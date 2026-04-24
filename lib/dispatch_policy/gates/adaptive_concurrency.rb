@@ -12,9 +12,13 @@ module DispatchPolicy
     # AIMD loop on a per-partition stats row; the underlying in-flight
     # counter is the same PartitionInflightCount used by :concurrency.
     class AdaptiveConcurrency < Gate
-      DEFAULT_EWMA_ALPHA  = 0.2
+      # alpha is fast enough that a single spike is forgotten in ~3
+      # observations instead of ~15. slow_factor 0.95 halves the per-
+      # observation shrink magnitude so the cap no longer overshoots
+      # after a burst drains the adapter queue.
+      DEFAULT_EWMA_ALPHA  = 0.5
       DEFAULT_FAIL_FACTOR = 0.5
-      DEFAULT_SLOW_FACTOR = 0.9
+      DEFAULT_SLOW_FACTOR = 0.95
 
       # target_lag_ms accepts the legacy alias `target_latency` for
       # backwards compatibility.
@@ -74,6 +78,14 @@ module DispatchPolicy
           effective_max = stats.dig(partition_key, :current_max) || resolve(@initial_max, nil).to_i
           effective_max = [ effective_max, min_v ].max
           used = in_flight.fetch(partition_key, 0)
+
+          # Safety valve: if nothing is in-flight for this partition and
+          # there's pending, the adapter queue is (or is about to be)
+          # empty and workers will idle. Ensure we hand over at least
+          # initial_max so the stream never dries up on its own.
+          if used.zero? && jobs.any?
+            effective_max = [ effective_max, resolve(@initial_max, nil).to_i ].max
+          end
 
           jobs.each do |staged|
             break unless used < effective_max
