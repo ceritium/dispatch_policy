@@ -28,15 +28,32 @@ module DispatchPolicy
       attr_accessor :_dispatch_partitions
 
       around_perform do |job, block|
+        started   = Time.current
+        succeeded = false
         begin
           block.call
+          succeeded = true
         ensure
           policy_name = job.class.resolved_dispatch_policy&.name
+          duration_ms = ((Time.current - started) * 1000).to_i
+
           if job._dispatch_partitions.present?
             DispatchPolicy::Tick.release(
               policy_name: policy_name,
               partitions:  job._dispatch_partitions
             )
+
+            # Feed adaptive-concurrency gates with what just happened.
+            policy = job.class.resolved_dispatch_policy
+            job._dispatch_partitions.each do |gate_name, partition_key|
+              gate = policy&.gates&.find { |g| g.name == gate_name.to_sym }
+              next unless gate.is_a?(DispatchPolicy::Gates::AdaptiveConcurrency)
+              gate.record_observation(
+                partition_key: partition_key,
+                duration_ms:   duration_ms,
+                succeeded:     succeeded
+              )
+            end
           end
           DispatchPolicy::StagedJob.mark_completed_by_active_job_id(job.job_id)
         end

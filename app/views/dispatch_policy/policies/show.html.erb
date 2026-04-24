@@ -38,6 +38,8 @@
         <th class="text-end">Pending (scheduled)</th>
         <th class="text-end">In-flight</th>
         <th class="text-end">Completed (24h)</th>
+        <th class="text-end">Adaptive cap</th>
+        <th class="text-end">EWMA latency (ms)</th>
       </tr>
     </thead>
     <tbody>
@@ -49,6 +51,12 @@
           <td class="text-end"><%= row[:scheduled] %></td>
           <td class="text-end"><%= row[:in_flight] %></td>
           <td class="text-end"><%= row[:completed_24h] %></td>
+          <td class="text-end">
+            <% if row[:current_max] %><strong><%= row[:current_max] %></strong><% else %><span class="muted">—</span><% end %>
+          </td>
+          <td class="text-end">
+            <% if row[:ewma_latency_ms] %><%= row[:ewma_latency_ms] %><% else %><span class="muted">—</span><% end %>
+          </td>
         </tr>
       <% end %>
     </tbody>

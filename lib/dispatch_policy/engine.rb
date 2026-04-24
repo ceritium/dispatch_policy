@@ -13,6 +13,7 @@ module DispatchPolicy
         DispatchPolicy::Gates::Throttle
         DispatchPolicy::Gates::GlobalCap
         DispatchPolicy::Gates::FairInterleave
+        DispatchPolicy::Gates::AdaptiveConcurrency
 
         DispatchPolicy::ActiveJobPerformAllLaterPatch
       end

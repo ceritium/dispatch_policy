@@ -64,8 +64,23 @@ module DispatchPolicy
       now_iso   = now.iso8601
       since_24h = 24.hours.ago.iso8601
 
+      adaptive_stats = AdaptiveConcurrencyStats.where(policy_name: @policy_name)
+        .pluck(:gate_name, :partition_key, :current_max, :ewma_latency_ms)
+        .each_with_object({}) { |(g, k, c, l), h|
+          h[[ g, k ]] = { current_max: c, ewma_latency_ms: l.to_f.round(1) }
+        }
+
       rows = Hash.new { |h, k|
-        h[k] = { source: k[0], partition: k[1], eligible: 0, scheduled: 0, in_flight: 0, completed_24h: 0 }
+        h[k] = {
+          source:          k[0],
+          partition:       k[1],
+          eligible:        0,
+          scheduled:       0,
+          in_flight:       0,
+          completed_24h:   0,
+          current_max:     nil,
+          ewma_latency_ms: nil
+        }
       }
 
       sources.each do |name, extract|
@@ -98,6 +113,13 @@ module DispatchPolicy
           partition = extract.call(ctx, rr_key)
           rows[[ name, partition ]][:completed_24h] += completed
         end
+      end
+
+      rows.each do |(source, partition), row|
+        stats = adaptive_stats[[ source, partition ]]
+        next unless stats
+        row[:current_max]     = stats[:current_max]
+        row[:ewma_latency_ms] = stats[:ewma_latency_ms]
       end
 
       rows.values

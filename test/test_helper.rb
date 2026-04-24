@@ -17,11 +17,14 @@ require_relative "dummy/config/environment"
 # Run migrations before rails/test_help triggers the pending-migration check.
 ActiveRecord::Migration.verbose = false
 migration_path = File.expand_path("../db/migrate", __dir__)
-ActiveRecord::Base.connection.drop_table :dispatch_policy_staged_jobs, if_exists: true
-ActiveRecord::Base.connection.drop_table :dispatch_policy_partition_counts, if_exists: true
-ActiveRecord::Base.connection.drop_table :dispatch_policy_throttle_buckets, if_exists: true
-ActiveRecord::Base.connection.drop_table :schema_migrations, if_exists: true
-ActiveRecord::Base.connection.drop_table :ar_internal_metadata, if_exists: true
+%w[
+  dispatch_policy_staged_jobs
+  dispatch_policy_partition_counts
+  dispatch_policy_throttle_buckets
+  dispatch_policy_adaptive_concurrency_stats
+  schema_migrations
+  ar_internal_metadata
+].each { |t| ActiveRecord::Base.connection.drop_table t.to_sym, if_exists: true }
 ActiveRecord::MigrationContext.new(migration_path).migrate
 
 require "rails/test_help"
