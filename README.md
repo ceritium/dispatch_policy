@@ -5,6 +5,14 @@
 > production on [pulso.run](https://pulso.run) — that's how we learn
 > what breaks. If you pick it up for your own project, pin the exact
 > version and expect to follow the changelog.
+>
+> **PostgreSQL only (11+).** The staging, admission, and fairness
+> machinery lean on `jsonb`, partial indexes, `FOR UPDATE SKIP LOCKED`,
+> `ON CONFLICT`, and `CROSS JOIN LATERAL`. MySQL/SQLite support isn't
+> closed off as a goal — being drop-in across every ActiveJob backend
+> is the long-term direction — but it would take meaningful rework
+> (shadow columns for `jsonb`, full indexes instead of partial, a
+> different batch-fetch strategy for fairness). Contributions welcome.
 
 Per-partition admission control for ActiveJob. Stages `perform_later`
 into a dedicated table, runs a tick loop that admits jobs through
