@@ -3,13 +3,7 @@
   <head>
     <title>DispatchPolicy</title>
     <%= csrf_meta_tags %>
-    <%
-      refresh_interval = params[:refresh].to_i
-      refresh_on       = refresh_interval.positive?
-    %>
-    <% if refresh_on %>
-      <meta http-equiv="refresh" content="<%= refresh_interval %>">
-    <% end %>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
     <style>
       body { font-family: -apple-system, system-ui, sans-serif; max-width: 1200px; margin: 2em auto; padding: 0 1em; color: #222; }
       h1 { font-size: 1.6em; margin-bottom: 0.25em; }
@@ -29,28 +23,73 @@
       .badge { display: inline-block; padding: 0.1em 0.5em; background: #eee; border-radius: 3px; font-size: 0.8em; margin-right: 0.25em; }
       .text-end { text-align: right; }
       .refresh-bar { display: flex; gap: 0.5em; align-items: center; justify-content: flex-end; font-size: 0.85em; margin-bottom: 0.5em; }
-      .refresh-bar a { text-decoration: none; padding: 0.15em 0.5em; border: 1px solid #ddd; border-radius: 3px; color: #555; }
-      .refresh-bar a.on { background: #e3f0d6; border-color: #b7d59c; color: #2b5a18; }
-      .refresh-bar a:hover { background: #f4f4f4; }
-      .refresh-bar a.on:hover { background: #d7e7c5; }
+      .refresh-bar button { font: inherit; background: transparent; text-decoration: none; padding: 0.15em 0.5em; border: 1px solid #ddd; border-radius: 3px; color: #555; cursor: pointer; }
+      .refresh-bar button.on { background: #e3f0d6; border-color: #b7d59c; color: #2b5a18; }
+      .refresh-bar button:hover { background: #f4f4f4; }
+      .refresh-bar button.on:hover { background: #d7e7c5; }
+      .chart-global { height: 200px; position: relative; margin: 0.5em 0 1em; }
+      .sparkline-cell { padding: 0 0.6em 0.4em !important; border-bottom: 1px solid #eee !important; background: #fafafa; }
+      .sparkline-wrap { height: 30px; position: relative; }
     </style>
   </head>
   <body>
     <div class="refresh-bar">
       <span class="muted">Auto-refresh:</span>
-      <% [
-        [ "off", 0 ],
-        [ "2s",  2 ],
-        [ "5s",  5 ],
-        [ "15s", 15 ]
-      ].each do |label, seconds| %>
-        <% active = (refresh_interval == seconds) || (seconds.zero? && !refresh_on) %>
-        <%= link_to label,
-              url_for(request.query_parameters.merge(refresh: seconds.zero? ? nil : seconds).compact),
-              class: (active ? "on" : nil) %>
+      <% [ [ "off", 0 ], [ "2s", 2 ], [ "5s", 5 ], [ "15s", 15 ] ].each do |label, seconds| %>
+        <button type="button" data-refresh="<%= seconds %>"><%= label %></button>
       <% end %>
     </div>
 
     <%= yield %>
+
+    <script>
+      (function () {
+        // Auto-refresh preference in localStorage.
+        const KEY = "dispatch_policy_refresh_seconds";
+        const current = parseInt(localStorage.getItem(KEY) || "0", 10);
+        document.querySelectorAll(".refresh-bar button[data-refresh]").forEach(btn => {
+          if (parseInt(btn.dataset.refresh, 10) === current) btn.classList.add("on");
+          btn.addEventListener("click", () => {
+            const v = parseInt(btn.dataset.refresh, 10);
+            if (v === 0) localStorage.removeItem(KEY);
+            else         localStorage.setItem(KEY, String(v));
+            location.reload();
+          });
+        });
+        if (current > 0) setTimeout(() => location.reload(), current * 1000);
+
+        // Chart.js initialization for canvases with data-chart.
+        const BLUE = "#0057b7";
+        document.querySelectorAll("canvas[data-chart]").forEach(canvas => {
+          const kind   = canvas.dataset.chart;
+          const values = JSON.parse(canvas.dataset.values || "[]");
+          const labels = JSON.parse(canvas.dataset.labels || "[]");
+          const label  = canvas.dataset.label || "";
+
+          if (kind === "line") {
+            new Chart(canvas, {
+              type: "bar",
+              data: { labels, datasets: [{ label, data: values, backgroundColor: BLUE, borderWidth: 0 }] },
+              options: {
+                responsive: true, maintainAspectRatio: false,
+                plugins: { legend: { display: false } },
+                scales: { y: { beginAtZero: true, ticks: { callback: v => v + "ms" } } }
+              }
+            });
+          } else if (kind === "sparkline") {
+            new Chart(canvas, {
+              type: "bar",
+              data: { labels: values.map((_, i) => i), datasets: [{ data: values, backgroundColor: BLUE, borderWidth: 0, barPercentage: 1.0, categoryPercentage: 1.0 }] },
+              options: {
+                responsive: true, maintainAspectRatio: false,
+                plugins: { legend: { display: false }, tooltip: { enabled: false } },
+                scales: { x: { display: false }, y: { display: false, beginAtZero: true } },
+                animation: false
+              }
+            });
+          }
+        });
+      })();
+    </script>
   </body>
 </html>

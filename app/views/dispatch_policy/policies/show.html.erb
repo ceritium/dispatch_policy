@@ -27,7 +27,12 @@
 
 <% if @adaptive_global.any? %>
   <h2>Adaptive — EWMA queue lag (avg across partitions, last hour)</h2>
-  <%= line_chart_svg(@adaptive_global, label: "avg ewma_latency_ms") %>
+  <div class="chart-global">
+    <canvas data-chart="line"
+            data-label="avg ewma_latency_ms"
+            data-labels='<%= @adaptive_global.map { |(t, _)| t.strftime("%H:%M") }.to_json %>'
+            data-values='<%= @adaptive_global.map { |(_, v)| v.to_f.round(1) }.to_json %>'></canvas>
+  </div>
 <% end %>
 
 <h2>Partition breakdown</h2>
@@ -45,7 +50,6 @@
         <th class="text-end">Completed (24h)</th>
         <th class="text-end">Adaptive cap</th>
         <th class="text-end">EWMA latency (ms)</th>
-        <th>Trend</th>
       </tr>
     </thead>
     <tbody>
@@ -63,15 +67,18 @@
           <td class="text-end">
             <% if row[:ewma_latency_ms] %><%= row[:ewma_latency_ms] %><% else %><span class="muted">—</span><% end %>
           </td>
-          <td>
-            <% samples = @adaptive_samples[row[:partition]] %>
-            <% if samples.present? %>
-              <%= sparkline(samples.map(&:last)) %>
-            <% else %>
-              <span class="muted">—</span>
-            <% end %>
-          </td>
         </tr>
+        <% samples = @adaptive_samples[row[:partition]] %>
+        <% if samples.present? %>
+          <tr>
+            <td colspan="8" class="sparkline-cell">
+              <div class="sparkline-wrap">
+                <canvas data-chart="sparkline"
+                        data-values='<%= samples.map { |(_, v)| v.to_f.round(1) }.to_json %>'></canvas>
+              </div>
+            </td>
+          </tr>
+        <% end %>
       <% end %>
     </tbody>
   </table>
