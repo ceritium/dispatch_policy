@@ -206,7 +206,7 @@ per-partition stats row (`dispatch_policy_adaptive_concurrency_stats`).
 gate :adaptive_concurrency,
      partition_by:   ->(ctx) { ctx[:account_id] },
      initial_max:    3,
-     target_lag_ms:  100,    # acceptable queue wait before admission
+     target_lag_ms:  1000,   # acceptable queue wait before admission
      min:            1       # floor so a partition can't lock out
 end
 ```
@@ -221,15 +221,33 @@ end
 - **Failure**: `current_max *= 0.5` (halve) when `perform` raises.
 - **Slow**: `current_max *= 0.95` when EWMA lag > target.
 
+### Choosing `target_lag_ms`
+
+It's the knob that trades latency for throughput. Rough guide:
+
+- **Too low** (e.g. 10-50 ms). The gate reacts to every tiny bump in
+  queue wait and shrinks the cap aggressively. Workers can end up
+  idle with jobs still pending admission because the cap is
+  overcorrecting — classic contention / overshoot.
+- **Too high** (e.g. 30 s). The gate barely ever pushes back, so
+  you get near-maximum throughput at the cost of real queue buildup;
+  newly admitted jobs may wait seconds before a worker picks them
+  up.
+- **Reasonable starting point**: `≈ worker_max_threads × avg_perform_ms`.
+  If you run 5 workers at ~200 ms/perform, `target_lag_ms: 1000`
+  means "it's OK if the adapter queue stays at most ~1 second
+  deep". You'll want to tune from there based on what your
+  downstream tolerates and how fast you want bursts to drain.
+
 Pair it with `round_robin_by` for multi-tenant systems that want
-automatic backpressure without setting hand-tuned caps per tenant:
+automatic backpressure without hand-tuned caps per tenant:
 
 ```ruby
 round_robin_by ->(args) { args.first[:account_id] }
 gate :adaptive_concurrency,
      partition_by:  ->(ctx) { ctx[:account_id] },
      initial_max:   3,
-     target_lag_ms: 100
+     target_lag_ms: 1000
 ```
 
 ## Queues and partitioning
