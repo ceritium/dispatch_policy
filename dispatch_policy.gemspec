@@ -10,6 +10,15 @@ Gem::Specification.new do |spec|
   spec.summary     = "Per-partition admission control (throttle, concurrency, dedupe, fairness) for ActiveJob."
   spec.description = "DispatchPolicy stages ActiveJob enqueues into a policy table and admits them through declared gates. Supports per-partition throttle/concurrency, dedupe, round-robin fairness, and ships a minimal Rails engine to inspect pending/admitted state."
   spec.license     = "MIT"
+  spec.homepage    = "https://github.com/ceritium/dispatch_policy"
+
+  spec.metadata = {
+    "homepage_uri"      => spec.homepage,
+    "source_code_uri"   => spec.homepage,
+    "bug_tracker_uri"   => "#{spec.homepage}/issues",
+    "changelog_uri"     => "#{spec.homepage}/blob/master/CHANGELOG.md",
+    "rubygems_mfa_required" => "true"
+  }
 
   spec.required_ruby_version = ">= 3.1"
 
@@ -19,7 +28,8 @@ Gem::Specification.new do |spec|
     "config/**/*",
     "db/**/*",
     "MIT-LICENSE",
-    "README.md"
+    "README.md",
+    "CHANGELOG.md"
   ]
 
   spec.add_dependency "activejob",    ">= 7.1"
