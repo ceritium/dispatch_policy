@@ -80,12 +80,37 @@ module DispatchPolicy
       staged = StagedJob.admitted.last
 
       job = ActiveJob::Base.deserialize(staged.arguments)
-      job._dispatch_partitions = staged.partitions
+      job._dispatch_partitions  = staged.partitions
+      job._dispatch_admitted_at = staged.admitted_at
       job.perform_now
 
       stats = stats_for("A")
       assert_equal 1, stats.sample_count
       assert_not_nil stats.last_observed_at
+    end
+
+    test "duration measures admitted_at → completion (captures queue wait)" do
+      AdaptiveJob.perform_later("A")
+      Tick.run(policy_name: policy_name)
+      staged = StagedJob.admitted.last
+
+      # Simulate the staged row having been admitted 2 seconds ago — as
+      # happens under queue saturation when workers are busy.
+      two_sec_ago = 2.seconds.ago
+      staged.update!(admitted_at: two_sec_ago)
+
+      job = ActiveJob::Base.deserialize(staged.arguments)
+      job._dispatch_partitions  = staged.partitions
+      job._dispatch_admitted_at = two_sec_ago
+      job.perform_now
+
+      stats = stats_for("A")
+      # EWMA of a single observation ≈ duration * alpha. With alpha=0.5 and
+      # duration ≥ 2000ms, EWMA should be ≥ ~1000ms — well above target=200ms.
+      assert_operator stats.ewma_latency_ms, :>=, 900,
+        "expected queue-wait latency reflected, got #{stats.ewma_latency_ms}"
+      assert_operator stats.current_max, :<=, 5,
+        "expected cap to shrink or stay put, got #{stats.current_max}"
     end
   end
 end

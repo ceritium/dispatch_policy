@@ -25,17 +25,21 @@ module DispatchPolicy
     end
 
     included do
-      attr_accessor :_dispatch_partitions
+      attr_accessor :_dispatch_partitions, :_dispatch_admitted_at
 
       around_perform do |job, block|
-        started   = Time.current
         succeeded = false
         begin
           block.call
           succeeded = true
         ensure
           policy_name = job.class.resolved_dispatch_policy&.name
-          duration_ms = ((Time.current - started) * 1000).to_i
+          now         = Time.current
+          # End-to-end latency from admission: includes queue wait on the
+          # real adapter. If workers are saturated this grows even though
+          # the perform itself was fast, and the adaptive gate shrinks.
+          admitted_at = job._dispatch_admitted_at || now
+          duration_ms = ((now - admitted_at) * 1000).to_i
 
           if job._dispatch_partitions.present?
             DispatchPolicy::Tick.release(
@@ -81,12 +85,17 @@ module DispatchPolicy
     end
 
     def serialize
-      super.merge("_dispatch_partitions" => _dispatch_partitions || {})
+      super.merge(
+        "_dispatch_partitions"  => _dispatch_partitions || {},
+        "_dispatch_admitted_at" => _dispatch_admitted_at&.iso8601(6)
+      )
     end
 
     def deserialize(job_data)
       super
-      self._dispatch_partitions = job_data["_dispatch_partitions"]
+      self._dispatch_partitions  = job_data["_dispatch_partitions"]
+      ts                         = job_data["_dispatch_admitted_at"]
+      self._dispatch_admitted_at = ts ? Time.iso8601(ts) : nil
     end
   end
 end

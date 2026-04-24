@@ -71,12 +71,14 @@ module DispatchPolicy
     end
 
     def mark_admitted!(partitions:)
+      now = Time.current
       job = instantiate_active_job
-      job._dispatch_partitions = partitions
+      job._dispatch_partitions  = partitions
+      job._dispatch_admitted_at = now
 
       update!(
-        admitted_at:      Time.current,
-        lease_expires_at: Time.current + DispatchPolicy.config.lease_duration,
+        admitted_at:      now,
+        lease_expires_at: now + DispatchPolicy.config.lease_duration,
         active_job_id:    job.job_id,
         partitions:       partitions
       )
