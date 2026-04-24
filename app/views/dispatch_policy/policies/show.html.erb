@@ -31,7 +31,8 @@
     <canvas data-chart="line"
             data-label="avg ewma_latency_ms"
             data-labels='<%= @chart_labels.to_json %>'
-            data-values='<%= @adaptive_global.to_json %>'></canvas>
+            data-values='<%= @adaptive_global.to_json %>'
+            data-counts='<%= @completions_global.to_json %>'></canvas>
   </div>
 <% end %>
 
@@ -69,13 +70,15 @@
           </td>
         </tr>
         <% series = @adaptive_samples[row[:partition]] %>
-        <% if series && series.any? { |v| !v.nil? } %>
+        <% counts = @completions_samples[row[:partition]] %>
+        <% if (series && series.any? { |v| !v.nil? }) || (counts && counts.any? { |c| c.positive? }) %>
           <tr>
             <td colspan="8" class="sparkline-cell">
               <div class="sparkline-wrap">
                 <canvas data-chart="sparkline"
                         data-labels='<%= @chart_labels.to_json %>'
-                        data-values='<%= series.to_json %>'></canvas>
+                        data-values='<%= (series || []).to_json %>'
+                        data-counts='<%= (counts || []).to_json %>'></canvas>
               </div>
             </td>
           </tr>

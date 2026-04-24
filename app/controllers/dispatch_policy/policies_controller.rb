@@ -158,38 +158,79 @@ module DispatchPolicy
       sources
     end
 
-    # Build fixed-axis chart data: exactly 60 minute slots covering the last
-    # hour, with nulls where no sample exists. Line charts with spanGaps:false
-    # render the gaps naturally; the X axis stays the full hour regardless
-    # of how much data we have.
+    # Build fixed-axis chart data: 60 minute slots covering the last hour.
+    # Two overlaid series per partition:
+    #   - EWMA queue lag (line), nulls where no sample exists.
+    #   - Completions per minute (bars behind the line), integers from 0.
     def load_adaptive_chart_data
       last_minute   = Time.current.utc.beginning_of_minute
       @chart_slots  = (0..59).map { |i| last_minute - (59 - i).minutes }
       @chart_labels = @chart_slots.map { |t| t.strftime("%H:%M") }
 
+      load_adaptive_latency_series
+      load_adaptive_completions_series
+    end
+
+    def load_adaptive_latency_series
       rows = AdaptiveConcurrencySample
         .where(policy_name: @policy_name)
         .where("minute_bucket >= ?", @chart_slots.first)
         .pluck(:partition_key, :minute_bucket, :ewma_latency_ms)
 
-      per_partition_bucket_to_value = Hash.new { |h, k| h[k] = {} }
-      global_by_bucket              = Hash.new { |h, k| h[k] = [] }
+      per_partition = Hash.new { |h, k| h[k] = {} }
+      global        = Hash.new { |h, k| h[k] = [] }
       rows.each do |pk, bucket, v|
         minute = bucket.utc.beginning_of_minute
-        per_partition_bucket_to_value[pk][minute] = v.to_f
-        global_by_bucket[minute] << v.to_f
+        per_partition[pk][minute] = v.to_f
+        global[minute] << v.to_f
       end
 
-      # { partition => [v, v, nil, v, ...] aligned to @chart_slots }
-      @adaptive_samples = per_partition_bucket_to_value.transform_values { |bucket_to_v|
+      @adaptive_samples = per_partition.transform_values { |bucket_to_v|
         @chart_slots.map { |t| bucket_to_v[t]&.round(1) }
       }
-
-      # Same shape, for the global line.
       @adaptive_global = @chart_slots.map { |t|
-        vs = global_by_bucket[t]
+        vs = global[t]
         vs.any? ? (vs.sum / vs.size.to_f).round(1) : nil
       }
+    end
+
+    # Completions per minute per partition, derived the same way as the
+    # breakdown table so bars line up with the sparkline they sit behind.
+    def load_adaptive_completions_series
+      sources              = partition_sources
+      @completions_samples = {}
+      @completions_global  = Array.new(@chart_slots.size, 0)
+      return if sources.empty?
+
+      rows = StagedJob
+        .where(policy_name: @policy_name)
+        .where("completed_at >= ?", @chart_slots.first)
+        .group(:context, :round_robin_key, Arel.sql("date_trunc('minute', completed_at)"))
+        .pluck(:context, :round_robin_key, Arel.sql("date_trunc('minute', completed_at)"), Arel.sql("count(*)"))
+
+      slot_index    = @chart_slots.each_with_index.to_h
+      per_partition = Hash.new { |h, k| h[k] = Array.new(@chart_slots.size, 0) }
+
+      sources.each do |_name, extract|
+        rows.each do |ctx, rr_key, minute, count|
+          partition = extract.call(ctx, rr_key)
+          idx       = slot_index[minute.utc.beginning_of_minute]
+          next unless idx && partition && !partition.empty?
+          per_partition[partition][idx] += count
+        end
+      end
+
+      # Dedup: a single completed row may be counted under multiple sources
+      # when gates + round_robin_by partition by the same key. The sort_by
+      # + uniq structure of breakdown hides this there; here we'd over-
+      # count. Divide each slot by the number of sources that produced it.
+      source_count = sources.size
+      per_partition.each_value { |arr| arr.map! { |c| c / source_count } }
+
+      @completions_samples = per_partition
+      @chart_slots.size.times do |i|
+        @completions_global[i] = per_partition.values.sum { |arr| arr[i] }
+      end
     end
   end
 end

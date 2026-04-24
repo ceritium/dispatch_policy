@@ -27,9 +27,9 @@
       .refresh-bar button.on { background: #e3f0d6; border-color: #b7d59c; color: #2b5a18; }
       .refresh-bar button:hover { background: #f4f4f4; }
       .refresh-bar button.on:hover { background: #d7e7c5; }
-      .chart-global { height: 200px; position: relative; margin: 0.5em 0 1em; }
-      .sparkline-cell { padding: 0 0.6em 0.4em !important; border-bottom: 1px solid #eee !important; background: #fafafa; }
-      .sparkline-wrap { height: 30px; position: relative; }
+      .chart-global { height: 220px; position: relative; margin: 0.5em 0 1em; }
+      .sparkline-cell { padding: 0.2em 0.6em 0.4em !important; border-bottom: 1px solid #eee !important; background: #fafafa; }
+      .sparkline-wrap { height: 70px; position: relative; }
     </style>
   </head>
   <body>
@@ -59,62 +59,96 @@
         if (current > 0) setTimeout(() => location.reload(), current * 1000);
 
         // Chart.js initialization for canvases with data-chart.
-        const BLUE = "#0057b7";
+        const BLUE        = "#0057b7";
+        const BAR_FILL    = "rgba(0, 87, 183, 0.18)";
+        const TOOLTIP_FMT = {
+          titleFont: { size: 11 },
+          bodyFont:  { size: 11 },
+          padding:   6,
+          displayColors: false,
+          boxPadding: 3
+        };
+
+        function parseJSON(s, fallback) {
+          try { return JSON.parse(s); } catch (e) { return fallback; }
+        }
+
         document.querySelectorAll("canvas[data-chart]").forEach(canvas => {
           const kind   = canvas.dataset.chart;
-          const values = JSON.parse(canvas.dataset.values || "[]");
-          const labels = JSON.parse(canvas.dataset.labels || "[]");
+          const values = parseJSON(canvas.dataset.values, []);
+          const labels = parseJSON(canvas.dataset.labels, []);
+          const counts = parseJSON(canvas.dataset.counts, []);
           const label  = canvas.dataset.label || "";
 
-          if (kind === "line") {
-            new Chart(canvas, {
-              type: "line",
-              data: { labels, datasets: [{ label, data: values, borderColor: BLUE, backgroundColor: "rgba(0,87,183,0.1)", tension: 0.25, fill: true, pointRadius: 0, borderWidth: 2, spanGaps: false }] },
-              options: {
-                responsive: true, maintainAspectRatio: false,
-                plugins: { legend: { display: false } },
-                scales: {
-                  x: { ticks: { maxTicksLimit: 12, autoSkip: true } },
-                  y: { beginAtZero: true, ticks: { callback: v => v + "ms" } }
-                }
-              }
-            });
-          } else if (kind === "sparkline") {
-            new Chart(canvas, {
-              type: "line",
-              data: {
-                labels: labels.length ? labels : values.map((_, i) => i),
-                datasets: [{
-                  data: values,
-                  borderColor: BLUE,
-                  backgroundColor: BLUE,
-                  tension: 0.3,
-                  pointRadius: 0,
-                  pointHoverRadius: 4,
-                  pointHitRadius: 10,
-                  borderWidth: 1.5,
-                  spanGaps: false
-                }]
-              },
-              options: {
-                responsive: true, maintainAspectRatio: false,
-                interaction: { mode: "index", intersect: false },
-                plugins: {
-                  legend: { display: false },
-                  tooltip: {
-                    enabled: true,
-                    displayColors: false,
-                    callbacks: {
-                      title: items => items[0].label,
-                      label: ctx => ctx.parsed.y != null ? `${ctx.parsed.y} ms` : "no data"
-                    }
-                  }
-                },
-                scales: { x: { display: false, min: 0, max: values.length - 1 }, y: { display: false, beginAtZero: true } },
-                animation: false
-              }
+          const datasets = [];
+          if (counts.length) {
+            datasets.push({
+              type: "bar",
+              label: "completions/min",
+              data: counts,
+              backgroundColor: BAR_FILL,
+              borderWidth: 0,
+              yAxisID: "y1",
+              order: 2
             });
           }
+          datasets.push({
+            type: "line",
+            label: label || "ewma ms",
+            data: values,
+            borderColor: BLUE,
+            backgroundColor: "rgba(0, 87, 183, 0.1)",
+            tension: 0.25,
+            fill: kind === "line",
+            pointRadius: 0,
+            pointHoverRadius: 4,
+            pointHitRadius: 10,
+            borderWidth: kind === "sparkline" ? 1.5 : 2,
+            spanGaps: false,
+            yAxisID: "y",
+            order: 1
+          });
+
+          const isSpark = kind === "sparkline";
+          const config = {
+            data: { labels: labels.length ? labels : values.map((_, i) => i), datasets },
+            options: {
+              responsive: true, maintainAspectRatio: false,
+              interaction: { mode: "index", intersect: false },
+              plugins: {
+                legend: { display: false },
+                tooltip: Object.assign({}, TOOLTIP_FMT, {
+                  enabled: true,
+                  callbacks: {
+                    title: items => items[0].label,
+                    label: ctx => {
+                      if (ctx.dataset.yAxisID === "y1") {
+                        return `${ctx.parsed.y} completions`;
+                      }
+                      return ctx.parsed.y != null ? `${ctx.parsed.y} ms` : "no data";
+                    }
+                  }
+                })
+              },
+              scales: {
+                x: isSpark
+                  ? { display: false, min: 0, max: values.length - 1 }
+                  : { ticks: { maxTicksLimit: 12, autoSkip: true } },
+                y: isSpark
+                  ? { display: false, beginAtZero: true }
+                  : { beginAtZero: true, ticks: { callback: v => v + "ms" } },
+                y1: {
+                  position: "right",
+                  display: !isSpark,
+                  beginAtZero: true,
+                  grid: { drawOnChartArea: false },
+                  ticks: { callback: v => v + "/m" }
+                }
+              },
+              animation: false
+            }
+          };
+          new Chart(canvas, config);
         });
       })();
     </script>
