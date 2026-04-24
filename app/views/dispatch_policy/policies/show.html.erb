@@ -93,69 +93,71 @@
 
 <h2>All partitions <small class="muted">(<%= @partition_total_list %>)</small></h2>
 
-<% if @partition_total_list.to_i.zero? && @partition_search.blank? %>
-  <p class="muted">This policy declares no partitioning (no gate with <code>partition_by</code> and no <code>round_robin_by</code>).</p>
-<% else %>
-  <%= form_with url: url_for, method: :get, local: true, html: { class: "partition-search" } do %>
-    <% if params[:watch].present? %>
-      <%= hidden_field_tag :watch, params[:watch] %>
-    <% end %>
-    <%= text_field_tag :q, @partition_search, placeholder: "filter by partition key…", size: 30 %>
-    <%= submit_tag "Search", name: nil %>
-    <% if @partition_search.present? %>
-      <%= link_to "clear", url_for(q: nil, page: nil, watch: params[:watch]), class: "muted" %>
-    <% end %>
-  <% end %>
-
-  <% if @partition_list.empty? %>
-    <p class="muted">No matches.</p>
+<turbo-frame id="partitions_list" data-turbo-action="advance">
+  <% if @partition_total_list.to_i.zero? && @partition_search.blank? %>
+    <p class="muted">This policy declares no partitioning (no gate with <code>partition_by</code> and no <code>round_robin_by</code>).</p>
   <% else %>
-    <table data-policy-name="<%= @policy_name %>">
-      <thead>
-        <tr>
-          <th></th>
-          <th>Source</th>
-          <th>Partition</th>
-          <th class="text-end">Pending</th>
-          <th class="text-end">In-flight</th>
-          <th class="text-end">Completed (24h)</th>
-        </tr>
-      </thead>
-      <tbody>
-        <% @partition_list.each do |row| %>
-          <% pending_total = row[:eligible] + row[:scheduled] %>
-          <tr>
-            <td>
-              <% if @watched_keys.include?(row[:partition]) %>
-                <span class="chip on" title="Watched">✓</span>
-              <% else %>
-                <button type="button" class="chip" data-watch="<%= row[:partition] %>" title="Watch this partition">+</button>
-              <% end %>
-            </td>
-            <td><%= row[:source] %></td>
-            <td><code><%= row[:partition] %></code></td>
-            <td class="text-end"><%= pending_total %></td>
-            <td class="text-end"><%= row[:in_flight] %></td>
-            <td class="text-end"><%= row[:completed_24h] %></td>
-          </tr>
-        <% end %>
-      </tbody>
-    </table>
+    <%= form_with url: url_for, method: :get, local: true, html: { class: "partition-search" } do %>
+      <% if params[:watch].present? %>
+        <%= hidden_field_tag :watch, params[:watch] %>
+      <% end %>
+      <%= text_field_tag :q, @partition_search, placeholder: "filter by partition key…", size: 30, autofocus: @partition_search.present? %>
+      <%= submit_tag "Search", name: nil %>
+      <% if @partition_search.present? %>
+        <%= link_to "clear", url_for(q: nil, page: nil, watch: params[:watch]), class: "muted" %>
+      <% end %>
+    <% end %>
 
-    <% total_pages = (@partition_total_list / DispatchPolicy::PoliciesController::PARTITION_LIST_PAGE_SIZE.to_f).ceil %>
-    <% if total_pages > 1 %>
-      <div class="pagination">
-        <% if @partition_page > 1 %>
-          <%= link_to "← prev", url_for(page: @partition_page - 1, q: @partition_search.presence, watch: params[:watch]) %>
-        <% end %>
-        <span class="muted">page <%= @partition_page %> / <%= total_pages %></span>
-        <% if @partition_page < total_pages %>
-          <%= link_to "next →", url_for(page: @partition_page + 1, q: @partition_search.presence, watch: params[:watch]) %>
-        <% end %>
-      </div>
+    <% if @partition_list.empty? %>
+      <p class="muted">No matches.</p>
+    <% else %>
+      <table data-policy-name="<%= @policy_name %>">
+        <thead>
+          <tr>
+            <th></th>
+            <th>Source</th>
+            <th>Partition</th>
+            <th class="text-end">Pending</th>
+            <th class="text-end">In-flight</th>
+            <th class="text-end">Completed (24h)</th>
+          </tr>
+        </thead>
+        <tbody>
+          <% @partition_list.each do |row| %>
+            <% pending_total = row[:eligible] + row[:scheduled] %>
+            <tr>
+              <td>
+                <% if @watched_keys.include?(row[:partition]) %>
+                  <span class="chip on" title="Watched">✓</span>
+                <% else %>
+                  <button type="button" class="chip" data-watch="<%= row[:partition] %>" data-turbo-frame="_top" title="Watch this partition">+</button>
+                <% end %>
+              </td>
+              <td><%= row[:source] %></td>
+              <td><code><%= row[:partition] %></code></td>
+              <td class="text-end"><%= pending_total %></td>
+              <td class="text-end"><%= row[:in_flight] %></td>
+              <td class="text-end"><%= row[:completed_24h] %></td>
+            </tr>
+          <% end %>
+        </tbody>
+      </table>
+
+      <% total_pages = (@partition_total_list / DispatchPolicy::PoliciesController::PARTITION_LIST_PAGE_SIZE.to_f).ceil %>
+      <% if total_pages > 1 %>
+        <div class="pagination">
+          <% if @partition_page > 1 %>
+            <%= link_to "← prev", url_for(page: @partition_page - 1, q: @partition_search.presence, watch: params[:watch]) %>
+          <% end %>
+          <span class="muted">page <%= @partition_page %> / <%= total_pages %></span>
+          <% if @partition_page < total_pages %>
+            <%= link_to "next →", url_for(page: @partition_page + 1, q: @partition_search.presence, watch: params[:watch]) %>
+          <% end %>
+        </div>
+      <% end %>
     <% end %>
   <% end %>
-<% end %>
+</turbo-frame>
 
 <h2>Throttle buckets</h2>
 <% if @throttle_buckets.empty? %>
