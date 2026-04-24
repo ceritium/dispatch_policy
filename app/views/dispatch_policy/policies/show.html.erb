@@ -25,13 +25,13 @@
   </div>
 </div>
 
-<% if @adaptive_global.any? %>
+<% if @adaptive_global.any? { |v| !v.nil? } %>
   <h2>Adaptive — EWMA queue lag (avg across partitions, last hour)</h2>
   <div class="chart-global">
     <canvas data-chart="line"
             data-label="avg ewma_latency_ms"
-            data-labels='<%= @adaptive_global.map { |(t, _)| t.strftime("%H:%M") }.to_json %>'
-            data-values='<%= @adaptive_global.map { |(_, v)| v.to_f.round(1) }.to_json %>'></canvas>
+            data-labels='<%= @chart_labels.to_json %>'
+            data-values='<%= @adaptive_global.to_json %>'></canvas>
   </div>
 <% end %>
 
@@ -68,13 +68,14 @@
             <% if row[:ewma_latency_ms] %><%= row[:ewma_latency_ms] %><% else %><span class="muted">—</span><% end %>
           </td>
         </tr>
-        <% samples = @adaptive_samples[row[:partition]] %>
-        <% if samples.present? %>
+        <% series = @adaptive_samples[row[:partition]] %>
+        <% if series && series.any? { |v| !v.nil? } %>
           <tr>
             <td colspan="8" class="sparkline-cell">
               <div class="sparkline-wrap">
                 <canvas data-chart="sparkline"
-                        data-values='<%= samples.map { |(_, v)| v.to_f.round(1) }.to_json %>'></canvas>
+                        data-labels='<%= @chart_labels.to_json %>'
+                        data-values='<%= series.to_json %>'></canvas>
               </div>
             </td>
           </tr>

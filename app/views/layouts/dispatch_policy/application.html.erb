@@ -68,22 +68,25 @@
 
           if (kind === "line") {
             new Chart(canvas, {
-              type: "bar",
-              data: { labels, datasets: [{ label, data: values, backgroundColor: BLUE, borderWidth: 0 }] },
+              type: "line",
+              data: { labels, datasets: [{ label, data: values, borderColor: BLUE, backgroundColor: "rgba(0,87,183,0.1)", tension: 0.25, fill: true, pointRadius: 0, borderWidth: 2, spanGaps: false }] },
               options: {
                 responsive: true, maintainAspectRatio: false,
                 plugins: { legend: { display: false } },
-                scales: { y: { beginAtZero: true, ticks: { callback: v => v + "ms" } } }
+                scales: {
+                  x: { ticks: { maxTicksLimit: 12, autoSkip: true } },
+                  y: { beginAtZero: true, ticks: { callback: v => v + "ms" } }
+                }
               }
             });
           } else if (kind === "sparkline") {
             new Chart(canvas, {
-              type: "bar",
-              data: { labels: values.map((_, i) => i), datasets: [{ data: values, backgroundColor: BLUE, borderWidth: 0, barPercentage: 1.0, categoryPercentage: 1.0 }] },
+              type: "line",
+              data: { labels: labels.length ? labels : values.map((_, i) => i), datasets: [{ data: values, borderColor: BLUE, tension: 0.3, pointRadius: 0, borderWidth: 1.5, spanGaps: false }] },
               options: {
                 responsive: true, maintainAspectRatio: false,
                 plugins: { legend: { display: false }, tooltip: { enabled: false } },
-                scales: { x: { display: false }, y: { display: false, beginAtZero: true } },
+                scales: { x: { display: false, min: 0, max: values.length - 1 }, y: { display: false, beginAtZero: true } },
                 animation: false
               }
             });

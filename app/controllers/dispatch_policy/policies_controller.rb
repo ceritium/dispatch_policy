@@ -35,8 +35,7 @@ module DispatchPolicy
       @completed_24h           = scope.completed.where(completed_at: 24.hours.ago..).count
 
       @partition_breakdown = partition_breakdown(scope)
-      @adaptive_samples    = adaptive_samples
-      @adaptive_global     = adaptive_global_series(@adaptive_samples)
+      load_adaptive_chart_data
       @throttle_buckets = ThrottleBucket
         .where(policy_name: @policy_name).order(:gate_name, :partition_key).limit(50)
       @pending_jobs = scope.pending.order(:priority, :staged_at).limit(50)
@@ -159,28 +158,38 @@ module DispatchPolicy
       sources
     end
 
-    # All samples from the last hour for this policy, grouped by partition.
-    # Returns { partition_key => [[Time, ewma_ms], ...] }.
-    def adaptive_samples
-      AdaptiveConcurrencySample
-        .where(policy_name: @policy_name)
-        .where("minute_bucket >= ?", 1.hour.ago)
-        .order(:minute_bucket)
-        .pluck(:partition_key, :minute_bucket, :ewma_latency_ms)
-        .group_by(&:first)
-        .transform_values { |rows| rows.map { |(_, t, v)| [ t, v ] } }
-    end
+    # Build fixed-axis chart data: exactly 60 minute slots covering the last
+    # hour, with nulls where no sample exists. Line charts with spanGaps:false
+    # render the gaps naturally; the X axis stays the full hour regardless
+    # of how much data we have.
+    def load_adaptive_chart_data
+      last_minute   = Time.current.utc.beginning_of_minute
+      @chart_slots  = (0..59).map { |i| last_minute - (59 - i).minutes }
+      @chart_labels = @chart_slots.map { |t| t.strftime("%H:%M") }
 
-    # For the global chart: average EWMA across partitions per minute bucket.
-    def adaptive_global_series(partition_samples)
-      # Collect (minute => [ewma values]) across partitions.
-      by_minute = Hash.new { |h, k| h[k] = [] }
-      partition_samples.each do |_partition, points|
-        points.each { |(t, v)| by_minute[t.utc.beginning_of_minute] << v }
+      rows = AdaptiveConcurrencySample
+        .where(policy_name: @policy_name)
+        .where("minute_bucket >= ?", @chart_slots.first)
+        .pluck(:partition_key, :minute_bucket, :ewma_latency_ms)
+
+      per_partition_bucket_to_value = Hash.new { |h, k| h[k] = {} }
+      global_by_bucket              = Hash.new { |h, k| h[k] = [] }
+      rows.each do |pk, bucket, v|
+        minute = bucket.utc.beginning_of_minute
+        per_partition_bucket_to_value[pk][minute] = v.to_f
+        global_by_bucket[minute] << v.to_f
       end
-      by_minute
-        .map { |t, values| [ t, values.sum / values.size.to_f ] }
-        .sort_by(&:first)
+
+      # { partition => [v, v, nil, v, ...] aligned to @chart_slots }
+      @adaptive_samples = per_partition_bucket_to_value.transform_values { |bucket_to_v|
+        @chart_slots.map { |t| bucket_to_v[t]&.round(1) }
+      }
+
+      # Same shape, for the global line.
+      @adaptive_global = @chart_slots.map { |t|
+        vs = global_by_bucket[t]
+        vs.any? ? (vs.sum / vs.size.to_f).round(1) : nil
+      }
     end
   end
 end
