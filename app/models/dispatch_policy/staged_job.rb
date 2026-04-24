@@ -12,6 +12,18 @@ module DispatchPolicy
       admitted.where("lease_expires_at IS NOT NULL AND lease_expires_at < ?", Time.current)
     }
 
+    # Merge the job's ActiveJob metadata (queue_name, priority) into the
+    # context hash so gate lambdas can partition_by :queue_name without
+    # the user having to pass it as a kwarg. User-provided keys win.
+    def self.context_for(job_instance, policy)
+      built = policy.context_builder.call(job_instance.arguments)
+      return built unless built.is_a?(Hash)
+      {
+        queue_name: job_instance.queue_name,
+        priority:   job_instance.priority
+      }.merge(built.symbolize_keys)
+    end
+
     # Stages a job in the admission queue. Returns the created row, or nil if
     # the policy declares a dedupe_key and an active row already exists.
     def self.stage!(job_instance:, policy:)
@@ -26,7 +38,7 @@ module DispatchPolicy
         policy_name:     policy.name,
         arguments:       job_instance.serialize,
         snapshot:        policy.build_snapshot(job_instance.arguments),
-        context:         policy.context_builder.call(job_instance.arguments),
+        context:         context_for(job_instance, policy),
         priority:        job_instance.priority || 100,
         not_before_at:   job_instance.scheduled_at,
         staged_at:       Time.current,
@@ -48,7 +60,7 @@ module DispatchPolicy
           policy_name:     policy.name,
           arguments:       job_instance.serialize,
           snapshot:        policy.build_snapshot(job_instance.arguments),
-          context:         policy.context_builder.call(job_instance.arguments),
+          context:         context_for(job_instance, policy),
           priority:        job_instance.priority || 100,
           not_before_at:   job_instance.scheduled_at,
           staged_at:       now,

@@ -232,6 +232,64 @@ gate :adaptive_concurrency,
      target_lag_ms: 100
 ```
 
+## Queues and partitioning
+
+DispatchPolicy operates at the **policy** (class) level. A job's
+ActiveJob `queue` and `priority` travel through staging into admission
+and on to the real adapter — workers of each queue pick up their jobs
+normally — but neither affects which staged rows the gates see. All
+enqueues of the same job class share one policy, one throttle bucket,
+one concurrency cap.
+
+Two consequences to be aware of:
+
+- Enqueuing the same job to different queues does **not** give one
+  queue priority at admission; they share the policy's gates. If
+  urgent work should jump ahead, set a lower ActiveJob `priority`
+  (the admission SELECT is `ORDER BY priority, staged_at`) — or split
+  into a subclass with its own policy.
+- `dedupe_key` is queue-agnostic: the same key enqueued to
+  `:urgent` and `:low` dedupes to one row.
+
+### Using queue as a partition
+
+The context hash has `queue_name` and `priority` injected automatically
+at stage time (user-supplied keys win). Use them in any `partition_by`:
+
+```ruby
+class SendEmailJob < ApplicationJob
+  include DispatchPolicy::Dispatchable
+
+  dispatch_policy do
+    context ->(args) { { account_id: args.first.account_id } }
+
+    # Separate throttle bucket per (queue, account) — urgent and default
+    # don't share rate tokens.
+    gate :throttle,
+         rate:         100,
+         per:          1.minute,
+         partition_by: ->(ctx) { "#{ctx[:queue_name]}:#{ctx[:account_id]}" }
+  end
+end
+
+SendEmailJob.set(queue: :urgent).perform_later(user)
+SendEmailJob.set(queue: :default).perform_later(user)
+# → two partitions, each with its own bucket.
+```
+
+If you'd rather keep the two streams fully isolated (separate policies,
+admin rows, and dedupe scopes), subclass:
+
+```ruby
+class UrgentEmailJob < SendEmailJob
+  queue_as :urgent
+  dispatch_policy do
+    context ->(args) { { account_id: args.first.account_id } }
+    gate :throttle, rate: 500, per: 1.minute, partition_by: ->(ctx) { ctx[:account_id] }
+  end
+end
+```
+
 ## Dedupe
 
 `dedupe_key` is enforced by a partial unique index on
