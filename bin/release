@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# Release dispatch_policy to RubyGems.
+#
+# Does sanity checks (clean tree, on master, up to date with origin) and
+# then hands off to `rake release`, which builds, tags `v<VERSION>`,
+# pushes the tag to GitHub, and pushes the gem to RubyGems.org.
+
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+
+VERSION=$(ruby -Ilib -rdispatch_policy/version -e 'print DispatchPolicy::VERSION')
+BRANCH=$(git rev-parse --abbrev-ref HEAD)
+
+if [[ "$BRANCH" != "master" ]]; then
+  echo "✗ on branch '$BRANCH', expected master" >&2
+  exit 1
+fi
+
+if [[ -n "$(git status --porcelain)" ]]; then
+  echo "✗ working tree is dirty — commit or stash first" >&2
+  exit 1
+fi
+
+git fetch --quiet origin master
+if [[ "$(git rev-parse HEAD)" != "$(git rev-parse origin/master)" ]]; then
+  echo "✗ local master is not in sync with origin/master" >&2
+  exit 1
+fi
+
+if git rev-parse "v$VERSION" >/dev/null 2>&1; then
+  echo "✗ tag v$VERSION already exists — bump lib/dispatch_policy/version.rb" >&2
+  exit 1
+fi
+
+echo "→ releasing dispatch_policy $VERSION"
+read -r -p "continue? [y/N] " reply
+[[ "$reply" =~ ^[Yy]$ ]] || { echo "aborted"; exit 1; }
+
+bundle exec rake release
