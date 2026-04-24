@@ -49,6 +49,9 @@ module DispatchPolicy
               partitions:  job._dispatch_partitions
             )
 
+            # Let adaptive gates update their AIMD state first; we pick up
+            # the resulting current_max in the generic observation below
+            # so the chart surfaces the cap alongside lag + completions.
             policy = job.class.resolved_dispatch_policy
             job._dispatch_partitions.each do |gate_name, partition_key|
               gate = policy&.gates&.find { |g| g.name == gate_name.to_sym }
@@ -57,6 +60,21 @@ module DispatchPolicy
                 partition_key: partition_key,
                 queue_lag_ms:  queue_lag_ms,
                 succeeded:     succeeded
+              )
+            end
+
+            # Generic observation per unique partition. Every gate with
+            # partition_by (adaptive or not) gets a sparkline this way.
+            job._dispatch_partitions.values.uniq.each do |partition_key|
+              current_max = DispatchPolicy::AdaptiveConcurrencyStats.current_max_for(
+                policy_name:   policy_name,
+                partition_key: partition_key
+              )
+              DispatchPolicy::PartitionObservation.observe!(
+                policy_name:   policy_name,
+                partition_key: partition_key,
+                queue_lag_ms:  queue_lag_ms,
+                current_max:   current_max
               )
             end
           end

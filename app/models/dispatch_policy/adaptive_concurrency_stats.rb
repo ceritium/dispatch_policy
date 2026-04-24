@@ -77,20 +77,13 @@ module DispatchPolicy
           policy_name, gate_name.to_s, partition_key.to_s
         ])
       )
+    end
 
-      # Feed the minute-bucketed chart history. Read-after-write: we just
-      # UPDATEd this row, so the visible values reflect the fresh state.
-      row = where(policy_name: policy_name, gate_name: gate_name.to_s,
-                  partition_key: partition_key.to_s).first
-      if row
-        AdaptiveConcurrencySample.upsert_current!(
-          policy_name:     policy_name,
-          gate_name:       gate_name,
-          partition_key:   partition_key,
-          ewma_latency_ms: row.ewma_latency_ms,
-          current_max:     row.current_max
-        )
-      end
+    # Quick lookup used by Dispatchable to denormalize current_max into
+    # the generic partition observation row.
+    def self.current_max_for(policy_name:, partition_key:)
+      where(policy_name: policy_name, partition_key: partition_key.to_s)
+        .limit(1).pick(:current_max)
     end
   end
 end
