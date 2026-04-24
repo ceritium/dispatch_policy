@@ -1,0 +1,7 @@
+inherit_gem: { rubocop-rails-omakase: rubocop.yml }
+
+AllCops:
+  NewCops: disable
+  Exclude:
+    - "test/dummy/db/schema.rb"
+    - "test/dummy/bin/**/*"

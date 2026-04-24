@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <title>DispatchPolicy</title>
+    <%= csrf_meta_tags %>
+    <style>
+      body { font-family: -apple-system, system-ui, sans-serif; max-width: 1200px; margin: 2em auto; padding: 0 1em; color: #222; }
+      h1 { font-size: 1.6em; margin-bottom: 0.25em; }
+      h2 { font-size: 1.2em; margin-top: 2em; border-bottom: 1px solid #ddd; padding-bottom: 0.25em; }
+      table { border-collapse: collapse; width: 100%; margin: 0.5em 0 1em; }
+      th, td { text-align: left; padding: 0.4em 0.6em; border-bottom: 1px solid #eee; }
+      th { font-size: 0.85em; text-transform: uppercase; color: #666; letter-spacing: 0.02em; }
+      code { background: #f4f4f4; padding: 0.1em 0.3em; border-radius: 3px; font-size: 0.9em; }
+      .muted { color: #888; }
+      .summary { display: flex; gap: 2em; margin: 1em 0; flex-wrap: wrap; }
+      .summary-item { min-width: 120px; }
+      .summary-item .value { font-size: 1.5em; font-weight: 600; }
+      .summary-item .label { font-size: 0.8em; color: #666; text-transform: uppercase; }
+      .summary-item .sub { font-size: 0.75em; color: #888; margin-top: 0.25em; }
+      .back { font-size: 0.9em; }
+      .stale { color: #c92a2a; }
+      .badge { display: inline-block; padding: 0.1em 0.5em; background: #eee; border-radius: 3px; font-size: 0.8em; margin-right: 0.25em; }
+    </style>
+  </head>
+  <body>
+    <%= yield %>
+  </body>
+</html>

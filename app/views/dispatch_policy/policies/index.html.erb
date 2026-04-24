@@ -1,0 +1,52 @@
+<h1>DispatchPolicy</h1>
+<p class="muted">Admission-control policies registered in this app.</p>
+
+<div class="summary">
+  <div class="summary-item">
+    <div class="label">Active partitions</div>
+    <div class="value"><%= @active_partitions %></div>
+  </div>
+  <div class="summary-item">
+    <div class="label">Expired leases</div>
+    <div class="value"><%= @expired_leases %></div>
+  </div>
+</div>
+
+<h2>Policies</h2>
+<% if @policies.empty? %>
+  <p class="muted">No policies registered yet.</p>
+<% else %>
+  <table>
+    <thead>
+      <tr>
+        <th>Policy</th>
+        <th>Job class</th>
+        <th>Pending</th>
+        <th>Admitted</th>
+        <th>Completed (24h)</th>
+        <th>Oldest pending</th>
+      </tr>
+    </thead>
+    <tbody>
+      <% @policies.each do |p| %>
+        <tr>
+          <td><%= link_to p[:name], policy_path(policy_name: p[:name]) %></td>
+          <td><code><%= p[:job_class].name %></code></td>
+          <td><%= p[:pending_count] %></td>
+          <td><%= p[:admitted_count] %></td>
+          <td><%= p[:completed_24h] %></td>
+          <td>
+            <% if p[:oldest_pending] %>
+              <% stale = p[:oldest_pending] < Time.current - p[:stale_threshold] %>
+              <span class="<%= 'stale' if stale %>">
+                <%= time_ago_in_words(p[:oldest_pending]) %> ago
+              </span>
+            <% else %>
+              <span class="muted">—</span>
+            <% end %>
+          </td>
+        </tr>
+      <% end %>
+    </tbody>
+  </table>
+<% end %>

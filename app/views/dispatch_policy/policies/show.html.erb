@@ -1,0 +1,94 @@
+<p class="back"><%= link_to "← All policies", root_path %></p>
+<h1><%= @policy_name %> <small class="muted"><%= @job_class.name %></small></h1>
+
+<div class="summary">
+  <div class="summary-item">
+    <div class="label">Pending</div>
+    <div class="value"><%= @pending_count %></div>
+    <div class="sub"><%= @pending_eligible_count %> eligible · <%= @pending_scheduled_count %> scheduled</div>
+  </div>
+  <div class="summary-item">
+    <div class="label">Admitted</div>
+    <div class="value"><%= @admitted_count %></div>
+  </div>
+  <div class="summary-item">
+    <div class="label">Completed (24h)</div>
+    <div class="value"><%= @completed_24h %></div>
+  </div>
+  <div class="summary-item">
+    <div class="label">Gates</div>
+    <div class="value" style="font-size: 1em;">
+      <% (@policy&.gates || []).each do |g| %>
+        <span class="badge"><%= g.name %></span>
+      <% end %>
+    </div>
+  </div>
+</div>
+
+<h2>Partition in-flight counts</h2>
+<% if @partition_counts.empty? %>
+  <p class="muted">No partition counters yet.</p>
+<% else %>
+  <table>
+    <thead>
+      <tr><th>Gate</th><th>Partition</th><th>In-flight</th><th>Updated</th></tr>
+    </thead>
+    <tbody>
+      <% @partition_counts.each do |row| %>
+        <tr>
+          <td><%= row.gate_name %></td>
+          <td><code><%= row.partition_key %></code></td>
+          <td><%= row.in_flight %></td>
+          <td><%= row.updated_at.to_s(:short) rescue row.updated_at %></td>
+        </tr>
+      <% end %>
+    </tbody>
+  </table>
+<% end %>
+
+<h2>Throttle buckets</h2>
+<% if @throttle_buckets.empty? %>
+  <p class="muted">No throttle buckets yet.</p>
+<% else %>
+  <table>
+    <thead>
+      <tr><th>Gate</th><th>Partition</th><th>Tokens</th><th>Refilled at</th></tr>
+    </thead>
+    <tbody>
+      <% @throttle_buckets.each do |b| %>
+        <tr>
+          <td><%= b.gate_name %></td>
+          <td><code><%= b.partition_key %></code></td>
+          <td><%= b.tokens.round(2) %></td>
+          <td><%= b.refilled_at.to_s(:short) rescue b.refilled_at %></td>
+        </tr>
+      <% end %>
+    </tbody>
+  </table>
+<% end %>
+
+<h2>Pending (first 50)</h2>
+<% if @pending_jobs.empty? %>
+  <p class="muted">Nothing waiting.</p>
+<% else %>
+  <table>
+    <thead>
+      <tr>
+        <th>ID</th><th>Dedupe key</th><th>Round-robin key</th>
+        <th>Priority</th><th>Staged at</th><th>Not before</th>
+      </tr>
+    </thead>
+    <tbody>
+      <% @pending_jobs.each do |job| %>
+        <tr>
+          <td><%= job.id %></td>
+          <td><%= job.dedupe_key ? content_tag(:code, job.dedupe_key) : content_tag(:span, '—', class: 'muted') %></td>
+          <td><%= job.round_robin_key ? content_tag(:code, job.round_robin_key) : content_tag(:span, '—', class: 'muted') %></td>
+          <td><%= job.priority %></td>
+          <td><%= job.staged_at %></td>
+          <td><%= job.not_before_at || content_tag(:span, '—', class: 'muted') %></td>
+        </tr>
+      <% end %>
+    </tbody>
+  </table>
+<% end %>

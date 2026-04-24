@@ -1,0 +1,8 @@
+/Gemfile.lock
+/pkg/
+/tmp/
+/log/
+/test/dummy/log/
+/test/dummy/tmp/
+*.gem
+.DS_Store
