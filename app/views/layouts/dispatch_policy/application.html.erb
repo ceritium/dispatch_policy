@@ -33,6 +33,13 @@
       .chart-global { height: 220px; position: relative; margin: 0.5em 0 1em; }
       .sparkline-cell { padding: 0.2em 0.6em 0.4em !important; border-bottom: 1px solid #eee !important; background: #fafafa; }
       .sparkline-wrap { height: 70px; position: relative; }
+      .chip { font: inherit; padding: 0.1em 0.5em; min-width: 1.6em; border: 1px solid #ccc; background: #fff; border-radius: 3px; cursor: pointer; font-size: 0.85em; color: #555; }
+      .chip:hover { background: #f4f4f4; }
+      .chip.on { background: #e3f0d6; border-color: #b7d59c; color: #2b5a18; cursor: default; }
+      .partition-search { margin: 0.75em 0; display: flex; gap: 0.5em; align-items: center; }
+      .partition-search input[type="text"] { font: inherit; padding: 0.25em 0.5em; border: 1px solid #ccc; border-radius: 3px; }
+      .partition-search input[type="submit"] { font: inherit; padding: 0.25em 0.75em; border: 1px solid #bbb; background: #f4f4f4; border-radius: 3px; cursor: pointer; }
+      .pagination { display: flex; gap: 1em; align-items: center; margin-top: 0.5em; font-size: 0.9em; }
     </style>
   </head>
   <body>
@@ -186,11 +193,63 @@
         });
         }
 
+        // Watched-partitions manager. Scopes the localStorage list to the
+        // current policy (via [data-policy-name]); watch/unwatch clicks
+        // rewrite the URL's `watch` param and Turbo.visit into it.
+        function policyKey() {
+          const el = document.querySelector("[data-policy-name]");
+          return el ? `dp_watched:${el.dataset.policyName}` : null;
+        }
+        function getWatched() {
+          const key = policyKey(); if (!key) return [];
+          try { return JSON.parse(localStorage.getItem(key) || "[]"); } catch (_) { return []; }
+        }
+        function setWatched(arr) {
+          const key = policyKey(); if (!key) return;
+          localStorage.setItem(key, JSON.stringify(arr));
+          const url = new URL(location.href);
+          if (arr.length) url.searchParams.set("watch", arr.join(","));
+          else            url.searchParams.delete("watch");
+          if (window.Turbo) Turbo.visit(url.toString(), { action: "replace" });
+          else              location.href = url.toString();
+        }
+
+        function wireWatch() {
+          document.addEventListener("click", (e) => {
+            const add = e.target.closest("[data-watch]");
+            const rm  = e.target.closest("[data-unwatch]");
+            if (!add && !rm) return;
+            e.preventDefault();
+            const arr = getWatched();
+            if (add) {
+              if (!arr.includes(add.dataset.watch)) arr.push(add.dataset.watch);
+            } else {
+              const idx = arr.indexOf(rm.dataset.unwatch);
+              if (idx >= 0) arr.splice(idx, 1);
+            }
+            setWatched(arr);
+          }, { once: true });
+        }
+
+        // On first load, if localStorage has a watched list but the URL
+        // doesn't, inject it so the page renders the right partitions.
+        function syncWatchedIntoUrl() {
+          const arr = getWatched();
+          if (!arr.length) return;
+          const url = new URL(location.href);
+          if (url.searchParams.get("watch") === arr.join(",")) return;
+          url.searchParams.set("watch", arr.join(","));
+          if (window.Turbo) Turbo.visit(url.toString(), { action: "replace" });
+          else              location.replace(url.toString());
+        }
+
         function boot() {
           destroyExistingCharts();
           wireRefreshButtons();
+          wireWatch();
           renderCharts();
           scheduleRefresh();
+          syncWatchedIntoUrl();
         }
 
         // Run on the initial load + whenever Turbo renders (morph or full).

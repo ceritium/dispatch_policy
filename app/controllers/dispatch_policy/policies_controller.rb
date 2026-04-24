@@ -3,6 +3,7 @@
 module DispatchPolicy
   class PoliciesController < ApplicationController
     STALE_PENDING_THRESHOLD = 1.hour
+    PARTITION_LIST_PAGE_SIZE = 25
 
     before_action :load_policy, only: :show
 
@@ -34,7 +35,22 @@ module DispatchPolicy
       @admitted_count          = scope.admitted.count
       @completed_24h           = scope.completed.where(completed_at: 24.hours.ago..).count
 
-      @partition_breakdown = partition_breakdown(scope)
+      all_breakdown = partition_breakdown(scope)
+
+      # "Watched" subset (passed via ?watch=a,b,c; the JS layer syncs it
+      # with localStorage so the choice sticks across reloads).
+      @watched_keys        = (params[:watch] || "").split(",").map(&:strip).reject(&:empty?)
+      @partition_breakdown = @watched_keys.any? ? all_breakdown.select { |r| @watched_keys.include?(r[:partition]) } : []
+
+      # Browsable list of every active partition with filter + pagination.
+      @partition_search = params[:q].to_s.strip
+      @partition_page   = [ params[:page].to_i, 1 ].max
+      list              = all_breakdown
+      list              = list.select { |r| r[:partition].to_s.downcase.include?(@partition_search.downcase) } if @partition_search.present?
+      @partition_total_list = list.size
+      offset                = (@partition_page - 1) * PARTITION_LIST_PAGE_SIZE
+      @partition_list       = list[offset, PARTITION_LIST_PAGE_SIZE] || []
+
       load_adaptive_chart_data
       @throttle_buckets = ThrottleBucket
         .where(policy_name: @policy_name).order(:gate_name, :partition_key).limit(50)
@@ -140,9 +156,9 @@ module DispatchPolicy
           base
         }
 
-      merged
-        .sort_by { |r| [ r[:source], -(r[:eligible] + r[:scheduled] + r[:in_flight]), r[:partition] ] }
-        .first(50)
+      merged.sort_by { |r|
+        [ -(r[:eligible] + r[:scheduled] + r[:in_flight] + r[:completed_24h]), r[:source], r[:partition] ]
+      }
     end
 
     # Returns [[source_name, ->(ctx, rr_key) { partition_key }], ...]
@@ -158,45 +174,50 @@ module DispatchPolicy
       sources
     end
 
-    # Build fixed-axis chart data from PartitionObservation (one query
-    # covering the last hour). Every gate with partition_by generates
-    # observations now, so the charts work for non-adaptive policies too.
-    # Two series per partition:
-    #   - avg queue lag = total_lag_ms / observation_count  (line)
-    #   - observation_count                                 (bars)
+    # Build chart data from PartitionObservation. Two queries:
+    # - Global aggregated (one row per minute): cheap even with 1000s of
+    #   partitions because we SUM/AVG in SQL, not in Ruby.
+    # - Per-partition sparkline data, scoped to only the partitions we're
+    #   going to actually render (breakdown's top N).
     def load_adaptive_chart_data
       last_minute   = Time.current.utc.beginning_of_minute
       @chart_slots  = (0..59).map { |i| last_minute - (59 - i).minutes }
       @chart_labels = @chart_slots.map { |t| t.strftime("%H:%M") }
       slot_index    = @chart_slots.each_with_index.to_h
 
-      rows = PartitionObservation
+      @adaptive_global    = Array.new(@chart_slots.size)
+      @completions_global = Array.new(@chart_slots.size, 0)
+      global_rows = PartitionObservation
         .where(policy_name: @policy_name)
         .where("minute_bucket >= ?", @chart_slots.first)
-        .pluck(:partition_key, :minute_bucket, :total_lag_ms, :observation_count)
+        .group(:minute_bucket)
+        .pluck(:minute_bucket, Arel.sql("SUM(total_lag_ms)"), Arel.sql("SUM(observation_count)"))
+      global_rows.each do |bucket, total_lag, obs_count|
+        idx = slot_index[bucket.utc.beginning_of_minute]
+        next unless idx
+        @completions_global[idx] = obs_count
+        @adaptive_global[idx]    = obs_count.positive? ? (total_lag.to_f / obs_count).round(1) : nil
+      end
+
+      partition_keys = (@partition_breakdown || []).map { |r| r[:partition] }.uniq
+      @adaptive_samples    = {}
+      @completions_samples = {}
+      return if partition_keys.empty?
 
       per_partition_lag    = Hash.new { |h, k| h[k] = Array.new(@chart_slots.size) }
       per_partition_counts = Hash.new { |h, k| h[k] = Array.new(@chart_slots.size, 0) }
-      global_lag_by_slot   = Hash.new { |h, k| h[k] = [] }
-      global_counts        = Array.new(@chart_slots.size, 0)
-
+      rows = PartitionObservation
+        .where(policy_name: @policy_name, partition_key: partition_keys)
+        .where("minute_bucket >= ?", @chart_slots.first)
+        .pluck(:partition_key, :minute_bucket, :total_lag_ms, :observation_count)
       rows.each do |pk, bucket, total, count|
         idx = slot_index[bucket.utc.beginning_of_minute]
         next unless idx
-        avg_lag                        = count.positive? ? total.to_f / count : 0.0
-        per_partition_lag[pk][idx]     = avg_lag.round(1)
-        per_partition_counts[pk][idx]  = count
-        global_lag_by_slot[idx]       << avg_lag
-        global_counts[idx]            += count
+        per_partition_lag[pk][idx]    = count.positive? ? (total.to_f / count).round(1) : nil
+        per_partition_counts[pk][idx] = count
       end
-
       @adaptive_samples    = per_partition_lag
       @completions_samples = per_partition_counts
-      @completions_global  = global_counts
-      @adaptive_global     = (0...@chart_slots.size).map { |i|
-        vs = global_lag_by_slot[i]
-        vs.any? ? (vs.sum / vs.size.to_f).round(1) : nil
-      }
     end
   end
 end
