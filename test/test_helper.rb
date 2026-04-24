@@ -2,6 +2,16 @@
 
 ENV["RAILS_ENV"] = "test"
 
+require "simplecov"
+SimpleCov.start do
+  add_filter "/test/"
+  add_filter "/db/migrate/"
+  add_filter "/lib/dispatch_policy/version.rb"
+  add_filter "/lib/dispatch_policy/install_generator.rb"
+  enable_coverage :branch
+  track_files "{lib,app}/**/*.rb"
+end
+
 require_relative "dummy/config/environment"
 
 # Run migrations before rails/test_help triggers the pending-migration check.
