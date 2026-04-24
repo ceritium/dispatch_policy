@@ -11,8 +11,13 @@ module DispatchPolicy
       DEFAULT_EWMA_ALPHA  = 0.2
       DEFAULT_FAIL_FACTOR = 0.5
       DEFAULT_SLOW_FACTOR = 0.9
+      # Large default ceiling so forgetting `max:` doesn't accidentally
+      # uncap anything; users who want a tighter safety net set their own.
+      DEFAULT_MAX         = 1_000
 
-      def configure(initial_max:, min:, max:, target_latency:,
+      def configure(initial_max:, target_latency:,
+                    min: 1,
+                    max: DEFAULT_MAX,
                     ewma_alpha: DEFAULT_EWMA_ALPHA,
                     failure_decrease_factor: DEFAULT_FAIL_FACTOR,
                     overload_decrease_factor: DEFAULT_SLOW_FACTOR)
