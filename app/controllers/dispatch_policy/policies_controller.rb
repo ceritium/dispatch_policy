@@ -122,8 +122,24 @@ module DispatchPolicy
         row[:ewma_latency_ms] = stats[:ewma_latency_ms]
       end
 
-      rows.values
+      # Two different sources (say round_robin_by account_id + a gate
+      # partitioned by account_id) producing the same partition key yield
+      # identical counts — collapse them into one row with a merged source
+      # label instead of listing the same numbers twice.
+      merged = rows.values
         .reject { |r| r[:partition].nil? || r[:partition].empty? }
+        .group_by { |r| [ r[:partition], r[:eligible], r[:scheduled], r[:in_flight], r[:completed_24h] ] }
+        .map { |_, group|
+          base = group.first.dup
+          base[:source] = group.map { |r| r[:source] }.uniq.sort.join(" + ")
+          group.each do |r|
+            base[:current_max]     ||= r[:current_max]
+            base[:ewma_latency_ms] ||= r[:ewma_latency_ms]
+          end
+          base
+        }
+
+      merged
         .sort_by { |r| [ r[:source], -(r[:eligible] + r[:scheduled] + r[:in_flight]), r[:partition] ] }
         .first(50)
     end
