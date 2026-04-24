@@ -45,7 +45,7 @@ module DispatchPolicy
       # Browsable list of every active partition with filter + sort + pagination.
       @partition_search = params[:q].to_s.strip
       @partition_page   = [ params[:page].to_i, 1 ].max
-      @partition_sort   = %w[source partition pending in_flight completed_24h].include?(params[:sort]) ? params[:sort] : "activity"
+      @partition_sort   = %w[source partition pending in_flight completed_24h last_enqueued_at last_dispatched_at].include?(params[:sort]) ? params[:sort] : "activity"
       @partition_dir    = params[:dir] == "asc" ? "asc" : "desc"
 
       list = all_breakdown
@@ -94,16 +94,30 @@ module DispatchPolicy
 
       rows = Hash.new { |h, k|
         h[k] = {
-          source:          k[0],
-          partition:       k[1],
-          eligible:        0,
-          scheduled:       0,
-          in_flight:       0,
-          completed_24h:   0,
-          current_max:     nil,
-          ewma_latency_ms: nil
+          source:             k[0],
+          partition:          k[1],
+          eligible:           0,
+          scheduled:          0,
+          in_flight:          0,
+          completed_24h:      0,
+          last_enqueued_at:   nil,
+          last_dispatched_at: nil,
+          current_max:        nil,
+          ewma_latency_ms:    nil
         }
       }
+
+      # Activity timestamps bounded to the last 24h so the scan stays on
+      # an index-friendly slice of staged_jobs.
+      activity_rows = scope
+        .where("staged_at > ?", since_24h)
+        .group(:context, :round_robin_key)
+        .pluck(
+          :context,
+          :round_robin_key,
+          Arel.sql("MAX(staged_at)"),
+          Arel.sql("MAX(admitted_at)")
+        )
 
       sources.each do |name, extract|
         pending_counts = scope.pending.group(:context, :round_robin_key).pluck(
@@ -135,6 +149,13 @@ module DispatchPolicy
           partition = extract.call(ctx, rr_key)
           rows[[ name, partition ]][:completed_24h] += completed
         end
+
+        activity_rows.each do |ctx, rr_key, last_staged, last_admitted|
+          partition = extract.call(ctx, rr_key)
+          row       = rows[[ name, partition ]]
+          row[:last_enqueued_at]   = [ row[:last_enqueued_at], last_staged ].compact.max
+          row[:last_dispatched_at] = [ row[:last_dispatched_at], last_admitted ].compact.max
+        end
       end
 
       rows.each do |(source, partition), row|
@@ -155,8 +176,10 @@ module DispatchPolicy
           base = group.first.dup
           base[:source] = group.map { |r| r[:source] }.uniq.sort.join(" + ")
           group.each do |r|
-            base[:current_max]     ||= r[:current_max]
-            base[:ewma_latency_ms] ||= r[:ewma_latency_ms]
+            base[:current_max]        ||= r[:current_max]
+            base[:ewma_latency_ms]    ||= r[:ewma_latency_ms]
+            base[:last_enqueued_at]     = [ base[:last_enqueued_at], r[:last_enqueued_at] ].compact.max
+            base[:last_dispatched_at]   = [ base[:last_dispatched_at], r[:last_dispatched_at] ].compact.max
           end
           base
         }
@@ -167,13 +190,17 @@ module DispatchPolicy
     end
 
     def sort_partition_list(list, sort, dir)
+      # Put nulls at the bottom regardless of direction (Time#to_f on nil
+      # would crash; -Float::INFINITY sorts first, +Float::INFINITY last).
       key =
         case sort
-        when "source"        then ->(r) { [ r[:source], r[:partition] ] }
-        when "partition"     then ->(r) { r[:partition] }
-        when "pending"       then ->(r) { r[:eligible] + r[:scheduled] }
-        when "in_flight"     then ->(r) { r[:in_flight] }
-        when "completed_24h" then ->(r) { r[:completed_24h] }
+        when "source"             then ->(r) { [ r[:source], r[:partition] ] }
+        when "partition"          then ->(r) { r[:partition] }
+        when "pending"            then ->(r) { r[:eligible] + r[:scheduled] }
+        when "in_flight"          then ->(r) { r[:in_flight] }
+        when "completed_24h"      then ->(r) { r[:completed_24h] }
+        when "last_enqueued_at"   then ->(r) { r[:last_enqueued_at]&.to_f || 0 }
+        when "last_dispatched_at" then ->(r) { r[:last_dispatched_at]&.to_f || 0 }
         else ->(r) { r[:eligible] + r[:scheduled] + r[:in_flight] + r[:completed_24h] }
         end
       sorted = list.sort_by(&key)
