@@ -25,6 +25,11 @@
   </div>
 </div>
 
+<% if @adaptive_global.any? %>
+  <h2>Adaptive — EWMA queue lag (avg across partitions, last hour)</h2>
+  <%= line_chart_svg(@adaptive_global, label: "avg ewma_latency_ms") %>
+<% end %>
+
 <h2>Partition breakdown</h2>
 <% if @partition_breakdown.empty? %>
   <p class="muted">This policy declares no partitioning (no gate with <code>partition_by</code> and no <code>round_robin_by</code>).</p>
@@ -40,6 +45,7 @@
         <th class="text-end">Completed (24h)</th>
         <th class="text-end">Adaptive cap</th>
         <th class="text-end">EWMA latency (ms)</th>
+        <th>Trend</th>
       </tr>
     </thead>
     <tbody>
@@ -56,6 +62,14 @@
           </td>
           <td class="text-end">
             <% if row[:ewma_latency_ms] %><%= row[:ewma_latency_ms] %><% else %><span class="muted">—</span><% end %>
+          </td>
+          <td>
+            <% samples = @adaptive_samples[row[:partition]] %>
+            <% if samples.present? %>
+              <%= sparkline(samples.map(&:last)) %>
+            <% else %>
+              <span class="muted">—</span>
+            <% end %>
           </td>
         </tr>
       <% end %>

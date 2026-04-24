@@ -35,6 +35,8 @@ module DispatchPolicy
       @completed_24h           = scope.completed.where(completed_at: 24.hours.ago..).count
 
       @partition_breakdown = partition_breakdown(scope)
+      @adaptive_samples    = adaptive_samples
+      @adaptive_global     = adaptive_global_series(@adaptive_samples)
       @throttle_buckets = ThrottleBucket
         .where(policy_name: @policy_name).order(:gate_name, :partition_key).limit(50)
       @pending_jobs = scope.pending.order(:priority, :staged_at).limit(50)
@@ -155,6 +157,30 @@ module DispatchPolicy
       end
       sources << [ "round_robin_by", ->(_ctx, rr) { rr } ] if @policy.round_robin?
       sources
+    end
+
+    # All samples from the last hour for this policy, grouped by partition.
+    # Returns { partition_key => [[Time, ewma_ms], ...] }.
+    def adaptive_samples
+      AdaptiveConcurrencySample
+        .where(policy_name: @policy_name)
+        .where("minute_bucket >= ?", 1.hour.ago)
+        .order(:minute_bucket)
+        .pluck(:partition_key, :minute_bucket, :ewma_latency_ms)
+        .group_by(&:first)
+        .transform_values { |rows| rows.map { |(_, t, v)| [ t, v ] } }
+    end
+
+    # For the global chart: average EWMA across partitions per minute bucket.
+    def adaptive_global_series(partition_samples)
+      # Collect (minute => [ewma values]) across partitions.
+      by_minute = Hash.new { |h, k| h[k] = [] }
+      partition_samples.each do |_partition, points|
+        points.each { |(t, v)| by_minute[t.utc.beginning_of_minute] << v }
+      end
+      by_minute
+        .map { |t, values| [ t, values.sum / values.size.to_f ] }
+        .sort_by(&:first)
     end
   end
 end

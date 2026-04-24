@@ -24,6 +24,7 @@ module DispatchPolicy
         begin
           DispatchPolicy::Tick.prune_orphan_gate_rows
           DispatchPolicy::Tick.prune_idle_partitions
+          DispatchPolicy::AdaptiveConcurrencySample.prune!
         rescue ActiveRecord::NoDatabaseError,
                ActiveRecord::StatementInvalid,
                ActiveRecord::ConnectionNotEstablished
