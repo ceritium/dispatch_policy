@@ -28,18 +28,20 @@ module DispatchPolicy
       attr_accessor :_dispatch_partitions, :_dispatch_admitted_at
 
       around_perform do |job, block|
+        # queue_lag = admitted_at → perform_start. Pure signal for "is the
+        # adapter queue building up?" (high = admitting too fast) vs "are
+        # workers idle?" (near zero = ready for more). Measured BEFORE
+        # block.call so perform duration doesn't pollute it.
+        admitted_at   = job._dispatch_admitted_at
+        perform_start = Time.current
+        queue_lag_ms  = admitted_at ? ((perform_start - admitted_at) * 1000).to_i : 0
+
         succeeded = false
         begin
           block.call
           succeeded = true
         ensure
           policy_name = job.class.resolved_dispatch_policy&.name
-          now         = Time.current
-          # End-to-end latency from admission: includes queue wait on the
-          # real adapter. If workers are saturated this grows even though
-          # the perform itself was fast, and the adaptive gate shrinks.
-          admitted_at = job._dispatch_admitted_at || now
-          duration_ms = ((now - admitted_at) * 1000).to_i
 
           if job._dispatch_partitions.present?
             DispatchPolicy::Tick.release(
@@ -47,14 +49,13 @@ module DispatchPolicy
               partitions:  job._dispatch_partitions
             )
 
-            # Feed adaptive-concurrency gates with what just happened.
             policy = job.class.resolved_dispatch_policy
             job._dispatch_partitions.each do |gate_name, partition_key|
               gate = policy&.gates&.find { |g| g.name == gate_name.to_sym }
               next unless gate.is_a?(DispatchPolicy::Gates::AdaptiveConcurrency)
               gate.record_observation(
                 partition_key: partition_key,
-                duration_ms:   duration_ms,
+                queue_lag_ms:  queue_lag_ms,
                 succeeded:     succeeded
               )
             end
