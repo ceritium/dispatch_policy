@@ -31,6 +31,14 @@ Use it when you need:
 - **Round-robin fairness across tenants** (LATERAL batch fetch) so one
   tenant's burst can't starve the others.
 
+## Demo
+
+A runnable playground that exercises every gate and the admin UI lives
+at [ceritium/dispatch_policy-demo](https://github.com/ceritium/dispatch_policy-demo).
+Clone it, `bundle && rails db:setup`, and use the in-browser forms to
+fire jobs through throttle / concurrency / adaptive / round-robin
+policies while the admin UI updates in real time.
+
 ## Install
 
 Add to your `Gemfile`:
