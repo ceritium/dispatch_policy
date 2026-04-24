@@ -27,12 +27,12 @@
 
 <h2>Partition breakdown</h2>
 <% if @partition_breakdown.empty? %>
-  <p class="muted">No partitioned gates declared — nothing to break down.</p>
+  <p class="muted">This policy declares no partitioning (no gate with <code>partition_by</code> and no <code>round_robin_by</code>).</p>
 <% else %>
   <table>
     <thead>
       <tr>
-        <th>Gate</th>
+        <th>Source</th>
         <th>Partition</th>
         <th class="text-end">Pending (eligible)</th>
         <th class="text-end">Pending (scheduled)</th>
@@ -43,7 +43,7 @@
     <tbody>
       <% @partition_breakdown.each do |row| %>
         <tr>
-          <td><%= row[:gate] %></td>
+          <td><%= row[:source] %></td>
           <td><code><%= row[:partition] %></code></td>
           <td class="text-end"><%= row[:eligible] %></td>
           <td class="text-end"><%= row[:scheduled] %></td>
@@ -54,11 +54,11 @@
     </tbody>
   </table>
   <p class="muted" style="font-size:0.8em;">
-    <em>Pending (eligible)</em> is admission-ready and will be evaluated next tick.
+    <em>Source</em> is the partitioning declaration: a gate's <code>partition_by</code> or the policy's <code>round_robin_by</code>.
+    <em>Pending (eligible)</em> is admission-ready next tick.
     <em>Pending (scheduled)</em> is waiting on <code>not_before_at</code>.
-    <em>In-flight</em> is the <code>PartitionInflightCount</code> counter for gates that track it
-    (concurrency, global_cap); throttle gates don't maintain one.
-    <em>Completed (24h)</em> counts staged rows whose performs finished in the last day.
+    <em>In-flight</em> is admitted staged rows whose perform hasn't completed.
+    <em>Completed (24h)</em> counts rows whose performs finished in the last day.
   </p>
 <% end %>
 

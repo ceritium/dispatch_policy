@@ -44,63 +44,79 @@ module DispatchPolicy
 
     def load_policy
       @policy_name = params[:policy_name]
-      @job_class   = DispatchPolicy.registry[@policy_name]
+      @job_class   = DispatchPolicy.registry[@policy_name] ||
+                     Tick.autoload_job_for(@policy_name)
       raise ActiveRecord::RecordNotFound unless @job_class
       @policy = @job_class.resolved_dispatch_policy
     end
 
-    # Per-(gate, partition) breakdown of pending-eligible, pending-scheduled
-    # and in-flight counts. Combines rows from PartitionInflightCount
-    # (authoritative for admitted in-flight) with partition keys derived
-    # from pending rows' context (so partitions that only have pending
-    # work are visible too).
+    # Per-(source, partition) breakdown of pending-eligible / pending-scheduled
+    # / in-flight / completed-24h. A "source" is either a gate with a
+    # partition_by (uses gate.partition_key_for(context)) or the policy's
+    # round_robin_by declaration (uses the round_robin_key column directly).
+    # All four counts come from StagedJob groupings; PartitionInflightCount
+    # is an admission-time optimization, not the user-facing truth.
     def partition_breakdown(scope)
-      gates = (@policy&.gates || []).select(&:partition_by)
-      return [] if gates.empty?
+      sources = partition_sources
+      return [] if sources.empty?
 
       now       = Time.current
       now_iso   = now.iso8601
       since_24h = 24.hours.ago.iso8601
 
-      pending_ctx_counts = scope.pending.group(:context).pluck(
-        :context,
-        Arel.sql("count(*) filter (where not_before_at is null or not_before_at <= '#{now_iso}')"),
-        Arel.sql("count(*) filter (where not_before_at > '#{now_iso}')")
-      )
-
-      completed_ctx_counts = scope.completed
-        .where("completed_at > ?", since_24h)
-        .group(:context).pluck(:context, Arel.sql("count(*)"))
-
-      inflight = PartitionInflightCount.where(policy_name: @policy_name)
-        .pluck(:gate_name, :partition_key, :in_flight)
-        .each_with_object({}) { |(g, k, n), h| h[[ g, k ]] = n }
-
       rows = Hash.new { |h, k|
-        h[k] = { gate: k[0], partition: k[1], eligible: 0, scheduled: 0, in_flight: 0, completed_24h: 0 }
+        h[k] = { source: k[0], partition: k[1], eligible: 0, scheduled: 0, in_flight: 0, completed_24h: 0 }
       }
 
-      gates.each do |gate|
-        pending_ctx_counts.each do |ctx, eligible, scheduled|
-          partition = gate.partition_key_for((ctx || {}).symbolize_keys)
-          row = rows[[ gate.name.to_s, partition ]]
+      sources.each do |name, extract|
+        pending_counts = scope.pending.group(:context, :round_robin_key).pluck(
+          :context,
+          :round_robin_key,
+          Arel.sql("count(*) filter (where not_before_at is null or not_before_at <= '#{now_iso}')"),
+          Arel.sql("count(*) filter (where not_before_at > '#{now_iso}')")
+        )
+        pending_counts.each do |ctx, rr_key, eligible, scheduled|
+          partition = extract.call(ctx, rr_key)
+          row = rows[[ name, partition ]]
           row[:eligible]  += eligible
           row[:scheduled] += scheduled
         end
 
-        completed_ctx_counts.each do |ctx, completed|
-          partition = gate.partition_key_for((ctx || {}).symbolize_keys)
-          rows[[ gate.name.to_s, partition ]][:completed_24h] += completed
+        admitted_counts = scope.admitted.group(:context, :round_robin_key).pluck(
+          :context, :round_robin_key, Arel.sql("count(*)")
+        )
+        admitted_counts.each do |ctx, rr_key, in_flight|
+          partition = extract.call(ctx, rr_key)
+          rows[[ name, partition ]][:in_flight] += in_flight
+        end
+
+        completed_counts = scope.completed.where("completed_at > ?", since_24h)
+          .group(:context, :round_robin_key).pluck(
+            :context, :round_robin_key, Arel.sql("count(*)")
+          )
+        completed_counts.each do |ctx, rr_key, completed|
+          partition = extract.call(ctx, rr_key)
+          rows[[ name, partition ]][:completed_24h] += completed
         end
       end
 
-      inflight.each do |(gate, partition), in_flight|
-        rows[[ gate, partition ]][:in_flight] = in_flight
-      end
+      rows.values
+        .reject { |r| r[:partition].nil? || r[:partition].empty? }
+        .sort_by { |r| [ r[:source], -(r[:eligible] + r[:scheduled] + r[:in_flight]), r[:partition] ] }
+        .first(50)
+    end
 
-      rows.values.sort_by { |r|
-        [ r[:gate], -(r[:eligible] + r[:scheduled] + r[:in_flight]), r[:partition] ]
-      }.first(50)
+    # Returns [[source_name, ->(ctx, rr_key) { partition_key }], ...]
+    # covering every partition-producing declaration on the policy: every
+    # gate with a partition_by, plus round_robin_by if declared.
+    def partition_sources
+      return [] unless @policy
+
+      sources = @policy.gates.select(&:partition_by).map do |gate|
+        [ gate.name.to_s, ->(ctx, _rr) { gate.partition_key_for((ctx || {}).symbolize_keys) } ]
+      end
+      sources << [ "round_robin_by", ->(_ctx, rr) { rr } ] if @policy.round_robin?
+      sources
     end
   end
 end
