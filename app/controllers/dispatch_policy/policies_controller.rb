@@ -42,11 +42,16 @@ module DispatchPolicy
       @watched_keys        = (params[:watch] || "").split(",").map(&:strip).reject(&:empty?)
       @partition_breakdown = @watched_keys.any? ? all_breakdown.select { |r| @watched_keys.include?(r[:partition]) } : []
 
-      # Browsable list of every active partition with filter + pagination.
+      # Browsable list of every active partition with filter + sort + pagination.
       @partition_search = params[:q].to_s.strip
       @partition_page   = [ params[:page].to_i, 1 ].max
-      list              = all_breakdown
-      list              = list.select { |r| r[:partition].to_s.downcase.include?(@partition_search.downcase) } if @partition_search.present?
+      @partition_sort   = %w[source partition pending in_flight completed_24h].include?(params[:sort]) ? params[:sort] : "activity"
+      @partition_dir    = params[:dir] == "asc" ? "asc" : "desc"
+
+      list = all_breakdown
+      list = list.select { |r| r[:partition].to_s.downcase.include?(@partition_search.downcase) } if @partition_search.present?
+      list = sort_partition_list(list, @partition_sort, @partition_dir)
+
       @partition_total_list = list.size
       offset                = (@partition_page - 1) * PARTITION_LIST_PAGE_SIZE
       @partition_list       = list[offset, PARTITION_LIST_PAGE_SIZE] || []
@@ -159,6 +164,20 @@ module DispatchPolicy
       merged.sort_by { |r|
         [ -(r[:eligible] + r[:scheduled] + r[:in_flight] + r[:completed_24h]), r[:source], r[:partition] ]
       }
+    end
+
+    def sort_partition_list(list, sort, dir)
+      key =
+        case sort
+        when "source"        then ->(r) { [ r[:source], r[:partition] ] }
+        when "partition"     then ->(r) { r[:partition] }
+        when "pending"       then ->(r) { r[:eligible] + r[:scheduled] }
+        when "in_flight"     then ->(r) { r[:in_flight] }
+        when "completed_24h" then ->(r) { r[:completed_24h] }
+        else ->(r) { r[:eligible] + r[:scheduled] + r[:in_flight] + r[:completed_24h] }
+        end
+      sorted = list.sort_by(&key)
+      dir == "asc" ? sorted : sorted.reverse
     end
 
     # Returns [[source_name, ->(ctx, rr_key) { partition_key }], ...]

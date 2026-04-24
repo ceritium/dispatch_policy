@@ -111,15 +111,27 @@
     <% if @partition_list.empty? %>
       <p class="muted">No matches.</p>
     <% else %>
+      <%
+        sort_link = lambda { |label, col, align_end: false|
+          active = @partition_sort == col
+          next_dir = active && @partition_dir == "desc" ? "asc" : "desc"
+          arrow = active ? (@partition_dir == "asc" ? " ▲" : " ▼") : ""
+          content_tag(:th, class: (align_end ? "text-end" : nil)) do
+            link_to "#{label}#{arrow}",
+              url_for(sort: col, dir: next_dir, q: @partition_search.presence, page: nil, watch: params[:watch]),
+              class: (active ? "sorted" : nil)
+          end
+        }
+      %>
       <table data-policy-name="<%= @policy_name %>">
         <thead>
           <tr>
             <th></th>
-            <th>Source</th>
-            <th>Partition</th>
-            <th class="text-end">Pending</th>
-            <th class="text-end">In-flight</th>
-            <th class="text-end">Completed (24h)</th>
+            <%= sort_link.call("Source",         "source") %>
+            <%= sort_link.call("Partition",      "partition") %>
+            <%= sort_link.call("Pending",        "pending",       align_end: true) %>
+            <%= sort_link.call("In-flight",      "in_flight",     align_end: true) %>
+            <%= sort_link.call("Completed (24h)", "completed_24h", align_end: true) %>
           </tr>
         </thead>
         <tbody>
@@ -145,13 +157,14 @@
 
       <% total_pages = (@partition_total_list / DispatchPolicy::PoliciesController::PARTITION_LIST_PAGE_SIZE.to_f).ceil %>
       <% if total_pages > 1 %>
+        <% page_params = { q: @partition_search.presence, watch: params[:watch], sort: params[:sort], dir: params[:dir] } %>
         <div class="pagination">
           <% if @partition_page > 1 %>
-            <%= link_to "← prev", url_for(page: @partition_page - 1, q: @partition_search.presence, watch: params[:watch]) %>
+            <%= link_to "← prev", url_for(page_params.merge(page: @partition_page - 1)) %>
           <% end %>
           <span class="muted">page <%= @partition_page %> / <%= total_pages %></span>
           <% if @partition_page < total_pages %>
-            <%= link_to "next →", url_for(page: @partition_page + 1, q: @partition_search.presence, watch: params[:watch]) %>
+            <%= link_to "next →", url_for(page_params.merge(page: @partition_page + 1)) %>
           <% end %>
         </div>
       <% end %>
