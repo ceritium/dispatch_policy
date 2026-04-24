@@ -12,7 +12,6 @@ module DispatchPolicy
              partition_by:   ->(ctx) { ctx[:tenant] },
              initial_max:    5,
              min:            1,
-             max:            10,
              target_latency: 200,
              ewma_alpha:     0.5
       end
@@ -65,13 +64,14 @@ module DispatchPolicy
       assert_operator stats_for("A").current_max, :<=, 5
     end
 
-    test "current_max grows toward max on fast successes" do
+    test "current_max grows unbounded on fast successes" do
       AdaptiveConcurrencyStats.seed!(
         policy_name: policy_name, gate_name: "adaptive_concurrency",
         partition_key: "A", initial_max: 3
       )
       20.times { record("A", duration_ms: 50, succeeded: true) }
-      assert_equal 10, stats_for("A").current_max
+      # +1 per fast success; nothing caps it but target_latency.
+      assert_equal 23, stats_for("A").current_max
     end
 
     test "around_perform records duration + success for adaptive gates" do

@@ -35,7 +35,7 @@ module DispatchPolicy
     def self.record_observation!(
       policy_name:, gate_name:, partition_key:,
       duration_ms:, succeeded:,
-      alpha:, min:, max:, target_latency_ms:,
+      alpha:, min:, target_latency_ms:,
       fail_factor:, slow_factor:, initial_max:
     )
       seed!(
@@ -45,16 +45,20 @@ module DispatchPolicy
         initial_max:   initial_max
       )
 
+      # No hard upper bound — the algorithm self-limits via target_latency:
+      # when latency rises past the target, slow_factor shrinks current_max;
+      # on failure, fail_factor shrinks harder. Only min is enforced so a
+      # partition can't get locked out entirely.
       sql = <<~SQL.squish
         UPDATE #{quoted_table_name}
         SET
           ewma_latency_ms = ewma_latency_ms * (1 - ?) + ? * ?,
           sample_count    = sample_count + 1,
-          current_max = GREATEST(?, LEAST(?, CASE
-            WHEN ? = FALSE THEN GREATEST(FLOOR(current_max * ?)::int, 1)
-            WHEN (ewma_latency_ms * (1 - ?) + ? * ?) > ? THEN GREATEST(FLOOR(current_max * ?)::int, 1)
-            ELSE LEAST(current_max + 1, ?)
-          END)),
+          current_max = GREATEST(?, CASE
+            WHEN ? = FALSE                                THEN FLOOR(current_max * ?)::int
+            WHEN (ewma_latency_ms * (1 - ?) + ? * ?) > ?  THEN FLOOR(current_max * ?)::int
+            ELSE current_max + 1
+          END),
           last_observed_at = ?,
           updated_at       = ?
         WHERE policy_name = ? AND gate_name = ? AND partition_key = ?
@@ -65,10 +69,9 @@ module DispatchPolicy
         sanitize_sql_array([
           sql,
           alpha, alpha, duration_ms,
-          min.to_i, max.to_i,
+          min.to_i,
           succeeded, fail_factor,
           alpha, alpha, duration_ms, target_latency_ms, slow_factor,
-          max.to_i,
           now, now,
           policy_name, gate_name.to_s, partition_key.to_s
         ])
