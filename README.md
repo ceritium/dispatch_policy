@@ -81,19 +81,51 @@ end
 
 ## Running the tick
 
-Enqueue `DispatchPolicy::DispatchTickLoopJob` once at boot (or via your
-scheduler); it self-chains at the end of each perform so it stays alive
-without a cron entry. Add a cron safety net if you want:
+The gem exposes `DispatchPolicy::TickLoop.run(policy_name:, stop_when:)` but
+**does not ship a tick job** — concurrency semantics are queue-adapter
+specific (GoodJob's `total_limit`, Sidekiq Enterprise uniqueness, etc.), so
+you write a small job in your app that wraps the loop with whatever dedup
+your adapter provides. Example for GoodJob:
 
 ```ruby
-# config/application.rb, GoodJob cron example
+# app/jobs/dispatch_tick_loop_job.rb
+class DispatchTickLoopJob < ApplicationJob
+  include GoodJob::ActiveJobExtensions::Concurrency
+  good_job_control_concurrency_with(
+    total_limit: 1,
+    key: -> { "dispatch_tick_loop:#{arguments.first || 'all'}" }
+  )
+
+  def perform(policy_name = nil)
+    deadline = Time.current + DispatchPolicy.config.tick_max_duration
+    DispatchPolicy::TickLoop.run(
+      policy_name: policy_name,
+      stop_when:   -> {
+        GoodJob.current_thread_shutting_down? || Time.current >= deadline
+      }
+    )
+    # Self-chain so the next run starts immediately; cron below is a safety net.
+    DispatchTickLoopJob.set(wait: 1.second).perform_later(policy_name)
+  end
+end
+```
+
+Schedule it (every 10s as a safety net — the self-chain keeps one alive
+under normal operation):
+
+```ruby
+# config/application.rb
 config.good_job.cron = {
-  dispatch_policy_tick: {
+  dispatch_tick_loop: {
     cron:  "*/10 * * * * *",
-    class: "DispatchPolicy::DispatchTickLoopJob"
+    class: "DispatchTickLoopJob"
   }
 }
 ```
+
+For adapters without a first-class dedup mechanism, implement it yourself
+(e.g. `pg_try_advisory_lock` inside `perform`) before calling
+`DispatchPolicy::TickLoop.run`.
 
 ## Gates shipped
 
