@@ -3,7 +3,10 @@
   <head>
     <title>DispatchPolicy</title>
     <%= csrf_meta_tags %>
+    <meta name="turbo-refresh-method" content="morph">
+    <meta name="turbo-refresh-scroll" content="preserve">
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@hotwired/turbo@8.0.12/dist/turbo.es2017-umd.min.js"></script>
     <style>
       body { font-family: -apple-system, system-ui, sans-serif; max-width: 1200px; margin: 2em auto; padding: 0 1em; color: #222; }
       h1 { font-size: 1.6em; margin-bottom: 0.25em; }
@@ -44,19 +47,48 @@
 
     <script>
       (function () {
-        // Auto-refresh preference in localStorage.
         const KEY = "dispatch_policy_refresh_seconds";
-        const current = parseInt(localStorage.getItem(KEY) || "0", 10);
-        document.querySelectorAll(".refresh-bar button[data-refresh]").forEach(btn => {
-          if (parseInt(btn.dataset.refresh, 10) === current) btn.classList.add("on");
-          btn.addEventListener("click", () => {
-            const v = parseInt(btn.dataset.refresh, 10);
-            if (v === 0) localStorage.removeItem(KEY);
-            else         localStorage.setItem(KEY, String(v));
-            location.reload();
+        let refreshTimer = null;
+
+        function scheduleRefresh() {
+          clearTimeout(refreshTimer);
+          const seconds = parseInt(localStorage.getItem(KEY) || "0", 10);
+          if (seconds <= 0) return;
+          refreshTimer = setTimeout(() => {
+            // Turbo.visit fetches + morphs thanks to the turbo-refresh-method
+            // meta tag, so the page updates in place without a full reload —
+            // scroll position, chart tooltips, form focus stay put.
+            if (window.Turbo) {
+              Turbo.visit(location.href, { action: "replace" });
+            } else {
+              location.reload();
+            }
+          }, seconds * 1000);
+        }
+
+        function wireRefreshButtons() {
+          const current = parseInt(localStorage.getItem(KEY) || "0", 10);
+          document.querySelectorAll(".refresh-bar button[data-refresh]").forEach(btn => {
+            btn.classList.toggle("on", parseInt(btn.dataset.refresh, 10) === current);
+            if (btn.dataset.wired) return;
+            btn.dataset.wired = "true";
+            btn.addEventListener("click", () => {
+              const v = parseInt(btn.dataset.refresh, 10);
+              if (v === 0) localStorage.removeItem(KEY);
+              else         localStorage.setItem(KEY, String(v));
+              wireRefreshButtons();
+              scheduleRefresh();
+            });
           });
-        });
-        if (current > 0) setTimeout(() => location.reload(), current * 1000);
+        }
+
+        // Charts get destroyed + rebuilt on each render because Chart.js
+        // keeps a registry keyed by canvas element; the morphed canvases
+        // are fresh DOM, so previous Chart instances would leak listeners.
+        function destroyExistingCharts() {
+          if (!window.Chart) return;
+          Chart.instances && Object.values(Chart.instances).forEach(c => c.destroy && c.destroy());
+        }
 
         // Chart.js initialization for canvases with data-chart.
         const BLUE        = "#0057b7";
@@ -73,6 +105,8 @@
           try { return JSON.parse(s); } catch (e) { return fallback; }
         }
 
+        function renderCharts() {
+          if (!window.Chart) return;
         document.querySelectorAll("canvas[data-chart]").forEach(canvas => {
           const kind   = canvas.dataset.chart;
           const values = parseJSON(canvas.dataset.values, []);
@@ -150,6 +184,19 @@
           };
           new Chart(canvas, config);
         });
+        }
+
+        function boot() {
+          destroyExistingCharts();
+          wireRefreshButtons();
+          renderCharts();
+          scheduleRefresh();
+        }
+
+        // Run on the initial load + whenever Turbo renders (morph or full).
+        document.addEventListener("DOMContentLoaded", boot);
+        document.addEventListener("turbo:render", boot);
+        document.addEventListener("turbo:load",   boot);
       })();
     </script>
   </body>
