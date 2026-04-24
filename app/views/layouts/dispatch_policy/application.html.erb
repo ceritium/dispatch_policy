@@ -3,6 +3,13 @@
   <head>
     <title>DispatchPolicy</title>
     <%= csrf_meta_tags %>
+    <%
+      refresh_interval = params[:refresh].to_i
+      refresh_on       = refresh_interval.positive?
+    %>
+    <% if refresh_on %>
+      <meta http-equiv="refresh" content="<%= refresh_interval %>">
+    <% end %>
     <style>
       body { font-family: -apple-system, system-ui, sans-serif; max-width: 1200px; margin: 2em auto; padding: 0 1em; color: #222; }
       h1 { font-size: 1.6em; margin-bottom: 0.25em; }
@@ -20,9 +27,30 @@
       .back { font-size: 0.9em; }
       .stale { color: #c92a2a; }
       .badge { display: inline-block; padding: 0.1em 0.5em; background: #eee; border-radius: 3px; font-size: 0.8em; margin-right: 0.25em; }
+      .text-end { text-align: right; }
+      .refresh-bar { display: flex; gap: 0.5em; align-items: center; justify-content: flex-end; font-size: 0.85em; margin-bottom: 0.5em; }
+      .refresh-bar a { text-decoration: none; padding: 0.15em 0.5em; border: 1px solid #ddd; border-radius: 3px; color: #555; }
+      .refresh-bar a.on { background: #e3f0d6; border-color: #b7d59c; color: #2b5a18; }
+      .refresh-bar a:hover { background: #f4f4f4; }
+      .refresh-bar a.on:hover { background: #d7e7c5; }
     </style>
   </head>
   <body>
+    <div class="refresh-bar">
+      <span class="muted">Auto-refresh:</span>
+      <% [
+        [ "off", 0 ],
+        [ "2s",  2 ],
+        [ "5s",  5 ],
+        [ "15s", 15 ]
+      ].each do |label, seconds| %>
+        <% active = (refresh_interval == seconds) || (seconds.zero? && !refresh_on) %>
+        <%= link_to label,
+              url_for(request.query_parameters.merge(refresh: seconds.zero? ? nil : seconds).compact),
+              class: (active ? "on" : nil) %>
+      <% end %>
+    </div>
+
     <%= yield %>
   </body>
 </html>

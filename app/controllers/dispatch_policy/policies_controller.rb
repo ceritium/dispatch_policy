@@ -58,18 +58,27 @@ module DispatchPolicy
       gates = (@policy&.gates || []).select(&:partition_by)
       return [] if gates.empty?
 
-      now = Time.current
+      now       = Time.current
+      now_iso   = now.iso8601
+      since_24h = 24.hours.ago.iso8601
+
       pending_ctx_counts = scope.pending.group(:context).pluck(
         :context,
-        Arel.sql("count(*) filter (where not_before_at is null or not_before_at <= '#{now.iso8601}')"),
-        Arel.sql("count(*) filter (where not_before_at > '#{now.iso8601}')")
+        Arel.sql("count(*) filter (where not_before_at is null or not_before_at <= '#{now_iso}')"),
+        Arel.sql("count(*) filter (where not_before_at > '#{now_iso}')")
       )
+
+      completed_ctx_counts = scope.completed
+        .where("completed_at > ?", since_24h)
+        .group(:context).pluck(:context, Arel.sql("count(*)"))
 
       inflight = PartitionInflightCount.where(policy_name: @policy_name)
         .pluck(:gate_name, :partition_key, :in_flight)
         .each_with_object({}) { |(g, k, n), h| h[[ g, k ]] = n }
 
-      rows = Hash.new { |h, k| h[k] = { gate: k[0], partition: k[1], eligible: 0, scheduled: 0, in_flight: 0 } }
+      rows = Hash.new { |h, k|
+        h[k] = { gate: k[0], partition: k[1], eligible: 0, scheduled: 0, in_flight: 0, completed_24h: 0 }
+      }
 
       gates.each do |gate|
         pending_ctx_counts.each do |ctx, eligible, scheduled|
@@ -78,13 +87,20 @@ module DispatchPolicy
           row[:eligible]  += eligible
           row[:scheduled] += scheduled
         end
+
+        completed_ctx_counts.each do |ctx, completed|
+          partition = gate.partition_key_for((ctx || {}).symbolize_keys)
+          rows[[ gate.name.to_s, partition ]][:completed_24h] += completed
+        end
       end
 
       inflight.each do |(gate, partition), in_flight|
         rows[[ gate, partition ]][:in_flight] = in_flight
       end
 
-      rows.values.sort_by { |r| [ r[:gate], -(r[:eligible] + r[:scheduled] + r[:in_flight]), r[:partition] ] }.first(50)
+      rows.values.sort_by { |r|
+        [ r[:gate], -(r[:eligible] + r[:scheduled] + r[:in_flight]), r[:partition] ]
+      }.first(50)
     end
   end
 end
