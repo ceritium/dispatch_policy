@@ -34,8 +34,7 @@ module DispatchPolicy
       @admitted_count          = scope.admitted.count
       @completed_24h           = scope.completed.where(completed_at: 24.hours.ago..).count
 
-      @partition_counts = PartitionInflightCount
-        .where(policy_name: @policy_name).order(updated_at: :desc).limit(50)
+      @partition_breakdown = partition_breakdown(scope)
       @throttle_buckets = ThrottleBucket
         .where(policy_name: @policy_name).order(:gate_name, :partition_key).limit(50)
       @pending_jobs = scope.pending.order(:priority, :staged_at).limit(50)
@@ -48,6 +47,44 @@ module DispatchPolicy
       @job_class   = DispatchPolicy.registry[@policy_name]
       raise ActiveRecord::RecordNotFound unless @job_class
       @policy = @job_class.resolved_dispatch_policy
+    end
+
+    # Per-(gate, partition) breakdown of pending-eligible, pending-scheduled
+    # and in-flight counts. Combines rows from PartitionInflightCount
+    # (authoritative for admitted in-flight) with partition keys derived
+    # from pending rows' context (so partitions that only have pending
+    # work are visible too).
+    def partition_breakdown(scope)
+      gates = (@policy&.gates || []).select(&:partition_by)
+      return [] if gates.empty?
+
+      now = Time.current
+      pending_ctx_counts = scope.pending.group(:context).pluck(
+        :context,
+        Arel.sql("count(*) filter (where not_before_at is null or not_before_at <= '#{now.iso8601}')"),
+        Arel.sql("count(*) filter (where not_before_at > '#{now.iso8601}')")
+      )
+
+      inflight = PartitionInflightCount.where(policy_name: @policy_name)
+        .pluck(:gate_name, :partition_key, :in_flight)
+        .each_with_object({}) { |(g, k, n), h| h[[ g, k ]] = n }
+
+      rows = Hash.new { |h, k| h[k] = { gate: k[0], partition: k[1], eligible: 0, scheduled: 0, in_flight: 0 } }
+
+      gates.each do |gate|
+        pending_ctx_counts.each do |ctx, eligible, scheduled|
+          partition = gate.partition_key_for((ctx || {}).symbolize_keys)
+          row = rows[[ gate.name.to_s, partition ]]
+          row[:eligible]  += eligible
+          row[:scheduled] += scheduled
+        end
+      end
+
+      inflight.each do |(gate, partition), in_flight|
+        rows[[ gate, partition ]][:in_flight] = in_flight
+      end
+
+      rows.values.sort_by { |r| [ r[:gate], -(r[:eligible] + r[:scheduled] + r[:in_flight]), r[:partition] ] }.first(50)
     end
   end
 end

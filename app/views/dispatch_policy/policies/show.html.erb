@@ -25,25 +25,38 @@
   </div>
 </div>
 
-<h2>Partition in-flight counts</h2>
-<% if @partition_counts.empty? %>
-  <p class="muted">No partition counters yet.</p>
+<h2>Partition breakdown</h2>
+<% if @partition_breakdown.empty? %>
+  <p class="muted">No partitioned gates declared — nothing to break down.</p>
 <% else %>
   <table>
     <thead>
-      <tr><th>Gate</th><th>Partition</th><th>In-flight</th><th>Updated</th></tr>
+      <tr>
+        <th>Gate</th>
+        <th>Partition</th>
+        <th class="text-end">Pending (eligible)</th>
+        <th class="text-end">Pending (scheduled)</th>
+        <th class="text-end">In-flight</th>
+      </tr>
     </thead>
     <tbody>
-      <% @partition_counts.each do |row| %>
+      <% @partition_breakdown.each do |row| %>
         <tr>
-          <td><%= row.gate_name %></td>
-          <td><code><%= row.partition_key %></code></td>
-          <td><%= row.in_flight %></td>
-          <td><%= row.updated_at.to_s(:short) rescue row.updated_at %></td>
+          <td><%= row[:gate] %></td>
+          <td><code><%= row[:partition] %></code></td>
+          <td><%= row[:eligible] %></td>
+          <td><%= row[:scheduled] %></td>
+          <td><%= row[:in_flight] %></td>
         </tr>
       <% end %>
     </tbody>
   </table>
+  <p class="muted" style="font-size:0.8em;">
+    <em>Pending (eligible)</em> is admission-ready and will be evaluated next tick.
+    <em>Pending (scheduled)</em> is waiting on <code>not_before_at</code>.
+    <em>In-flight</em> is the <code>PartitionInflightCount</code> counter for gates that track it
+    (concurrency, global_cap); throttle gates don't maintain one.
+  </p>
 <% end %>
 
 <h2>Throttle buckets</h2>
