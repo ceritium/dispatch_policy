@@ -28,7 +28,20 @@ module DispatchPolicy
       pending_enqueue.each do |staged, job|
         begin
           job.enqueue(_bypass_staging: true)
-          admitted_count += 1
+          # ActiveJob adapters report a polite failure by setting
+          # enqueue_error and leaving successfully_enqueued? false
+          # instead of raising. Without this check the staged row
+          # would stay marked admitted while the adapter never queued
+          # the job — losing it silently.
+          if job.successfully_enqueued?
+            admitted_count += 1
+          else
+            Rails.logger&.warn(
+              "[DispatchPolicy] adapter did not enqueue staged=#{staged.id}: " \
+              "#{job.enqueue_error&.class}: #{job.enqueue_error&.message}"
+            )
+            revert_admission(staged)
+          end
         rescue StandardError => e
           Rails.logger&.error("[DispatchPolicy] enqueue failed staged=#{staged.id}: #{e.class}: #{e.message}")
           revert_admission(staged)
