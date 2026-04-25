@@ -90,8 +90,12 @@ module DispatchPolicy
       now       = Time.current
       now_iso   = now.iso8601
       since_24h = 24.hours.ago.iso8601
+      limit     = DispatchPolicy.config.admin_partition_limit
+      @partition_breakdown_truncated = false
 
       adaptive_stats = AdaptiveConcurrencyStats.where(policy_name: @policy_name)
+        .order(updated_at: :desc)
+        .limit(limit)
         .pluck(:gate_name, :partition_key, :current_max, :ewma_latency_ms)
         .each_with_object({}) { |(g, k, c, l), h|
           h[[ g, k ]] = { current_max: c, ewma_latency_ms: l.to_f.round(1) }
@@ -112,25 +116,38 @@ module DispatchPolicy
         }
       }
 
+      # Each aggregation below is order-by-count + limited so that a
+      # policy with tens of thousands of distinct (context, round_robin_key)
+      # tuples can't pull megabytes of rows into memory per request. We
+      # show the top-N most-active partitions per axis and flip the
+      # truncation flag for the view banner.
+
       # Activity timestamps bounded to the last 24h so the scan stays on
       # an index-friendly slice of staged_jobs.
       activity_rows = scope
         .where("staged_at > ?", since_24h)
         .group(:context, :round_robin_key)
+        .order(Arel.sql("MAX(staged_at) DESC"))
+        .limit(limit)
         .pluck(
           :context,
           :round_robin_key,
           Arel.sql("MAX(staged_at)"),
           Arel.sql("MAX(admitted_at)")
         )
+      @partition_breakdown_truncated = true if activity_rows.size >= limit
 
       sources.each do |name, extract|
-        pending_counts = scope.pending.group(:context, :round_robin_key).pluck(
-          :context,
-          :round_robin_key,
-          Arel.sql("count(*) filter (where not_before_at is null or not_before_at <= '#{now_iso}')"),
-          Arel.sql("count(*) filter (where not_before_at > '#{now_iso}')")
-        )
+        pending_counts = scope.pending.group(:context, :round_robin_key)
+          .order(Arel.sql("count(*) DESC"))
+          .limit(limit)
+          .pluck(
+            :context,
+            :round_robin_key,
+            Arel.sql("count(*) filter (where not_before_at is null or not_before_at <= '#{now_iso}')"),
+            Arel.sql("count(*) filter (where not_before_at > '#{now_iso}')")
+          )
+        @partition_breakdown_truncated = true if pending_counts.size >= limit
         pending_counts.each do |ctx, rr_key, eligible, scheduled|
           partition = extract.call(ctx, rr_key)
           row = rows[[ name, partition ]]
@@ -138,18 +155,22 @@ module DispatchPolicy
           row[:scheduled] += scheduled
         end
 
-        admitted_counts = scope.admitted.group(:context, :round_robin_key).pluck(
-          :context, :round_robin_key, Arel.sql("count(*)")
-        )
+        admitted_counts = scope.admitted.group(:context, :round_robin_key)
+          .order(Arel.sql("count(*) DESC"))
+          .limit(limit)
+          .pluck(:context, :round_robin_key, Arel.sql("count(*)"))
+        @partition_breakdown_truncated = true if admitted_counts.size >= limit
         admitted_counts.each do |ctx, rr_key, in_flight|
           partition = extract.call(ctx, rr_key)
           rows[[ name, partition ]][:in_flight] += in_flight
         end
 
         completed_counts = scope.completed.where("completed_at > ?", since_24h)
-          .group(:context, :round_robin_key).pluck(
-            :context, :round_robin_key, Arel.sql("count(*)")
-          )
+          .group(:context, :round_robin_key)
+          .order(Arel.sql("count(*) DESC"))
+          .limit(limit)
+          .pluck(:context, :round_robin_key, Arel.sql("count(*)"))
+        @partition_breakdown_truncated = true if completed_counts.size >= limit
         completed_counts.each do |ctx, rr_key, completed|
           partition = extract.call(ctx, rr_key)
           rows[[ name, partition ]][:completed_24h] += completed

@@ -98,6 +98,14 @@
 
 <h2>All partitions <small class="muted">(<%= @partition_total_list %>)</small></h2>
 
+<% if @partition_breakdown_truncated %>
+  <p class="muted" style="background: #fff3cd; border: 1px solid #f0d97f; padding: 0.5em 0.75em; border-radius: 4px;">
+    Showing the most-active partitions only. The full set exceeds the
+    admin's per-request cap (<code>DispatchPolicy.config.admin_partition_limit</code>
+    = <%= DispatchPolicy.config.admin_partition_limit %>); raise it if you need the long tail.
+  </p>
+<% end %>
+
 <turbo-frame id="partitions_list" data-turbo-action="advance">
   <% if @partition_total_list.to_i.zero? && @partition_search.blank? %>
     <p class="muted">This policy declares no partitioning (no gate with <code>partition_by</code> and no <code>round_robin_by</code>).</p>
