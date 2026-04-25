@@ -29,7 +29,9 @@ Use it when you need:
   and grows back when workers keep up, without manual tuning.
 - **Dedupe** against a partial unique index, not an in-memory key.
 - **Round-robin fairness across tenants** (LATERAL batch fetch) so one
-  tenant's burst can't starve the others.
+  tenant's burst can't starve the others — including a **time-weighted
+  variant** that balances total compute time per tenant when their
+  performs have very different durations.
 
 ## Demo
 
@@ -124,6 +126,11 @@ end
 ```
 
 `perform_later` stages the job; the tick admits it when its gates pass.
+
+For the common multi-tenant webhook case (mixed-latency tenants behind
+a shared pool) skip ahead to [Recipes](#multi-tenant-webhook-delivery)
+— `round_robin_by weight: :time` plus `:adaptive_concurrency` covers
+it without an explicit throttle.
 
 ## Gates
 
@@ -358,6 +365,81 @@ fetch:
 
 Cost per tick is O(`quantum × active_keys`), not O(backlog) — so the
 admin stays snappy even with thousands of distinct tenants.
+
+### Time-weighted variant
+
+Equal-quanta round-robin gives every active tenant the same number of
+admissions per tick — fair by *count*. If your tenants have very
+different per-job durations (slow webhooks, varied report sizes) and
+you want to balance the *total compute time* each consumes, pass
+`weight: :time`:
+
+```ruby
+round_robin_by ->(args) { args.first[:account_id] }, weight: :time
+```
+
+Solo tenants are unaffected — the fetch falls through to the trailing
+top-up and they consume up to `batch_size` per tick. When multiple
+tenants are active, each one's quantum is sized inversely to how much
+compute time it has used in the last `window` seconds (default 60),
+sourced from `dispatch_policy_partition_observations`. So if `slow`
+has burned 20 s of perform time recently and `fast` has burned 200 ms,
+this tick `fast` claims ~99% of `batch_size` while `slow` gets the
+floor — total compute per minute stays balanced and you don't need a
+throttle on top.
+
+## Recipes
+
+### Multi-tenant webhook delivery
+
+Mixed-latency tenants behind a shared worker pool — exactly the case
+that motivated `weight: :time` and adaptive concurrency. Pair them:
+
+```ruby
+class WebhookDeliveryJob < ApplicationJob
+  include DispatchPolicy::Dispatchable
+
+  dispatch_policy do
+    context ->(args) { { account_id: args.first[:account_id] } }
+
+    # Fetch-level fairness by *compute time* (not request count). When
+    # several accounts compete, per-tick quanta are sized inverse to
+    # their recent perform duration; solo accounts top up to batch_size.
+    round_robin_by ->(args) { args.first[:account_id] },
+                   weight: :time, window: 60
+
+    # Drip-feed admission per account based on adapter queue lag.
+    # Without this, a single account with thousands of pending could
+    # dump batch_size jobs into the adapter queue in one tick and lose
+    # the ability to react to performance changes mid-burst.
+    gate :adaptive_concurrency,
+         partition_by:  ->(ctx) { ctx[:account_id] },
+         initial_max:   3,
+         target_lag_ms: 500
+  end
+
+  def perform(account_id:, **) = WebhookClient.deliver!(account_id)
+end
+```
+
+What you get with no throttle, no manual tuning:
+
+- A solo account runs at whatever throughput its downstream allows;
+  `:adaptive_concurrency` grows `current_max` while queue lag stays
+  under `target_lag_ms`.
+- A slow account (1 s/perform) and a fast account (100 ms/perform)
+  competing → `weight: :time` gives the fast one most of each tick's
+  budget; the slow one's adaptive cap shrinks toward `min`. Total
+  compute time per minute stays balanced and the adapter queue
+  doesn't pile up behind whichever tenant happened to enqueue first.
+- A misbehaving downstream that suddenly goes from 100 ms to 5 s →
+  that tenant's `current_max` drops within a few completions and its
+  fetch quantum shrinks; the other tenants are unaffected.
+
+Tune `target_lag_ms` for the latency budget you can tolerate (see
+[Choosing target_lag_ms](#choosing-target_lag_ms)) and `window` for
+how reactive the time-balancing should be (smaller = noisier, larger
+= more stable).
 
 ## Running the tick
 

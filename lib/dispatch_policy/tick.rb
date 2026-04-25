@@ -100,7 +100,11 @@ module DispatchPolicy
 
     def self.fetch_batch(policy)
       if policy.round_robin?
-        fetch_round_robin_batch(policy)
+        if policy.round_robin_weight == :time
+          fetch_time_weighted_batch(policy)
+        else
+          fetch_round_robin_batch(policy)
+        end
       else
         fetch_plain_batch(policy)
       end
@@ -149,6 +153,76 @@ module DispatchPolicy
 
       remaining = batch_size - batch.size
       return batch if remaining <= 0
+
+      top_up = StagedJob.pending
+        .where(policy_name: policy.name)
+        .where("not_before_at IS NULL OR not_before_at <= ?", now)
+        .where.not(id: batch.map(&:id))
+        .order(:priority, :staged_at)
+        .limit(remaining)
+        .lock("FOR UPDATE SKIP LOCKED")
+        .to_a
+
+      batch + top_up
+    end
+
+    # Time-weighted variant of round-robin: instead of an equal quantum
+    # per active partition, allocate quanta proportional to the inverse
+    # of recently-consumed compute time. Solo partitions get the full
+    # batch_size; competing partitions get slices that bias admission
+    # toward whoever has consumed less, so total compute time stays
+    # balanced even when one tenant's backlog is much bigger than
+    # another's. Falls back to the same trailing top-up as the equal
+    # round-robin so we never under-fill the batch when only a few
+    # partitions are active.
+    DEFAULT_TIME_SHARE_DURATION_MS = 100
+
+    def self.fetch_time_weighted_batch(policy)
+      batch_size = DispatchPolicy.config.batch_size
+      now        = Time.current
+
+      partitions = StagedJob.pending
+        .where(policy_name: policy.name)
+        .where("not_before_at IS NULL OR not_before_at <= ?", now)
+        .where.not(round_robin_key: nil)
+        .distinct
+        .pluck(:round_robin_key)
+
+      return fetch_plain_batch(policy) if partitions.empty?
+
+      consumed = PartitionObservation.consumed_ms_by_partition(
+        policy_name:    policy.name,
+        partition_keys: partitions,
+        window:         policy.round_robin_window
+      )
+
+      # Inverse-of-consumed weights, with a floor so a brand-new partition
+      # (no observations) doesn't dominate to infinity.
+      weights = partitions.each_with_object({}) do |key, acc|
+        consumed_ms     = consumed.dig(key, :consumed_ms) || 0
+        denom           = [ consumed_ms, DEFAULT_TIME_SHARE_DURATION_MS ].max
+        acc[key]        = 1.0 / denom
+      end
+      total_weight = weights.values.sum
+      quanta = weights.transform_values do |w|
+        [ (batch_size * w / total_weight).floor, 1 ].max
+      end
+
+      batch = []
+      partitions.each do |key|
+        rows = StagedJob.pending
+          .where(policy_name: policy.name, round_robin_key: key)
+          .where("not_before_at IS NULL OR not_before_at <= ?", now)
+          .order(:priority, :staged_at)
+          .limit(quanta[key])
+          .lock("FOR UPDATE SKIP LOCKED")
+          .to_a
+        batch.concat(rows)
+        break if batch.size >= batch_size
+      end
+
+      remaining = batch_size - batch.size
+      return batch if remaining <= 0 || batch.empty?
 
       top_up = StagedJob.pending
         .where(policy_name: policy.name)

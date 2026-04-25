@@ -57,6 +57,44 @@ module DispatchPolicy
       assert_equal 40, StagedJob.admitted.count
     end
 
+    class TimeWeightedJob < ActiveJob::Base
+      include DispatchPolicy::Dispatchable
+      dispatch_policy do
+        context ->(args) { { tenant: args.first } }
+        round_robin_by ->(args) { args.first }, weight: :time
+      end
+      def perform(*); end
+    end
+
+    test "weight: :time gives bigger quanta to partitions with less consumed time" do
+      DispatchPolicy.config.batch_size = 40
+
+      # Heavy partition has 20s of consumed time recently; light has none.
+      # Inverse-weighted, light should claim ~99% of the batch_size budget.
+      PartitionObservation.observe!(
+        policy_name: TimeWeightedJob.resolved_dispatch_policy.name,
+        partition_key: "heavy", queue_lag_ms: 0, duration_ms: 20_000
+      )
+
+      30.times { TimeWeightedJob.perform_later("heavy") }
+      30.times { TimeWeightedJob.perform_later("light") }
+
+      Tick.run(policy_name: TimeWeightedJob.resolved_dispatch_policy.name)
+
+      grouped = StagedJob.admitted.group(:round_robin_key).count
+      assert_operator grouped["light"].to_i, :>, grouped["heavy"].to_i,
+        "light should be admitted more than heavy when heavy has burned 20s (got #{grouped.inspect})"
+    end
+
+    test "weight: :time with a solo tenant fetches up to batch_size" do
+      DispatchPolicy.config.batch_size = 25
+
+      40.times { TimeWeightedJob.perform_later("solo") }
+      Tick.run(policy_name: TimeWeightedJob.resolved_dispatch_policy.name)
+
+      assert_equal 25, StagedJob.admitted.count
+    end
+
     test "concurrency gate caps admissions per partition" do
       CappedJob.perform_later("X")
       CappedJob.perform_later("X")
