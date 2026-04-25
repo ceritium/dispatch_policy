@@ -18,7 +18,11 @@ module DispatchPolicy
         by_partition = batch.group_by { |staged| partition_key_for(context.for(staged)) }
 
         admitted = []
-        by_partition.each do |partition_key, jobs|
+        # Sort keys before acquiring per-partition row locks: two ticks
+        # processing overlapping partitions in different group_by orders
+        # would otherwise deadlock on each other's FOR UPDATE rows.
+        by_partition.keys.sort.each do |partition_key|
+          jobs       = by_partition[partition_key]
           sample_ctx = context.for(jobs.first)
           rate       = resolve(@rate, sample_ctx).to_f
           per        = @per.to_f
