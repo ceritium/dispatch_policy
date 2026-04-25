@@ -53,8 +53,15 @@ module DispatchPolicy
     def self.consumed_ms_by_partition(policy_name:, partition_keys:, window:)
       return {} if partition_keys.empty?
 
+      # minute_bucket is floored on insert (date_trunc('minute', now)).
+      # An observation written T seconds ago lives in a bucket up to 60s
+      # earlier than T. Add a one-bucket pad to the lower bound so the
+      # most recent bucket is always inside the window — without it, the
+      # previous-minute bucket is silently excluded as soon as the wall
+      # clock crosses a minute boundary.
+      since = Time.current - window - 60
       rows = where(policy_name: policy_name, partition_key: partition_keys.map(&:to_s))
-        .where("minute_bucket >= ?", Time.current - window)
+        .where("minute_bucket >= ?", since)
         .group(:partition_key)
         .pluck(Arel.sql("partition_key, SUM(total_duration_ms), SUM(observation_count)"))
       rows.each_with_object({}) do |(key, total, count), acc|
