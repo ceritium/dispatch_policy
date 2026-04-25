@@ -41,6 +41,7 @@ module DispatchPolicy
           block.call
           succeeded = true
         ensure
+          duration_ms = ((Time.current - perform_start) * 1000).to_i
           policy_name = job.class.resolved_dispatch_policy&.name
 
           if job._dispatch_partitions.present?
@@ -49,22 +50,30 @@ module DispatchPolicy
               partitions:  job._dispatch_partitions
             )
 
-            # Let adaptive gates update their AIMD state first; we pick up
-            # the resulting current_max in the generic observation below
-            # so the chart surfaces the cap alongside lag + completions.
+            # Let adaptive + time-budget gates update their state first;
+            # the generic observation below then captures the resulting
+            # current_max alongside lag + duration for the chart.
             policy = job.class.resolved_dispatch_policy
             job._dispatch_partitions.each do |gate_name, partition_key|
               gate = policy&.gates&.find { |g| g.name == gate_name.to_sym }
-              next unless gate.is_a?(DispatchPolicy::Gates::AdaptiveConcurrency)
-              gate.record_observation(
-                partition_key: partition_key,
-                queue_lag_ms:  queue_lag_ms,
-                succeeded:     succeeded
-              )
+              case gate
+              when DispatchPolicy::Gates::AdaptiveConcurrency
+                gate.record_observation(
+                  partition_key: partition_key,
+                  queue_lag_ms:  queue_lag_ms,
+                  succeeded:     succeeded
+                )
+              when DispatchPolicy::Gates::TimeBudget
+                gate.record_completion(
+                  partition_key: partition_key,
+                  duration_ms:   duration_ms
+                )
+              end
             end
 
             # Generic observation per unique partition. Every gate with
-            # partition_by (adaptive or not) gets a sparkline this way.
+            # partition_by (adaptive or not) gets a sparkline this way,
+            # plus :fair_time_share reads consumed_ms from here.
             job._dispatch_partitions.values.uniq.each do |partition_key|
               current_max = DispatchPolicy::AdaptiveConcurrencyStats.current_max_for(
                 policy_name:   policy_name,
@@ -74,6 +83,7 @@ module DispatchPolicy
                 policy_name:   policy_name,
                 partition_key: partition_key,
                 queue_lag_ms:  queue_lag_ms,
+                duration_ms:   duration_ms,
                 current_max:   current_max
               )
             end

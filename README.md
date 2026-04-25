@@ -258,6 +258,64 @@ gate :adaptive_concurrency,
      target_lag_ms: 1000
 ```
 
+### `:time_budget` — per-partition compute-time budget
+
+The bucket holds **milliseconds**, not request count. Each completed
+perform debits its actual duration; admissions are only allowed while
+the bucket has positive ms left. Slow downstreams self-throttle: a
+webhook that takes 10× longer admits 10× fewer requests under the same
+budget, with no operator tuning.
+
+```ruby
+gate :time_budget,
+     partition_by: ->(ctx) { ctx[:account_id] },
+     budget_ms:    60_000,    # 60s of perform time
+     per:          1.minute   # refill window
+```
+
+- **Refill**: `budget_ms` tokens (= ms) per `per` seconds, capped at
+  `budget_ms` (no burst beyond the window's allowance).
+- **Debit**: applied post-perform from `around_perform`, in a single
+  SQL statement so concurrent completions can't lose a debit.
+- **Negative tokens are by design**. A 30-second perform on a 10-second
+  budget drives the bucket to −20s; refill brings it back to positive
+  over the next ~30s before any new admissions happen. That's the
+  backpressure mechanism.
+
+Reuses the existing `dispatch_policy_throttle_buckets` table — `tokens`
+is interpreted as milliseconds for time_budget partitions.
+
+### `:fair_time_share` — share compute time across active tenants
+
+Reordering gate, not a cap. Pair it with `:throttle` (the absolute
+ceiling) so:
+
+- A solo tenant always wins the next slot → consumes up to the ceiling.
+- Multiple tenants converge on **equal compute time**, regardless of
+  how many jobs each has staged or how slow their performs are.
+
+```ruby
+gate :throttle,
+     rate:         ->(ctx) { ctx[:rate_limit] },
+     per:          1.minute,
+     partition_by: ->(ctx) { ctx[:account_id] }
+gate :fair_time_share, window: 60   # seconds; default 60
+```
+
+Mechanics: at each tick we look up consumed_ms per partition over the
+last `window` (sourced from `dispatch_policy_partition_observations`),
+then walk the batch with a virtual-time scheduler — always picking the
+partition with the lowest accumulated time that still has pending work.
+Each pick advances that partition's vtime by its recent average
+duration.
+
+If your fast tenant averages 100 ms and your slow tenant averages
+1 s, when both compete you'll see ~10 fast jobs admitted for every 1
+slow job — total compute time stays balanced.
+
+The first time a partition appears (no observations yet) it starts
+with `default_duration_ms: 100` of estimated cost.
+
 ## Queues and partitioning
 
 DispatchPolicy operates at the **policy** (class) level. A job's

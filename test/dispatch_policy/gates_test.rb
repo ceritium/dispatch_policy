@@ -76,5 +76,89 @@ module DispatchPolicy
         klass.dispatch_policy { gate :does_not_exist }
       end
     end
+
+    class TimeBudgetJob < ActiveJob::Base
+      include DispatchPolicy::Dispatchable
+      dispatch_policy do
+        context ->(args) { { account_id: args.first } }
+        gate :time_budget,
+             budget_ms:    500,
+             per:          60,
+             partition_by: ->(ctx) { ctx[:account_id] }
+      end
+      def perform(*); end
+    end
+
+    test "time_budget admits while the bucket has positive ms" do
+      3.times { TimeBudgetJob.perform_later("acc_a") }
+      Tick.run(policy_name: TimeBudgetJob.resolved_dispatch_policy.name)
+
+      assert_equal 3, StagedJob.admitted.count, "fresh bucket should admit the whole batch"
+    end
+
+    test "time_budget completion debits ms; bucket can go negative and stop admitting" do
+      policy_name = TimeBudgetJob.resolved_dispatch_policy.name
+      gate = TimeBudgetJob.resolved_dispatch_policy.gates.first
+
+      # Drain the bucket past zero by simulating a slow completion.
+      ThrottleBucket.lock(
+        policy_name: policy_name, gate_name: :time_budget,
+        partition_key: "acc_b", burst: 500
+      ).tap { |b| b.refilled_at = Time.current; b.tokens = 500.0; b.save! }
+
+      gate.record_completion(partition_key: "acc_b", duration_ms: 800)
+
+      bucket = ThrottleBucket.find_by(policy_name: policy_name, partition_key: "acc_b")
+      assert_in_delta(-300.0, bucket.tokens, 0.5)
+
+      # Negative bucket → no admissions until refill catches up.
+      2.times { TimeBudgetJob.perform_later("acc_b") }
+      Tick.run(policy_name: policy_name)
+      assert_equal 0, StagedJob.admitted.where(arguments: { arguments: [ "acc_b" ] }).count
+    end
+
+    class FairTimeShareJob < ActiveJob::Base
+      include DispatchPolicy::Dispatchable
+      dispatch_policy do
+        context ->(args) { { account_id: args.first } }
+        gate :concurrency, max: 100, partition_by: ->(ctx) { ctx[:account_id] }
+        gate :fair_time_share, window: 60
+      end
+      def perform(*); end
+    end
+
+    test "fair_time_share admits the under-consumer first when two tenants compete" do
+      policy_name = FairTimeShareJob.resolved_dispatch_policy.name
+
+      # Pre-seed an observation row showing acc_heavy already burned 5s in
+      # the window while acc_light burned 100ms. fair_time_share should
+      # pick acc_light first.
+      PartitionObservation.observe!(
+        policy_name: policy_name, partition_key: "acc_heavy",
+        queue_lag_ms: 0, duration_ms: 5_000
+      )
+      PartitionObservation.observe!(
+        policy_name: policy_name, partition_key: "acc_light",
+        queue_lag_ms: 0, duration_ms: 100
+      )
+
+      2.times { FairTimeShareJob.perform_later("acc_heavy") }
+      2.times { FairTimeShareJob.perform_later("acc_light") }
+
+      Tick.run(policy_name: policy_name)
+
+      ordered_keys = StagedJob.admitted.order(:admitted_at, :id).map { |s| s.arguments["arguments"].first }
+      assert_equal "acc_light", ordered_keys.first,
+        "expected the under-consumer to be admitted before the heavy one (got #{ordered_keys.inspect})"
+    end
+
+    test "fair_time_share with a single tenant is a no-op (admits in stage order)" do
+      policy_name = FairTimeShareJob.resolved_dispatch_policy.name
+
+      4.times { FairTimeShareJob.perform_later("acc_solo") }
+      Tick.run(policy_name: policy_name)
+
+      assert_equal 4, StagedJob.admitted.count
+    end
   end
 end
