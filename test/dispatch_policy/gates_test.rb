@@ -122,7 +122,7 @@ module DispatchPolicy
       dispatch_policy do
         context ->(args) { { account_id: args.first } }
         gate :concurrency, max: 100, partition_by: ->(ctx) { ctx[:account_id] }
-        gate :fair_time_share, window: 60
+        gate :fair_time_share, window: 60, partition_by: ->(ctx) { ctx[:account_id] }
       end
       def perform(*); end
     end
@@ -150,6 +150,15 @@ module DispatchPolicy
       ordered_keys = StagedJob.admitted.order(:admitted_at, :id).map { |s| s.arguments["arguments"].first }
       assert_equal "acc_light", ordered_keys.first,
         "expected the under-consumer to be admitted before the heavy one (got #{ordered_keys.inspect})"
+    end
+
+    test "fair_time_share without partition_by raises at policy declaration" do
+      klass = Class.new(ActiveJob::Base) { include DispatchPolicy::Dispatchable }
+      klass.define_singleton_method(:name) { "FairTimeShareNoPartition" }
+
+      assert_raises(ArgumentError) do
+        klass.dispatch_policy { gate :fair_time_share }
+      end
     end
 
     test "fair_time_share with a single tenant is a no-op (admits in stage order)" do

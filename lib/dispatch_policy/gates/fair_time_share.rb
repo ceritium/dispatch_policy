@@ -26,6 +26,7 @@ module DispatchPolicy
       def configure(window: DEFAULT_WINDOW, default_duration_ms: DEFAULT_DURATION_MS)
         @window              = window
         @default_duration_ms = default_duration_ms
+        raise ArgumentError, "fair_time_share requires partition_by" if @partition_by.nil?
       end
 
       def tracks_inflight?
@@ -35,13 +36,7 @@ module DispatchPolicy
       attr_reader :window, :default_duration_ms
 
       def filter(batch, context)
-        groups = batch.group_by do |staged|
-          if @partition_by
-            partition_key_for(context.for(staged))
-          else
-            context.primary_partition_for(staged) || staged.id.to_s
-          end
-        end
+        groups = batch.group_by { |staged| partition_key_for(context.for(staged)) }
         return batch if groups.size <= 1
 
         stats = PartitionObservation.consumed_ms_by_partition(

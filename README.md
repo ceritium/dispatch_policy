@@ -299,7 +299,9 @@ gate :throttle,
      rate:         ->(ctx) { ctx[:rate_limit] },
      per:          1.minute,
      partition_by: ->(ctx) { ctx[:account_id] }
-gate :fair_time_share, window: 60   # seconds; default 60
+gate :fair_time_share,
+     partition_by: ->(ctx) { ctx[:account_id] },
+     window:       60   # seconds; default 60
 ```
 
 Mechanics: at each tick we look up consumed_ms per partition over the
