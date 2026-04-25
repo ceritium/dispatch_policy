@@ -50,25 +50,18 @@ module DispatchPolicy
               partitions:  job._dispatch_partitions
             )
 
-            # Let adaptive + time-budget gates update their state first;
-            # the generic observation below then captures the resulting
+            # Let adaptive gates update their AIMD state first; the
+            # generic observation below then captures the resulting
             # current_max alongside lag + duration for the chart.
             policy = job.class.resolved_dispatch_policy
             job._dispatch_partitions.each do |gate_name, partition_key|
               gate = policy&.gates&.find { |g| g.name == gate_name.to_sym }
-              case gate
-              when DispatchPolicy::Gates::AdaptiveConcurrency
-                gate.record_observation(
-                  partition_key: partition_key,
-                  queue_lag_ms:  queue_lag_ms,
-                  succeeded:     succeeded
-                )
-              when DispatchPolicy::Gates::TimeBudget
-                gate.record_completion(
-                  partition_key: partition_key,
-                  duration_ms:   duration_ms
-                )
-              end
+              next unless gate.is_a?(DispatchPolicy::Gates::AdaptiveConcurrency)
+              gate.record_observation(
+                partition_key: partition_key,
+                queue_lag_ms:  queue_lag_ms,
+                succeeded:     succeeded
+              )
             end
 
             # Generic observation per unique partition. Every gate with

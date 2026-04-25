@@ -37,21 +37,5 @@ module DispatchPolicy
       self.tokens -= n
       true
     end
-
-    # Single-statement debit used by :time_budget on perform completion.
-    # No SELECT-then-UPDATE race: the subtraction lives entirely in SQL
-    # so concurrent completions can't lose a debit. Tokens may go negative
-    # — that's intentional (see Gates::TimeBudget).
-    def self.debit_ms!(policy_name:, gate_name:, partition_key:, ms:)
-      connection.exec_update(
-        sanitize_sql_array([
-          <<~SQL.squish, ms.to_f, Time.current, policy_name, gate_name.to_s, partition_key.to_s
-            UPDATE #{quoted_table_name}
-               SET tokens = tokens - ?, updated_at = ?
-             WHERE policy_name = ? AND gate_name = ? AND partition_key = ?
-          SQL
-        ])
-      )
-    end
   end
 end
