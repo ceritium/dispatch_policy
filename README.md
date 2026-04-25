@@ -29,7 +29,9 @@ Use it when you need:
   and grows back when workers keep up, without manual tuning.
 - **Dedupe** against a partial unique index, not an in-memory key.
 - **Round-robin fairness across tenants** (LATERAL batch fetch) so one
-  tenant's burst can't starve the others.
+  tenant's burst can't starve the others — including a **time-weighted
+  variant** that balances total compute time per tenant when their
+  performs have very different durations.
 
 ## Demo
 
@@ -124,6 +126,11 @@ end
 ```
 
 `perform_later` stages the job; the tick admits it when its gates pass.
+
+For the common multi-tenant webhook case (mixed-latency tenants behind
+a shared pool) skip ahead to [Recipes](#multi-tenant-webhook-delivery)
+— `round_robin_by weight: :time` plus `:adaptive_concurrency` covers
+it without an explicit throttle.
 
 ## Gates
 
@@ -287,47 +294,30 @@ is interpreted as milliseconds for time_budget partitions.
 
 ### `:fair_time_share` — share compute time across active tenants
 
-Reordering gate, not a cap. **Pair it with `round_robin_by` plus
-`:throttle`**:
+Reordering gate, not a cap. **In most cases prefer the time-weighted
+variant of `round_robin_by` (`weight: :time`)** — it solves the same
+problem at the fetch layer with one DSL line. See the
+[Time-weighted variant](#time-weighted-variant) below.
+
+Reach for `:fair_time_share` only when you need batch-level reordering
+on top of an *already-balanced* fetch (rare). Always pair with
+`round_robin_by`; the gate cannot reorder rows that the FIFO fetch
+never put in the batch.
 
 ```ruby
-round_robin_by ->(args) { args.first[:account_id] }     # fetch fairness
-gate :throttle,
-     rate:         ->(ctx) { ctx[:rate_limit] },
-     per:          1.minute,
-     partition_by: ->(ctx) { ctx[:account_id] }         # absolute ceiling
+round_robin_by ->(args) { args.first[:account_id] }
 gate :fair_time_share,
      partition_by: ->(ctx) { ctx[:account_id] },
-     window:       60                                   # seconds; default 60
+     window:       60   # seconds; default 60
 ```
 
-Why `round_robin_by` is needed: the tick's default fetch is FIFO
-(`ORDER BY priority, staged_at`). If one tenant has thousands of
-pending jobs staged earlier, the FIFO fetch only returns *that
-tenant's* backlog — `:fair_time_share` reorders the batch, but it
-can't reorder rows that aren't in the batch. With `round_robin_by`
-the fetch becomes LATERAL (a quantum per partition), so newly-enqueued
-work from a different tenant lands in the batch and the reordering
-has something to balance.
-
-Behavior with the three together:
-
-- Solo tenant → always wins the next slot → consumes up to the
-  throttle ceiling.
-- Multiple tenants → converge on **equal compute time**, regardless
-  of backlog size or how slow each tenant's performs are.
-
-Mechanics: at each tick we look up consumed_ms per partition over the
-last `window` (sourced from `dispatch_policy_partition_observations`),
-then walk the batch with a virtual-time scheduler — always picking
+Mechanics: at each tick the gate looks up consumed_ms per partition
+over the last `window` (from `dispatch_policy_partition_observations`)
+and walks the batch with a virtual-time scheduler — always picking
 the partition with the lowest accumulated time that still has pending
 work. Each pick advances that partition's vtime by its recent average
-duration. So if your fast tenant averages 100 ms and your slow tenant
-averages 1 s, you'll see ~10 fast jobs admitted for every 1 slow job —
-total compute time stays balanced.
-
-The first time a partition appears (no observations yet) it starts
-with `default_duration_ms: 100` of estimated cost.
+duration. The first time a partition appears (no observations yet) it
+starts with `default_duration_ms: 100` of estimated cost.
 
 ## Queues and partitioning
 
@@ -455,6 +445,59 @@ throttle on top.
 This obsoletes most uses of the `:fair_time_share` admission gate; use
 that gate only when you also need batch-level reordering on top of an
 already-balanced fetch, which is rare.
+
+## Recipes
+
+### Multi-tenant webhook delivery
+
+Mixed-latency tenants behind a shared worker pool — exactly the case
+that motivated `weight: :time` and adaptive concurrency. Pair them:
+
+```ruby
+class WebhookDeliveryJob < ApplicationJob
+  include DispatchPolicy::Dispatchable
+
+  dispatch_policy do
+    context ->(args) { { account_id: args.first[:account_id] } }
+
+    # Fetch-level fairness by *compute time* (not request count). When
+    # several accounts compete, per-tick quanta are sized inverse to
+    # their recent perform duration; solo accounts top up to batch_size.
+    round_robin_by ->(args) { args.first[:account_id] },
+                   weight: :time, window: 60
+
+    # Drip-feed admission per account based on adapter queue lag.
+    # Without this, a single account with thousands of pending could
+    # dump batch_size jobs into the adapter queue in one tick and lose
+    # the ability to react to performance changes mid-burst.
+    gate :adaptive_concurrency,
+         partition_by:  ->(ctx) { ctx[:account_id] },
+         initial_max:   3,
+         target_lag_ms: 500
+  end
+
+  def perform(account_id:, **) = WebhookClient.deliver!(account_id)
+end
+```
+
+What you get with no throttle, no manual tuning:
+
+- A solo account runs at whatever throughput its downstream allows;
+  `:adaptive_concurrency` grows `current_max` while queue lag stays
+  under `target_lag_ms`.
+- A slow account (1 s/perform) and a fast account (100 ms/perform)
+  competing → `weight: :time` gives the fast one most of each tick's
+  budget; the slow one's adaptive cap shrinks toward `min`. Total
+  compute time per minute stays balanced and the adapter queue
+  doesn't pile up behind whichever tenant happened to enqueue first.
+- A misbehaving downstream that suddenly goes from 100 ms to 5 s →
+  that tenant's `current_max` drops within a few completions and its
+  fetch quantum shrinks; the other tenants are unaffected.
+
+Tune `target_lag_ms` for the latency budget you can tolerate (see
+[Choosing target_lag_ms](#choosing-target_lag_ms)) and `window` for
+how reactive the time-balancing should be (smaller = noisier, larger
+= more stable).
 
 ## Running the tick
 
