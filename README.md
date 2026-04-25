@@ -287,33 +287,44 @@ is interpreted as milliseconds for time_budget partitions.
 
 ### `:fair_time_share` — share compute time across active tenants
 
-Reordering gate, not a cap. Pair it with `:throttle` (the absolute
-ceiling) so:
-
-- A solo tenant always wins the next slot → consumes up to the ceiling.
-- Multiple tenants converge on **equal compute time**, regardless of
-  how many jobs each has staged or how slow their performs are.
+Reordering gate, not a cap. **Pair it with `round_robin_by` plus
+`:throttle`**:
 
 ```ruby
+round_robin_by ->(args) { args.first[:account_id] }     # fetch fairness
 gate :throttle,
      rate:         ->(ctx) { ctx[:rate_limit] },
      per:          1.minute,
-     partition_by: ->(ctx) { ctx[:account_id] }
+     partition_by: ->(ctx) { ctx[:account_id] }         # absolute ceiling
 gate :fair_time_share,
      partition_by: ->(ctx) { ctx[:account_id] },
-     window:       60   # seconds; default 60
+     window:       60                                   # seconds; default 60
 ```
+
+Why `round_robin_by` is needed: the tick's default fetch is FIFO
+(`ORDER BY priority, staged_at`). If one tenant has thousands of
+pending jobs staged earlier, the FIFO fetch only returns *that
+tenant's* backlog — `:fair_time_share` reorders the batch, but it
+can't reorder rows that aren't in the batch. With `round_robin_by`
+the fetch becomes LATERAL (a quantum per partition), so newly-enqueued
+work from a different tenant lands in the batch and the reordering
+has something to balance.
+
+Behavior with the three together:
+
+- Solo tenant → always wins the next slot → consumes up to the
+  throttle ceiling.
+- Multiple tenants → converge on **equal compute time**, regardless
+  of backlog size or how slow each tenant's performs are.
 
 Mechanics: at each tick we look up consumed_ms per partition over the
 last `window` (sourced from `dispatch_policy_partition_observations`),
-then walk the batch with a virtual-time scheduler — always picking the
-partition with the lowest accumulated time that still has pending work.
-Each pick advances that partition's vtime by its recent average
-duration.
-
-If your fast tenant averages 100 ms and your slow tenant averages
-1 s, when both compete you'll see ~10 fast jobs admitted for every 1
-slow job — total compute time stays balanced.
+then walk the batch with a virtual-time scheduler — always picking
+the partition with the lowest accumulated time that still has pending
+work. Each pick advances that partition's vtime by its recent average
+duration. So if your fast tenant averages 100 ms and your slow tenant
+averages 1 s, you'll see ~10 fast jobs admitted for every 1 slow job —
+total compute time stays balanced.
 
 The first time a partition appears (no observations yet) it starts
 with `default_duration_ms: 100` of estimated cost.
@@ -418,6 +429,32 @@ fetch:
 
 Cost per tick is O(`quantum × active_keys`), not O(backlog) — so the
 admin stays snappy even with thousands of distinct tenants.
+
+### Time-weighted variant
+
+Equal-quanta round-robin gives every active tenant the same number of
+admissions per tick — fair by *count*. If your tenants have very
+different per-job durations (slow webhooks, varied report sizes) and
+you want to balance the *total compute time* each consumes, pass
+`weight: :time`:
+
+```ruby
+round_robin_by ->(args) { args.first[:account_id] }, weight: :time
+```
+
+Solo tenants are unaffected — the fetch falls through to the trailing
+top-up and they consume up to `batch_size` per tick. When multiple
+tenants are active, each one's quantum is sized inversely to how much
+compute time it has used in the last `window` seconds (default 60),
+sourced from `dispatch_policy_partition_observations`. So if `slow`
+has burned 20 s of perform time recently and `fast` has burned 200 ms,
+this tick `fast` claims ~99% of `batch_size` while `slow` gets the
+floor — total compute per minute stays balanced and you don't need a
+throttle on top.
+
+This obsoletes most uses of the `:fair_time_share` admission gate; use
+that gate only when you also need batch-level reordering on top of an
+already-balanced fetch, which is rare.
 
 ## Running the tick
 

@@ -12,6 +12,8 @@ module DispatchPolicy
       @snapshots           = {}
       @dedupe_key_builder  = nil
       @round_robin_builder = nil
+      @round_robin_weight  = :equal
+      @round_robin_window  = 60
       instance_eval(&block) if block
       DispatchPolicy.registry[@name] = job_class
     end
@@ -45,12 +47,23 @@ module DispatchPolicy
       key&.to_s
     end
 
-    def round_robin_by(builder)
+    def round_robin_by(builder, weight: :equal, window: 60)
+      raise ArgumentError, "weight must be :equal or :time" unless %i[equal time].include?(weight)
       @round_robin_builder = builder
+      @round_robin_weight  = weight
+      @round_robin_window  = window
     end
 
     def round_robin?
       !@round_robin_builder.nil?
+    end
+
+    def round_robin_weight
+      @round_robin_weight
+    end
+
+    def round_robin_window
+      @round_robin_window
     end
 
     def build_round_robin_key(arguments)
