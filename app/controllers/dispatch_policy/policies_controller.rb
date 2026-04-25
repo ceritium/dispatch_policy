@@ -59,7 +59,12 @@ module DispatchPolicy
       load_adaptive_chart_data
       @throttle_buckets = ThrottleBucket
         .where(policy_name: @policy_name).order(:gate_name, :partition_key).limit(50)
-      @pending_jobs = scope.pending.order(:priority, :staged_at).limit(50)
+      # Explicit select: don't load the `arguments` jsonb (job payload —
+      # may contain PII / tokens) into memory just to render six fields.
+      @pending_jobs = scope.pending
+        .select(:id, :dedupe_key, :round_robin_key, :priority, :staged_at, :not_before_at)
+        .order(:priority, :staged_at)
+        .limit(50)
     end
 
     private
