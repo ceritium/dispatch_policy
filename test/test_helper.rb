@@ -7,7 +7,6 @@ SimpleCov.start do
   add_filter "/test/"
   add_filter "/db/migrate/"
   add_filter "/lib/dispatch_policy/version.rb"
-  add_filter "/lib/dispatch_policy/install_generator.rb"
   enable_coverage :branch
   track_files "{lib,app}/**/*.rb"
 end
