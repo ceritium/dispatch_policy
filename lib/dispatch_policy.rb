@@ -16,19 +16,25 @@ module DispatchPolicy
     :tick_sleep,
     :tick_sleep_busy,
     :partition_idle_ttl,
+    :admin_partition_limit,
     keyword_init: true
   )
 
   def self.config
     @config ||= Config.new(
-      enabled:             true,
-      lease_duration:      15 * 60,          # 15.minutes
-      batch_size:          500,
-      round_robin_quantum: 50,
-      tick_max_duration:   60,               # 1.minute
-      tick_sleep:          1,                # idle sleep
-      tick_sleep_busy:     0.05,             # busy sleep
-      partition_idle_ttl:  30 * 60           # 30.minutes
+      enabled:               true,
+      lease_duration:        15 * 60,          # 15.minutes
+      batch_size:            500,
+      round_robin_quantum:   50,
+      tick_max_duration:     60,               # 1.minute
+      tick_sleep:            1,                # idle sleep
+      tick_sleep_busy:       0.05,             # busy sleep
+      partition_idle_ttl:    30 * 60,          # 30.minutes
+      # Hard cap on rows the admin's partition breakdown will pull per
+      # aggregation. Protects the host DB and process when a policy has
+      # tens of thousands of partitions: the admin shows the top-N most
+      # active and a truncation banner instead of dragging in everything.
+      admin_partition_limit: 5_000
     )
   end
 
