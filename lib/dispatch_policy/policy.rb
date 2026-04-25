@@ -69,7 +69,8 @@ module DispatchPolicy
     def build_round_robin_key(arguments)
       return nil unless @round_robin_builder
       key = @round_robin_builder.call(arguments)
-      key.nil? || key.to_s.empty? ? nil : key.to_s
+      return nil if key.nil? || key.to_s.empty?
+      key.to_s[0, DispatchPolicy::MAX_PARTITION_KEY_LENGTH]
     end
 
     def gate(type, **opts)

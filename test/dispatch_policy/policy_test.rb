@@ -33,5 +33,25 @@ module DispatchPolicy
       assert_nil policy.build_round_robin_key([ nil ])
       assert_nil policy.build_round_robin_key([ "" ])
     end
+
+    test "round_robin_key is truncated to MAX_PARTITION_KEY_LENGTH" do
+      policy = SampleJob.resolved_dispatch_policy
+      huge   = "x" * (DispatchPolicy::MAX_PARTITION_KEY_LENGTH + 100)
+      assert_equal DispatchPolicy::MAX_PARTITION_KEY_LENGTH,
+                   policy.build_round_robin_key([ huge ]).length
+    end
+
+    test "gate partition_key_for is truncated to MAX_PARTITION_KEY_LENGTH" do
+      gate = DispatchPolicy::Gates::Throttle.new(
+        policy:       SampleJob.resolved_dispatch_policy,
+        name:         :throttle,
+        rate:         1,
+        per:          60,
+        partition_by: ->(ctx) { ctx[:huge] }
+      )
+      huge = "y" * (DispatchPolicy::MAX_PARTITION_KEY_LENGTH + 50)
+      assert_equal DispatchPolicy::MAX_PARTITION_KEY_LENGTH,
+                   gate.partition_key_for(huge: huge).length
+    end
   end
 end

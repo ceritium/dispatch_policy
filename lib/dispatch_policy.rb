@@ -7,6 +7,14 @@ require "dispatch_policy/version"
 require "dispatch_policy/engine" if defined?(Rails)
 
 module DispatchPolicy
+  # Hard cap on the length of partition keys (gate partition_by results,
+  # round_robin_by results). Keys longer than this are truncated before
+  # they reach the database. Protects partition_counts / throttle_buckets
+  # / partition_observations rows + indexes from being inflated by an
+  # accidentally-unbounded host-app input flowing through a partition_by
+  # lambda.
+  MAX_PARTITION_KEY_LENGTH = 512
+
   Config = Struct.new(
     :enabled,
     :lease_duration,

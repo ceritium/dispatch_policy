@@ -23,10 +23,13 @@ module DispatchPolicy
 
     def configure(**_opts); end
 
-    # Resolve a partition key for a given context.
+    # Resolve a partition key for a given context. The result is
+    # truncated to MAX_PARTITION_KEY_LENGTH so a host-app lambda that
+    # accidentally passes through unbounded user input can't bloat
+    # the gate's persisted rows + indexes.
     def partition_key_for(ctx)
       return "default" if @partition_by.nil?
-      @partition_by.call(ctx).to_s
+      @partition_by.call(ctx).to_s[0, DispatchPolicy::MAX_PARTITION_KEY_LENGTH]
     end
 
     # Subclasses must implement.
