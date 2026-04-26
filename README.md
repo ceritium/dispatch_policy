@@ -520,6 +520,32 @@ indexes, `FOR UPDATE SKIP LOCKED`, `jsonb`). `PGUSER` / `PGHOST` /
 `PGPASSWORD` env vars override the defaults in
 `test/dummy/config/database.yml`.
 
+## Releasing
+
+The gem uses the standard `bundler/gem_tasks` flow — there is no
+release automation in CI. To cut a new version:
+
+1. Bump `DispatchPolicy::VERSION` in `lib/dispatch_policy/version.rb`
+   following SemVer. While the API is marked experimental, breaking
+   changes go in a minor bump and should be called out in the changelog.
+2. Add a section to `CHANGELOG.md` above the previous one, grouping
+   entries (Added / Changed / Fixed / Removed). Link any relevant PRs.
+3. Make sure the working tree is on `master`, clean, and CI is green
+   (`bundle exec rake test` locally for a sanity check).
+4. Commit: `git commit -am "Release vX.Y.Z"`.
+5. `bundle exec rake release` — Bundler will build the `.gem` into
+   `pkg/`, tag `vX.Y.Z`, push the commit and tag, and `gem push` to
+   RubyGems. The gemspec sets `rubygems_mfa_required`, so have your
+   OTP ready (`gem signin` first if you aren't authenticated).
+6. Optional: publish a GitHub release from the tag, e.g.
+   `gh release create vX.Y.Z --notes-from-tag`, or paste the
+   changelog section into the release notes.
+
+If `rake release` fails partway through (e.g. RubyGems push rejects
+the version), do not retry blindly — inspect what already happened
+(tag created? commit pushed?) and clean up before re-running, since
+Bundler won't re-tag an existing version.
+
 ## License
 
 MIT.
