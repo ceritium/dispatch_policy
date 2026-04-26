@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+- Add a partial index on `dispatch_policy_staged_jobs(active_job_id)`
+  scoped to in-flight rows (`completed_at IS NULL AND active_job_id
+  IS NOT NULL`). Without it, the per-perform completion UPDATE
+  (`mark_completed_by_active_job_id`) does a sequential scan on every
+  finished job. Existing installs need to run the new migration
+  (`bundle exec rails dispatch_policy:install:migrations` then
+  `db:migrate`).
+
 ## 0.2.0
 
 ### Added
