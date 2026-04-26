@@ -7,9 +7,18 @@
   scoped to in-flight rows (`completed_at IS NULL AND active_job_id
   IS NOT NULL`). Without it, the per-perform completion UPDATE
   (`mark_completed_by_active_job_id`) does a sequential scan on every
-  finished job. Existing installs need to run the new migration
-  (`bundle exec rails dispatch_policy:install:migrations` then
-  `db:migrate`).
+  finished job.
+- Add two partial indexes used by the admin partition breakdown:
+  `(policy_name) WHERE admitted_at IS NOT NULL AND completed_at IS NULL`
+  for in-flight aggregations, and `(policy_name, completed_at) WHERE
+  completed_at IS NOT NULL` for completed-in-window aggregations. The
+  pre-existing `(completed_at) WHERE completed_at IS NOT NULL` index
+  is left in place for now — drop it in a follow-up after confirming
+  in production that nothing else depends on it.
+
+Existing installs need to run the new migrations
+(`bundle exec rails dispatch_policy:install:migrations` then
+`db:migrate`).
 
 ## 0.2.0
 
