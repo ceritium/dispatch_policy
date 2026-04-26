@@ -530,21 +530,24 @@ release automation in CI. To cut a new version:
    changes go in a minor bump and should be called out in the changelog.
 2. Add a section to `CHANGELOG.md` above the previous one, grouping
    entries (Added / Changed / Fixed / Removed). Link any relevant PRs.
+   The heading must match `## X.Y.Z` exactly — `bin/release` extracts
+   it as the GitHub release notes.
 3. Make sure the working tree is on `master`, clean, and CI is green
    (`bundle exec rake test` locally for a sanity check).
-4. Commit: `git commit -am "Release vX.Y.Z"`.
-5. `bundle exec rake release` — Bundler will build the `.gem` into
-   `pkg/`, tag `vX.Y.Z`, push the commit and tag, and `gem push` to
-   RubyGems. The gemspec sets `rubygems_mfa_required`, so have your
-   OTP ready (`gem signin` first if you aren't authenticated).
-6. Optional: publish a GitHub release from the tag, e.g.
-   `gh release create vX.Y.Z --notes-from-tag`, or paste the
-   changelog section into the release notes.
+4. Commit and push: `git commit -am "Release vX.Y.Z" && git push`.
+5. Run `bin/release`. It runs sanity checks, then `rake release`
+   (build → tag `vX.Y.Z` → push tag → `gem push` to RubyGems), and
+   finally `gh release create vX.Y.Z` with the matching CHANGELOG
+   section as notes. The gemspec sets `rubygems_mfa_required`, so
+   have your OTP ready (`gem signin` first if you aren't authenticated;
+   `gh auth login` if you haven't authenticated the GitHub CLI).
 
 If `rake release` fails partway through (e.g. RubyGems push rejects
 the version), do not retry blindly — inspect what already happened
 (tag created? commit pushed?) and clean up before re-running, since
-Bundler won't re-tag an existing version.
+Bundler won't re-tag an existing version. If only the GitHub release
+step fails, the gem is already published; create the release by hand
+with `gh release create vX.Y.Z --title "vX.Y.Z" --notes-file …`.
 
 ## License
 

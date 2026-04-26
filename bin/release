@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# Release dispatch_policy to RubyGems.
+# Release dispatch_policy to RubyGems and create the GitHub release.
 #
-# Does sanity checks (clean tree, on master, up to date with origin) and
-# then hands off to `rake release`, which builds, tags `v<VERSION>`,
-# pushes the tag to GitHub, and pushes the gem to RubyGems.org.
+# Does sanity checks (clean tree, on master, up to date with origin),
+# hands off to `rake release` (which builds, tags `v<VERSION>`, pushes
+# the tag to GitHub, and pushes the gem to RubyGems.org), then creates
+# a GitHub release using the matching CHANGELOG section as notes.
 
 set -euo pipefail
 
@@ -38,3 +39,23 @@ read -r -p "continue? [y/N] " reply
 [[ "$reply" =~ ^[Yy]$ ]] || { echo "aborted"; exit 1; }
 
 bundle exec rake release
+
+NOTES=$(awk -v v="$VERSION" '
+  $0 ~ "^## " v "($|[^0-9])" { flag = 1; next }
+  flag && /^## / { exit }
+  flag { print }
+' CHANGELOG.md)
+
+if [[ -z "${NOTES//[[:space:]]/}" ]]; then
+  echo "✗ no CHANGELOG section found for $VERSION — create the GitHub release manually" >&2
+  exit 1
+fi
+
+if ! command -v gh >/dev/null 2>&1; then
+  echo "! gh CLI not installed — create the GitHub release manually:" >&2
+  echo "    gh release create v$VERSION --title \"v$VERSION\" --notes-file CHANGELOG.md" >&2
+  exit 0
+fi
+
+echo "→ creating GitHub release v$VERSION"
+gh release create "v$VERSION" --title "v$VERSION" --notes "$NOTES"
