@@ -350,23 +350,41 @@ module DispatchPolicy
         survivors = gate.filter(survivors, context)
       end
 
-      survivors.map do |staged|
+      return [] if survivors.empty?
+
+      now           = Time.current
+      lease_expires = now + DispatchPolicy.config.lease_duration
+      gate_index    = policy.gates.each_with_object({}) { |g, h| h[g.name.to_s] = g }
+
+      staged_updates = []
+      counter_deltas = Hash.new(0)
+      pairs          = []
+
+      survivors.each do |staged|
         partitions = context.partitions_for(staged)
 
         partitions.each do |gate_name, partition_key|
-          gate = policy.gates.find { |g| g.name == gate_name.to_sym }
+          gate = gate_index[gate_name.to_s]
           next unless gate&.tracks_inflight?
-
-          PartitionInflightCount.increment(
-            policy_name:   policy.name,
-            gate_name:     gate_name.to_s,
-            partition_key: partition_key.to_s
-          )
+          counter_deltas[[ policy.name, gate_name.to_s, partition_key.to_s ]] += 1
         end
 
-        job = staged.mark_admitted!(partitions: partitions)
-        [ staged, job ]
+        job = staged.instantiate_active_job
+        job._dispatch_partitions  = partitions
+        job._dispatch_admitted_at = now
+
+        staged_updates << [ staged.id, job.job_id, partitions ]
+        pairs          << [ staged, job ]
       end
+
+      StagedJob.mark_admitted_many!(
+        rows:             staged_updates,
+        admitted_at:      now,
+        lease_expires_at: lease_expires
+      )
+      PartitionInflightCount.increment_many!(deltas: counter_deltas)
+
+      pairs
     end
   end
 end

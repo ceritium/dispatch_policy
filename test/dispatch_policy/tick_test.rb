@@ -170,5 +170,33 @@ module DispatchPolicy
       assert_equal 1, StagedJob.admitted.count
       assert_equal 2, StagedJob.pending.count
     end
+
+    test "Tick.run issues a constant number of SQL writes regardless of batch size" do
+      # Architectural assertion: mark_admitted! and counter increments
+      # are both bulked into single statements. A regression that
+      # restores the per-row UPDATE pattern would balloon the write
+      # count back to ~2 × batch_size.
+      DispatchPolicy.config.batch_size = 200
+
+      300.times { |i| CappedJob.perform_later("p#{i}") }
+
+      writes = []
+      callback = ->(_, _, _, _, payload) {
+        sql = payload[:sql]
+        next if payload[:name] == "SCHEMA"
+        next unless /\A\s*(UPDATE|INSERT)/i.match?(sql)
+        next unless sql.include?("dispatch_policy_staged_jobs") ||
+                    sql.include?("dispatch_policy_partition_counts")
+        writes << sql
+      }
+
+      ActiveSupport::Notifications.subscribed(callback, "sql.active_record") do
+        Tick.run(policy_name: CappedJob.resolved_dispatch_policy.name)
+      end
+
+      assert_operator writes.size, :<=, 4,
+        "Tick.run must batch admission writes, got #{writes.size} writes for batch_size=200:\n" \
+        "#{writes.join("\n")}"
+    end
   end
 end

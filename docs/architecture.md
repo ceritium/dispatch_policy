@@ -133,17 +133,23 @@ multiples.
 
 | Operation                       |    100 |   1,000 |  10,000 | 100,000 |
 |---------------------------------|-------:|--------:|--------:|--------:|
-| `fetch_time_weighted_batch`     |   21ms |    24ms |   135ms | 1,200ms |
-| `fetch_round_robin_batch`       |   14ms |    21ms |    80ms |   773ms |
-| `Tick.run` end-to-end           |  380ms |   472ms |   479ms |   442ms |
-| `Tick.reap` (all rows expired)  |  3.6ms |    15ms |   205ms | 2,481ms |
-| `StagedJob.stage_many!`         |   16ms |   130ms | 1,419ms | 17,456ms |
+| `fetch_time_weighted_batch`     |   25ms |    26ms |   173ms | 1,187ms |
+| `fetch_round_robin_batch`       |   14ms |    19ms |    76ms |   729ms |
+| `Tick.run` end-to-end           |   51ms |    53ms |    65ms |    64ms |
+| `Tick.reap` (all rows expired)  |  4.8ms |    14ms |   183ms | 2,395ms |
+| `StagedJob.stage_many!`         |   15ms |   175ms | 1,488ms | 18,234ms |
 
 ### What this says
 
-- **`Tick.run` is flat**, regardless of how many partitions are
-  pending. Capped by `batch_size`. Roughly 1,000-1,150 admissions/sec
-  steady-state across all scales tested.
+- **`Tick.run` is flat AND bulk**: ~50-65ms regardless of partition
+  count, with 6 SQL statements regardless of `batch_size`. The
+  per-row UPDATE for `mark_admitted!` and the per-row counter
+  increment have both been folded into single statements
+  (UPDATE … FROM (VALUES …) for staged_jobs, multi-row INSERT … ON
+  CONFLICT for partition counts). ~7,500-9,500 admissions/sec
+  steady-state on local PG; on remote PG with ~1ms RTT the impact
+  is much larger because the old per-row pattern paid one round-trip
+  per row.
 - **`Tick.reap` is bulk-batched**: two SQL statements regardless of
   expired-row count (one UPDATE … RETURNING on staged_jobs, one
   UPDATE … FROM (VALUES …) on counters). ~30,000-70,000 rows/sec.

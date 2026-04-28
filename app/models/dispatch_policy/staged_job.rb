@@ -98,6 +98,35 @@ module DispatchPolicy
       job
     end
 
+    # Bulk variant of mark_admitted! for the tick path. Updates every
+    # row in the batch with one UPDATE … FROM (VALUES …) statement
+    # instead of N separate UPDATEs. The (id, active_job_id,
+    # partitions) tuples are computed in Ruby — the tick path
+    # deserializes the ActiveJob and assigns _dispatch_partitions in
+    # memory there, so we don't need a RETURNING clause.
+    def self.mark_admitted_many!(rows:, admitted_at:, lease_expires_at:)
+      return 0 if rows.empty?
+
+      values_clause = ([ "(?::bigint, ?, ?::jsonb)" ] * rows.size).join(", ")
+      values_args   = rows.flat_map { |id, active_job_id, partitions|
+        [ id, active_job_id, partitions.to_json ]
+      }
+
+      sql = <<~SQL.squish
+        UPDATE #{quoted_table_name} AS s
+           SET admitted_at      = ?,
+               lease_expires_at = ?,
+               active_job_id    = d.active_job_id,
+               partitions       = d.partitions
+          FROM (VALUES #{values_clause}) AS d(id, active_job_id, partitions)
+         WHERE s.id = d.id
+      SQL
+
+      connection.exec_update(
+        sanitize_sql_array([ sql, admitted_at, lease_expires_at, *values_args ])
+      )
+    end
+
     def instantiate_active_job
       ActiveJob::Base.deserialize(arguments)
     end
