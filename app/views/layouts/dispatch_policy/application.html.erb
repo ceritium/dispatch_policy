@@ -60,12 +60,23 @@
       (function () {
         const KEY = "dispatch_policy_refresh_seconds";
         let refreshTimer = null;
+        // Tracks whether Turbo currently has a navigation in flight.
+        // Without this guard, a slow server response means the next
+        // setTimeout fires while the previous fetch is still loading,
+        // and Turbo aborts it — Firefox surfaces these as NS_BINDING_
+        // ABORTED entries in DevTools and the server work is wasted.
+        let inFlight = false;
 
         function scheduleRefresh() {
           clearTimeout(refreshTimer);
           const seconds = parseInt(localStorage.getItem(KEY) || "0", 10);
           if (seconds <= 0) return;
           refreshTimer = setTimeout(() => {
+            // Skip if Turbo is still loading from a previous fire.
+            // The turbo:load handler below re-arms the timer when
+            // the in-flight request settles, so the effective
+            // interval becomes max(seconds, response_time).
+            if (inFlight) return;
             // Turbo.visit fetches + morphs thanks to the turbo-refresh-method
             // meta tag, so the page updates in place without a full reload —
             // scroll position, chart tooltips, form focus stay put.
@@ -260,6 +271,13 @@
         document.addEventListener("DOMContentLoaded", boot);
         document.addEventListener("turbo:render", boot);
         document.addEventListener("turbo:load",   boot);
+
+        // In-flight tracking for the auto-refresh guard. Registered
+        // outside boot() because they should fire once per Turbo
+        // navigation, not be re-bound on every render.
+        document.addEventListener("turbo:visit",               () => { inFlight = true;  });
+        document.addEventListener("turbo:load",                () => { inFlight = false; });
+        document.addEventListener("turbo:fetch-request-error", () => { inFlight = false; });
       })();
     </script>
   </body>
