@@ -234,18 +234,33 @@ module DispatchPolicy
         [ (batch_size * w / total_weight).floor, 1 ].max
       end
 
-      batch = []
-      partitions.each do |key|
-        rows = StagedJob.pending
-          .where(policy_name: policy.name, round_robin_key: key)
-          .where("not_before_at IS NULL OR not_before_at <= ?", now)
-          .order(:priority, :staged_at)
-          .limit(quanta[key])
-          .lock("FOR UPDATE SKIP LOCKED")
-          .to_a
-        batch.concat(rows)
-        break if batch.size >= batch_size
-      end
+      # Drive a single LATERAL fetch from a VALUES list of
+      # (round_robin_key, quantum) pairs. One round-trip regardless of
+      # partition count — earlier versions issued one query per
+      # partition, which became the inner loop for tenants with
+      # thousands of partitions.
+      values_clause = ([ "(?, ?::int)" ] * quanta.size).join(", ")
+      values_args   = quanta.flat_map { |key, q| [ key, q ] }
+
+      sql = <<~SQL.squish
+        WITH plan(round_robin_key, quantum) AS (VALUES #{values_clause})
+        SELECT rows.*
+        FROM plan
+        CROSS JOIN LATERAL (
+          SELECT *
+          FROM dispatch_policy_staged_jobs
+          WHERE policy_name = ?
+            AND admitted_at IS NULL
+            AND round_robin_key = plan.round_robin_key
+            AND (not_before_at IS NULL OR not_before_at <= ?)
+          ORDER BY priority, staged_at
+          LIMIT plan.quantum
+          FOR UPDATE SKIP LOCKED
+        ) AS rows
+        LIMIT ?
+      SQL
+
+      batch = StagedJob.find_by_sql([ sql, *values_args, policy.name, now, batch_size ])
 
       remaining = batch_size - batch.size
       return batch if remaining <= 0 || batch.empty?
