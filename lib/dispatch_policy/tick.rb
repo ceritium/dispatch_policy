@@ -1,54 +1,61 @@
 # frozen_string_literal: true
 
 module DispatchPolicy
+  # Raised inside the staging transaction when the configured adapter
+  # politely declines an enqueue (sets enqueue_error without raising).
+  # Caught at the top of Tick.run to log and swallow after the rollback
+  # has already reverted admission.
+  class EnqueueDeclined < StandardError; end
+
   class Tick
     THROTTLE_ZERO_THRESHOLD = 0.001
 
-    # Single admission pass: fetch pending staged jobs per policy, evaluate
-    # gates, mark survivors as admitted, then enqueue them on the real
-    # backend outside the locking transaction.
+    # Single admission pass: fetch pending staged jobs, run gates, mark
+    # survivors as admitted, AND hand them off to the real adapter — all
+    # inside one PostgreSQL transaction. Because dispatch_policy only
+    # supports PG-backed adapters (GoodJob, Solid Queue) sharing the
+    # same connection as our staging tables, the adapter's INSERT into
+    # its own jobs table participates in the same TX. Any failure
+    # (gate raise, adapter raise, polite decline) rolls back everything:
+    # rows stay pending, counters never drift, no half-enqueued state.
     def self.run(policy_name: nil)
       return 0 unless DispatchPolicy.enabled?
 
-      pending_enqueue = []
+      admitted = 0
 
-      StagedJob.transaction do
-        active_policies(policy_name).each do |pname|
-          policy = lookup_policy(pname)
-          next unless policy
+      begin
+        StagedJob.transaction do
+          active_policies(policy_name).each do |pname|
+            policy = lookup_policy(pname)
+            next unless policy
 
-          batch = fetch_batch(policy)
-          next if batch.empty?
+            batch = fetch_batch(policy)
+            next if batch.empty?
 
-          pending_enqueue.concat(run_policy(policy, batch))
-        end
-      end
+            run_policy(policy, batch).each do |staged, job|
+              job.enqueue(_bypass_staging: true)
 
-      admitted_count = 0
-      pending_enqueue.each do |staged, job|
-        begin
-          job.enqueue(_bypass_staging: true)
-          # ActiveJob adapters report a polite failure by setting
-          # enqueue_error and leaving successfully_enqueued? false
-          # instead of raising. Without this check the staged row
-          # would stay marked admitted while the adapter never queued
-          # the job — losing it silently.
-          if job.successfully_enqueued?
-            admitted_count += 1
-          else
-            Rails.logger&.warn(
-              "[DispatchPolicy] adapter did not enqueue staged=#{staged.id}: " \
-              "#{job.enqueue_error&.class}: #{job.enqueue_error&.message}"
-            )
-            revert_admission(staged)
+              # ActiveJob adapters can report failure by setting
+              # enqueue_error and leaving successfully_enqueued? false
+              # instead of raising. We treat that as a hard failure and
+              # roll back the entire transaction so admission, counters
+              # and the adapter row all unwind together.
+              unless job.successfully_enqueued?
+                raise EnqueueDeclined,
+                  "adapter declined staged=#{staged.id}: " \
+                  "#{job.enqueue_error&.class}: #{job.enqueue_error&.message}"
+              end
+
+              admitted += 1
+            end
           end
-        rescue StandardError => e
-          Rails.logger&.error("[DispatchPolicy] enqueue failed staged=#{staged.id}: #{e.class}: #{e.message}")
-          revert_admission(staged)
         end
+      rescue EnqueueDeclined => e
+        Rails.logger&.warn("[DispatchPolicy] #{e.message} — transaction rolled back")
+        return 0
       end
 
-      admitted_count
+      admitted
     end
 
     def self.prune_idle_partitions
@@ -71,6 +78,12 @@ module DispatchPolicy
       end
     end
 
+    # Safety net for the narrow case where a worker started executing
+    # an admitted job but died before around_perform's ensure block
+    # released its in-flight counters. With atomic admission+enqueue
+    # there is no longer a "stuck admitted but never reached the
+    # adapter" case to recover from — the adapter's own retry semantics
+    # cover crashed jobs, dispatch_policy only releases the counters.
     def self.reap
       StagedJob.expired_leases.find_each do |staged|
         (staged.partitions || {}).each do |gate_name, partition_key|
@@ -285,17 +298,6 @@ module DispatchPolicy
         job = staged.mark_admitted!(partitions: partitions)
         [ staged, job ]
       end
-    end
-
-    def self.revert_admission(staged)
-      partitions = staged.partitions || {}
-      release(policy_name: staged.policy_name, partitions: partitions)
-      staged.update_columns(
-        admitted_at:      nil,
-        lease_expires_at: nil,
-        active_job_id:    nil,
-        partitions:       {}
-      )
     end
   end
 end

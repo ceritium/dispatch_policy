@@ -8,11 +8,22 @@
 >
 > **PostgreSQL only (11+).** The staging, admission, and fairness
 > machinery lean on `jsonb`, partial indexes, `FOR UPDATE SKIP LOCKED`,
-> `ON CONFLICT`, and `CROSS JOIN LATERAL`. MySQL/SQLite support isn't
-> closed off as a goal — being drop-in across every ActiveJob backend
-> is the long-term direction — but it would take meaningful rework
-> (shadow columns for `jsonb`, full indexes instead of partial, a
-> different batch-fetch strategy for fairness). Contributions welcome.
+> `ON CONFLICT`, and `CROSS JOIN LATERAL`.
+>
+> **PG-backed ActiveJob adapter required.** dispatch_policy admits jobs
+> and hands them off to the adapter inside a single transaction, which
+> means the adapter must store its jobs in the same PostgreSQL
+> connection as `dispatch_policy_staged_jobs`. Supported: **GoodJob**
+> and **Solid Queue**. Sidekiq, Resque, and SQS are **not supported** —
+> they store jobs externally and can't share the staging transaction.
+> See the "Failure modes" section below for what this buys you, and
+> [docs/architecture.md](docs/architecture.md) for a sketch of how
+> external-adapter support could be added later.
+>
+> If your adapter lives in a separate database (typical Solid Queue
+> setup using a `:queue` role), set
+> `DispatchPolicy.config.database_role = :queue` so the staging tables
+> live alongside the adapter's tables.
 
 Per-partition admission control for ActiveJob. Stages `perform_later`
 into a dedicated table, runs a tick loop that admits jobs through
@@ -24,7 +35,8 @@ Use it when you need:
 - **Per-tenant / per-endpoint throttle** that's exact (token bucket)
   instead of best-effort enqueue-side.
 - **Per-partition concurrency** with a proper release hook on job
-  completion (and lease-expiry recovery if the worker dies mid-perform).
+  completion, plus a short lease that recovers in-flight counters if
+  the worker dies mid-perform (see "Failure modes" below).
 - **Adaptive concurrency** — a cap that shrinks under queue pressure
   and grows back when workers keep up, without manual tuning.
 - **Dedupe** against a partial unique index, not an in-memory key.
@@ -67,11 +79,12 @@ Configure in `config/initializers/dispatch_policy.rb`:
 ```ruby
 DispatchPolicy.configure do |c|
   c.enabled             = ENV.fetch("DISPATCH_POLICY_ENABLED", "true") != "false"
-  c.lease_duration      = 15.minutes
+  c.lease_duration      = 2.minutes  # safety net for crashed workers
   c.batch_size          = 500
   c.round_robin_quantum = 50
-  c.tick_sleep          = 1        # idle
-  c.tick_sleep_busy     = 0.05     # after productive ticks
+  c.tick_sleep          = 1          # idle
+  c.tick_sleep_busy     = 0.05       # after productive ticks
+  # c.database_role     = :queue     # when the adapter lives in a separate DB
 end
 ```
 
@@ -82,11 +95,12 @@ ActiveJob#perform_later
   → Dispatchable#enqueue
     → StagedJob.stage!   (insert into dispatch_policy_staged_jobs, pending)
 
-(tick loop, periodically)
+(tick loop, periodically — all inside ONE transaction)
   → SELECT pending FOR UPDATE SKIP LOCKED
   → Run gates in declared order; survivors are the admitted set
-  → StagedJob#mark_admitted!   (increment counters, set admitted_at)
-  → job.enqueue(_bypass_staging: true)   (hand off to the real adapter)
+  → StagedJob#mark_admitted!              (increment counters, set admitted_at)
+  → job.enqueue(_bypass_staging: true)    (INSERT into adapter table — same TX)
+  → COMMIT, or ROLLBACK on any failure (rows revert to pending automatically)
 
 (worker runs perform)
   → Dispatchable#around_perform
@@ -489,6 +503,44 @@ config.good_job.cron = {
 For adapters without a first-class dedup mechanism, implement it
 yourself (e.g. `pg_try_advisory_lock` inside `perform`) before calling
 `DispatchPolicy::TickLoop.run`.
+
+## Failure modes
+
+Admission and enqueue happen inside a single PostgreSQL transaction, so
+the failure surface is small and predictable.
+
+| Failure                                            | Outcome                                                                                       |
+|----------------------------------------------------|-----------------------------------------------------------------------------------------------|
+| Tick process crashes mid-batch                     | Full rollback. All rows in the batch stay `pending`. Counters never increment. Picked up next tick. |
+| Gate raises during `filter`                        | Same as above — rollback, nothing admitted.                                                   |
+| Adapter raises during `enqueue`                    | Same as above — rollback, nothing admitted.                                                   |
+| Adapter politely declines (sets `enqueue_error`)   | Same as above — `EnqueueDeclined` is raised inside the TX and rolls everything back.          |
+| Worker crashes mid-`perform`                       | Lease expires (`lease_duration`, default 2 min). Reaper releases counters and marks the row completed. The job itself is **not** retried by dispatch_policy — the adapter's retry semantics handle that. |
+| Worker finishes `perform` but dies before `around_perform` releases counters | Same as above — lease reaps and counters return to zero. |
+
+### Non-guarantees
+
+- **dispatch_policy does not retry crashed jobs.** That is the
+  adapter's job. GoodJob and Solid Queue both have built-in retries
+  with backoff — configure them as you would normally.
+- **The reaper releases counters but never re-pends rows.** Once a row
+  has been admitted, dispatch_policy has handed it to the adapter and
+  considers its work done. There is no "stuck admitted but not
+  enqueued" state to recover from, because admission and enqueue are
+  atomic.
+- **No support for adapters that store jobs outside this PostgreSQL
+  connection** (Sidekiq/Resque/SQS). The transaction wouldn't span the
+  adapter's storage, breaking every guarantee in the table above. See
+  [docs/architecture.md](docs/architecture.md) for what it would take
+  to support them.
+
+### Choosing `lease_duration`
+
+The lease only protects in-flight counters from a crashed worker, so
+set it just above your longest realistic perform. Values in the 2–5
+minute range are typical; the legacy 15-minute default existed to
+also cover "tick crashed before adapter handoff" — that case is gone
+and no longer needs accommodation.
 
 ## Admin UI
 

@@ -59,21 +59,5 @@ module DispatchPolicy
 
       assert_equal 0, ThrottleBucket.where(policy_name: "any").count
     end
-
-    test "revert_admission reverses a failed enqueue" do
-      ReapJob.perform_later("Z")
-      Tick.run(policy_name: ReapJob.resolved_dispatch_policy.name)
-      staged = StagedJob.admitted.last
-
-      Tick.revert_admission(staged)
-
-      assert_nil staged.reload.admitted_at
-      count = PartitionInflightCount.fetch_many(
-        policy_name: ReapJob.resolved_dispatch_policy.name,
-        gate_name: :concurrency,
-        partition_keys: [ "Z" ]
-      )
-      assert_equal 0, count["Z"]
-    end
   end
 end

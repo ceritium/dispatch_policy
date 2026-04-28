@@ -17,13 +17,29 @@ module DispatchPolicy
     :tick_sleep_busy,
     :partition_idle_ttl,
     :admin_partition_limit,
+    :database_role,
+    :allowed_adapters,
     keyword_init: true
   )
+
+  # Adapters that store jobs in the same PostgreSQL database as the host
+  # app. These can participate in the staging transaction so admission +
+  # enqueue is atomic. Sidekiq/Resque/SQS are not supported because their
+  # backing store is external — see docs/architecture.md.
+  PG_BACKED_ADAPTERS = %i[good_job solid_queue].freeze
+
+  # Adapters that don't talk to any external store, safe to use in tests
+  # and development. Atomicity is trivially preserved.
+  IN_PROCESS_ADAPTERS = %i[test inline async].freeze
 
   def self.config
     @config ||= Config.new(
       enabled:               true,
-      lease_duration:        15 * 60,          # 15.minutes
+      # Reaper safety net for the narrow case "worker started the job
+      # but died before around_perform.ensure released counters".
+      # Admission/enqueue is atomic so this never covers stuck-admitted
+      # rows anymore — keep it short.
+      lease_duration:        2 * 60,           # 2.minutes
       batch_size:            500,
       round_robin_quantum:   50,
       tick_max_duration:     60,               # 1.minute
@@ -34,7 +50,14 @@ module DispatchPolicy
       # aggregation. Protects the host DB and process when a policy has
       # tens of thousands of partitions: the admin shows the top-N most
       # active and a truncation banner instead of dragging in everything.
-      admin_partition_limit: 5_000
+      admin_partition_limit: 5_000,
+      # Role used by ApplicationRecord#connects_to when the host app
+      # stores jobs in a separate database (typical Solid Queue setup).
+      # nil = use the primary connection.
+      database_role:         nil,
+      # Override the adapter allowlist if you know what you're doing.
+      # Defaults to PG_BACKED_ADAPTERS + IN_PROCESS_ADAPTERS.
+      allowed_adapters:      nil
     )
   end
 

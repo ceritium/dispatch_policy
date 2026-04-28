@@ -59,23 +59,106 @@ module DispatchPolicy
       end
     end
 
-    test "enqueue failure post-admission reverts the staged row and the counter" do
+    test "adapter raise during enqueue rolls back the entire staging transaction" do
       policy_name = FailingEnqueueJob.resolved_dispatch_policy.name
       FailingEnqueueJob.perform_later
 
       FailingEnqueueJob.enqueue_should_raise = true
       begin
-        Tick.run(policy_name: policy_name)
+        # The exception bubbles out of Tick.run — the surrounding
+        # TickLoop catches it; here we assert the rollback behaviour.
+        assert_raises(RuntimeError) { Tick.run(policy_name: policy_name) }
       ensure
         FailingEnqueueJob.enqueue_should_raise = false
       end
 
       staged = StagedJob.find_by!(policy_name: policy_name)
-      assert_nil staged.admitted_at, "should be pending after a failed adapter enqueue"
+      assert_nil staged.admitted_at, "TX rollback must leave the row pending"
       assert_nil staged.active_job_id
       assert_empty staged.partitions
       assert_equal 0, PartitionInflightCount.where(policy_name: policy_name).sum(:in_flight),
-        "counter must be decremented when the post-admission enqueue is reverted"
+        "counter increments must roll back with the rest of the TX"
+    end
+
+    class PoliteFailureJob < ActiveJob::Base
+      include DispatchPolicy::Dispatchable
+      class_attribute :should_set_enqueue_error, default: false
+
+      dispatch_policy { gate :concurrency, max: 5, partition_by: ->(_ctx) { "p" } }
+
+      def perform(*); end
+
+      private
+
+      # Simulate an adapter that reports failure via enqueue_error +
+      # leaves successfully_enqueued? false. Override raw_enqueue (not
+      # _raw_enqueue) so the same stub works on Rails 7.2 (where the
+      # adapter call lives in raw_enqueue) and 8.1 (where raw_enqueue
+      # wraps _raw_enqueue in callbacks).
+      def raw_enqueue
+        if self.class.should_set_enqueue_error
+          self.enqueue_error = ActiveJob::EnqueueError.new("simulated polite failure")
+          return
+        end
+        super
+      end
+    end
+
+    test "polite adapter decline (enqueue_error set, no raise) rolls back the staging transaction" do
+      policy_name = PoliteFailureJob.resolved_dispatch_policy.name
+      PoliteFailureJob.perform_later
+
+      PoliteFailureJob.should_set_enqueue_error = true
+      begin
+        # Polite decline is internally raised as EnqueueDeclined and
+        # rescued inside Tick.run, so this returns 0 instead of bubbling.
+        assert_equal 0, Tick.run(policy_name: policy_name)
+      ensure
+        PoliteFailureJob.should_set_enqueue_error = false
+      end
+
+      staged = StagedJob.find_by!(policy_name: policy_name)
+      assert_nil staged.admitted_at, "TX rollback must leave the row pending"
+      assert_equal 0, PartitionInflightCount.where(policy_name: policy_name).sum(:in_flight)
+    end
+
+    class BatchFailingJob < ActiveJob::Base
+      include DispatchPolicy::Dispatchable
+      class_attribute :fail_on_index, default: nil
+      class_attribute :enqueue_call_count, default: 0
+
+      dispatch_policy { gate :concurrency, max: 100, partition_by: ->(_ctx) { "b" } }
+
+      def perform(*); end
+
+      private
+
+      def raw_enqueue
+        idx = self.class.enqueue_call_count
+        self.class.enqueue_call_count = idx + 1
+        raise "simulated mid-batch failure" if idx == self.class.fail_on_index
+        super
+      end
+    end
+
+    test "raise mid-batch rolls back every prior admission in the same tick" do
+      policy_name = BatchFailingJob.resolved_dispatch_policy.name
+      3.times { BatchFailingJob.perform_later }
+
+      BatchFailingJob.fail_on_index       = 1   # second enqueue raises
+      BatchFailingJob.enqueue_call_count  = 0
+      begin
+        assert_raises(RuntimeError) { Tick.run(policy_name: policy_name) }
+      ensure
+        BatchFailingJob.fail_on_index      = nil
+        BatchFailingJob.enqueue_call_count = 0
+      end
+
+      scope = StagedJob.where(policy_name: policy_name)
+      assert_equal 3, scope.pending.count, "all three rows revert when one mid-batch enqueue raises"
+      assert_equal 0, scope.admitted.count
+      assert_equal 0, PartitionInflightCount.where(policy_name: policy_name).sum(:in_flight),
+        "counter increments from earlier successful enqueues in the batch must roll back too"
     end
 
     # ───── Group B: dedupe state transitions ─────

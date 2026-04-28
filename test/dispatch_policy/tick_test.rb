@@ -104,47 +104,5 @@ module DispatchPolicy
       assert_equal 1, StagedJob.admitted.count
       assert_equal 2, StagedJob.pending.count
     end
-
-    class PoliteFailureJob < ActiveJob::Base
-      include DispatchPolicy::Dispatchable
-      class_attribute :should_set_enqueue_error, default: false
-
-      dispatch_policy { gate :concurrency, max: 5, partition_by: ->(_ctx) { "p" } }
-
-      def perform(*); end
-
-      private
-
-      # Simulate an adapter that reports failure via enqueue_error +
-      # leaves successfully_enqueued? false. Override raw_enqueue (not
-      # _raw_enqueue) so the same stub works on Rails 7.2 (where the
-      # adapter call lives in raw_enqueue) and 8.1 (where raw_enqueue
-      # wraps _raw_enqueue in callbacks).
-      def raw_enqueue
-        if self.class.should_set_enqueue_error
-          self.enqueue_error = ActiveJob::EnqueueError.new("simulated polite failure")
-          return
-        end
-        super
-      end
-    end
-
-    test "polite enqueue failure (enqueue_error set, no raise) reverts admission" do
-      policy_name = PoliteFailureJob.resolved_dispatch_policy.name
-      PoliteFailureJob.perform_later
-
-      PoliteFailureJob.should_set_enqueue_error = true
-      begin
-        Tick.run(policy_name: policy_name)
-      ensure
-        PoliteFailureJob.should_set_enqueue_error = false
-      end
-
-      staged = StagedJob.find_by!(policy_name: policy_name)
-      assert_nil staged.admitted_at,
-        "row must be reverted to pending when the adapter declined to enqueue"
-      assert_equal 0, PartitionInflightCount.where(policy_name: policy_name).sum(:in_flight),
-        "counter must be decremented when admission is reverted"
-    end
   end
 end
