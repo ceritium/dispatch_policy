@@ -8,8 +8,13 @@
 #
 # stdout: column-aligned report (valid markdown, also readable in a
 #         terminal). Capture cleanly with `… > report.md`.
-# stderr: progress bars + status lines that are erased as each phase
+# stderr: progress bars + status lines that erase as each phase
 #         finishes, so the final terminal view is just the report.
+#
+# Iteration is by scale, not by scenario, so read-only fetches can
+# share a seed: only 4 seeds happen per scale (a fetch seed, a
+# Tick.run seed, a reap seed, and the stage_many measurement which
+# is its own seed) instead of 5.
 #
 # Numbers depend on hardware and database (local PG vs containerised
 # vs remote) — useful for spotting regressions and shaping defaults,
@@ -21,7 +26,10 @@ include DispatchPolicy::BenchmarkHelpers
 
 # ─── Job definitions ─────────────────────────────────────────────────
 
-class TimeWeightedBenchmarkJob < ActiveJob::Base
+# Used as the seed for BOTH fetch tests. fetch_round_robin_batch
+# doesn't read the time-weight, so calling it against a time-weighted
+# policy is fine — only the row shape matters and it's identical.
+class FetchBenchmarkJob < ActiveJob::Base
   include DispatchPolicy::Dispatchable
   dispatch_policy do
     context        ->(args) { { tenant: args.first } }
@@ -30,16 +38,10 @@ class TimeWeightedBenchmarkJob < ActiveJob::Base
   def perform(*); end
 end
 
-class RoundRobinBenchmarkJob < ActiveJob::Base
-  include DispatchPolicy::Dispatchable
-  dispatch_policy do
-    context        ->(args) { { tenant: args.first } }
-    round_robin_by ->(args) { args.first }
-  end
-  def perform(*); end
-end
-
-class PlainBenchmarkJob < ActiveJob::Base
+# Used for Tick.run + Tick.reap measurements. A concurrency gate
+# means Tick.run does counter increments per admission, which is the
+# meaningful per-job cost we want to measure.
+class GatedBenchmarkJob < ActiveJob::Base
   include DispatchPolicy::Dispatchable
   dispatch_policy do
     context ->(args) { { tenant: args.first } }
@@ -80,97 +82,89 @@ def seed_with_progress(label, **kwargs)
   seeded
 end
 
-# ─── Fetch / tick scenarios ──────────────────────────────────────────
-
-def run_scenario(label, job_class:, scales:, jobs_per_partition:)
-  policy = job_class.resolved_dispatch_policy
-  rows_out = []
-
-  scales.each do |n|
-    truncate_all!
-    seeded = seed_with_progress(
-      "#{label} N=#{fmt_int(n)}",
-      job_class:          job_class,
-      partitions:         n,
-      jobs_per_partition: jobs_per_partition
-    )
-
-    status("#{label} N=#{fmt_int(n)}: measuring…")
-    wall_ms, sql_count, result = measure { yield(policy) }
-    clear_status
-
-    fetched = if result.is_a?(Integer)
-      result
-    elsif result.respond_to?(:size)
-      result.size
-    else
-      0
-    end
-
-    rows_per_s = wall_ms.zero? ? 0 : (fetched * 1000.0 / wall_ms).round
-
-    rows_out << [
-      fmt_int(n),
-      fmt_int(seeded),
-      fmt_ms(wall_ms),
-      fmt_int(sql_count),
-      fmt_int(fetched),
-      fmt_int(rows_per_s)
-    ]
-  end
-
-  print_section(label)
-  print_table(
-    [ "partitions", "pending", "wall_ms", "sql", "rows", "rows/s" ],
-    rows_out
-  )
+def fetch_row(n, seeded, wall_ms, sql_count, fetched)
+  rows_per_s = wall_ms.zero? ? 0 : (fetched * 1000.0 / wall_ms).round
+  [
+    fmt_int(n),
+    fmt_int(seeded),
+    fmt_ms(wall_ms),
+    fmt_int(sql_count),
+    fmt_int(fetched),
+    fmt_int(rows_per_s)
+  ]
 end
 
-# 1. Time-weighted batch fetch.
-run_scenario(
-  "fetch_time_weighted_batch",
-  job_class:          TimeWeightedBenchmarkJob,
-  scales:             SCALES,
-  jobs_per_partition: JOBS_PER_PARTITION
-) do |policy|
-  DispatchPolicy::Tick.fetch_time_weighted_batch(policy)
+def reap_row(n, wall_ms, sql_count)
+  rows_per_s = wall_ms.zero? ? 0 : (n * 1000.0 / wall_ms).round
+  [ fmt_int(n), fmt_ms(wall_ms), fmt_int(sql_count), fmt_int(rows_per_s) ]
 end
 
-# 2. Plain round-robin batch fetch.
-run_scenario(
-  "fetch_round_robin_batch",
-  job_class:          RoundRobinBenchmarkJob,
-  scales:             SCALES,
-  jobs_per_partition: JOBS_PER_PARTITION
-) do |policy|
-  DispatchPolicy::Tick.fetch_round_robin_batch(policy)
+def stage_row(n, wall_ms, sql_count)
+  rows_per_s = wall_ms.zero? ? 0 : (n * 1000.0 / wall_ms).round
+  [ fmt_int(n), fmt_ms(wall_ms), fmt_int(sql_count), fmt_int(rows_per_s) ]
 end
 
-# 3. End-to-end Tick.run.
-run_scenario(
-  "Tick.run end-to-end (concurrency gate)",
-  job_class:          PlainBenchmarkJob,
-  scales:             SCALES,
-  jobs_per_partition: JOBS_PER_PARTITION
-) do |policy|
-  DispatchPolicy::Tick.run(policy_name: policy.name)
-end
+# ─── Measurements ────────────────────────────────────────────────────
 
-# 4. Tick.reap with N expired leases.
-reap_rows = []
-policy = PlainBenchmarkJob.resolved_dispatch_policy
+results = {
+  fetch_time_weighted: [],
+  fetch_round_robin:   [],
+  tick_run:            [],
+  reap:                [],
+  stage_many:          []
+}
+
+fetch_policy = FetchBenchmarkJob.resolved_dispatch_policy
+gated_policy = GatedBenchmarkJob.resolved_dispatch_policy
+
 SCALES.each do |n|
+  # ── Phase A: shared seed for both fetch_* measurements ───────────
+  truncate_all!
+  seeded = seed_with_progress(
+    "fetch N=#{fmt_int(n)}",
+    job_class:          FetchBenchmarkJob,
+    partitions:         n,
+    jobs_per_partition: JOBS_PER_PARTITION
+  )
+
+  status("fetch_time_weighted N=#{fmt_int(n)}: measuring…")
+  wall_ms, sql_count, result = measure { DispatchPolicy::Tick.fetch_time_weighted_batch(fetch_policy) }
+  fetched = result.respond_to?(:size) ? result.size : 0
+  results[:fetch_time_weighted] << fetch_row(n, seeded, wall_ms, sql_count, fetched)
+  clear_status
+
+  status("fetch_round_robin N=#{fmt_int(n)}: measuring…")
+  wall_ms, sql_count, result = measure { DispatchPolicy::Tick.fetch_round_robin_batch(fetch_policy) }
+  fetched = result.respond_to?(:size) ? result.size : 0
+  results[:fetch_round_robin] << fetch_row(n, seeded, wall_ms, sql_count, fetched)
+  clear_status
+
+  # ── Phase B: Tick.run consumes its seed (marks rows admitted) ────
+  truncate_all!
+  seeded = seed_with_progress(
+    "Tick.run N=#{fmt_int(n)}",
+    job_class:          GatedBenchmarkJob,
+    partitions:         n,
+    jobs_per_partition: JOBS_PER_PARTITION
+  )
+
+  status("Tick.run N=#{fmt_int(n)}: measuring…")
+  wall_ms, sql_count, admitted = measure { DispatchPolicy::Tick.run(policy_name: gated_policy.name) }
+  results[:tick_run] << fetch_row(n, seeded, wall_ms, sql_count, admitted)
+  clear_status
+
+  # ── Phase C: Tick.reap needs N admitted-and-expired rows ─────────
   truncate_all!
   seed_with_progress(
     "reap N=#{fmt_int(n)}",
-    job_class:          PlainBenchmarkJob,
+    job_class:          GatedBenchmarkJob,
     partitions:         n,
     jobs_per_partition: 1
   )
 
   status("reap N=#{fmt_int(n)}: marking expired…")
   past = 1.hour.ago
-  DispatchPolicy::StagedJob.where(policy_name: policy.name).update_all(
+  DispatchPolicy::StagedJob.where(policy_name: gated_policy.name).update_all(
     admitted_at:      past,
     lease_expires_at: past,
     active_job_id:    "bench",
@@ -180,34 +174,40 @@ SCALES.each do |n|
   expired = DispatchPolicy::StagedJob.expired_leases.count
   status("reap N=#{fmt_int(n)}: reaping…")
   wall_ms, sql_count, _ = measure { DispatchPolicy::Tick.reap }
+  results[:reap] << reap_row(expired, wall_ms, sql_count)
   clear_status
 
-  rows_per_s = wall_ms.zero? ? 0 : (expired * 1000.0 / wall_ms).round
-  reap_rows << [ fmt_int(expired), fmt_ms(wall_ms), fmt_int(sql_count), fmt_int(rows_per_s) ]
-end
-print_section("Tick.reap (all rows expired)")
-print_table([ "rows", "wall_ms", "sql", "rows/s" ], reap_rows)
-
-# 5. StagedJob.stage_many! bulk insert (seeding-cost baseline).
-stage_rows = []
-policy = TimeWeightedBenchmarkJob.resolved_dispatch_policy
-SCALES.each do |n|
+  # ── Phase D: stage_many (the measurement IS the seed) ────────────
   truncate_all!
-  status("stage_many! N=#{fmt_int(n)}: building job instances…")
-  jobs = Array.new(n) { |i| TimeWeightedBenchmarkJob.new("p#{i}") }
-  status("stage_many! N=#{fmt_int(n)}: inserting…")
+  status("stage_many N=#{fmt_int(n)}: building job instances…")
+  jobs = Array.new(n) { |i| GatedBenchmarkJob.new("p#{i}") }
+  status("stage_many N=#{fmt_int(n)}: inserting…")
   wall_ms, sql_count, inserted = measure do
-    DispatchPolicy::StagedJob.stage_many!(policy: policy, jobs: jobs)
+    DispatchPolicy::StagedJob.stage_many!(policy: gated_policy, jobs: jobs)
   end
+  results[:stage_many] << stage_row(inserted, wall_ms, sql_count)
   clear_status
-
-  rows_per_s = wall_ms.zero? ? 0 : (inserted * 1000.0 / wall_ms).round
-  stage_rows << [ fmt_int(inserted), fmt_ms(wall_ms), fmt_int(sql_count), fmt_int(rows_per_s) ]
 end
-print_section("StagedJob.stage_many! (bulk insert)")
-print_table([ "jobs", "wall_ms", "sql", "rows/s" ], stage_rows)
 
 truncate_all!
+
+# ─── Output ──────────────────────────────────────────────────────────
+
+print_section("fetch_time_weighted_batch")
+print_table([ "partitions", "pending", "wall_ms", "sql", "rows", "rows/s" ], results[:fetch_time_weighted])
+
+print_section("fetch_round_robin_batch")
+print_table([ "partitions", "pending", "wall_ms", "sql", "rows", "rows/s" ], results[:fetch_round_robin])
+
+print_section("Tick.run end-to-end (concurrency gate)")
+print_table([ "partitions", "pending", "wall_ms", "sql", "rows", "rows/s" ], results[:tick_run])
+
+print_section("Tick.reap (all rows expired)")
+print_table([ "rows", "wall_ms", "sql", "rows/s" ], results[:reap])
+
+print_section("StagedJob.stage_many! (bulk insert)")
+print_table([ "jobs", "wall_ms", "sql", "rows/s" ], results[:stage_many])
+
 puts ""
 puts "Done."
 puts ""
