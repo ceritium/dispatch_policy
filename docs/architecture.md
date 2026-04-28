@@ -121,3 +121,61 @@ the few that don't already have a fallback in our own code.
 Total effort estimate if it ever matters: ~1-2 days of code + a CI
 matrix for both adapters. Not architecturally hard; mostly schema and
 query plumbing. File an issue with a real use case to revive this.
+
+## Scale: what numbers can we support?
+
+Numbers from `bundle exec rake test:benchmark` on local PostgreSQL
+13.19 (single-node, no tuning, defaults). batch_size=500,
+jobs_per_partition=3. Useful as a rough orientation, NOT an SLA —
+remote PG, container limits, or noisy neighbours move these by
+multiples.
+
+| Operation                       |    100 |   1,000 |  10,000 | 100,000 |
+|---------------------------------|-------:|--------:|--------:|--------:|
+| `fetch_time_weighted_batch`     |   22ms |   107ms |   340ms | 1,089ms |
+| `fetch_round_robin_batch`       |   12ms |    95ms | 1,025ms |   785ms |
+| `Tick.run` end-to-end           |  328ms |   440ms |   423ms |   489ms |
+| `Tick.reap` (all rows expired)  |  2.8ms |    11ms |   182ms | 2,610ms |
+| `StagedJob.stage_many!`         |   15ms |   133ms | 1,316ms | 20,650ms |
+
+### What this says
+
+- **`Tick.run` is flat**, regardless of how many partitions are
+  pending. Capped by `batch_size`. Roughly 1,000-1,200 admissions/sec
+  steady-state across all scales tested.
+- **`Tick.reap` is bulk-batched**: two SQL statements regardless of
+  expired-row count (one UPDATE … RETURNING on staged_jobs, one
+  UPDATE … FROM (VALUES …) on counters). ~40,000-90,000 rows/sec.
+- **Fetch operations dominate the tick cost beyond ~10k partitions**.
+  Time-weighted scales sub-linearly thanks to the CTE+VALUES driver.
+  Plain round-robin sits at ~800-1,000ms in the 10k-100k range — the
+  CTE pattern gave us plan stability (no more 44x run-to-run variance
+  the SELECT DISTINCT version had), but the planner still flips
+  between strategies based on LIMIT-per-LATERAL value (open issue).
+- **`stage_many!` is just `INSERT … VALUES` throughput**: ~7,000
+  rows/sec on local PG. For sustained enqueue rates higher than that
+  you'd need `COPY` or batch enqueue from a streaming source.
+
+### Recommended scale tiers
+
+| Partitions | Status      | Notes                                                               |
+|-----------:|-------------|---------------------------------------------------------------------|
+|     ≤ 10k  | Comfortable | All ops sub-second. Default tick cadence (1s) leaves headroom.       |
+|  10k–100k  | Workable    | Round-robin / time-weighted fetch take 0.5-1s per tick. Bump `tick_sleep` to 2-5s, or the tick will spend most of its time fetching. Reap stays fast. |
+|    > 100k  | Investigate | Numbers extrapolate. Adding a covering index on `(policy_name, admitted_at, round_robin_key, priority, staged_at)` or capping partitions per tick will likely be necessary. |
+
+Beyond 100k partitions the gem hasn't been benchmarked. Operationally
+we have one data point: `pulso.run` runs in production with low
+thousands of partitions and the tick is consistently <100ms. If you
+operate at hundreds of thousands of partitions and try this gem, file
+an issue with your numbers — it'd be useful baseline.
+
+### Re-running the benchmark
+
+```sh
+SIMPLECOV_DISABLED=1 bundle exec rake test:benchmark             # up to 10k
+SIMPLECOV_DISABLED=1 MAX_PARTITIONS=100000 bundle exec rake test:benchmark
+```
+
+Output is column-aligned markdown to stdout; progress bars on stderr
+erase themselves so `… > report.md` captures only the report.
