@@ -95,6 +95,43 @@ module DispatchPolicy
       assert_equal 25, StagedJob.admitted.count
     end
 
+    test "time-weighted fetch issues a constant number of SELECTs regardless of partition count" do
+      # Architectural assertion: fetch_time_weighted_batch must be O(1)
+      # in SELECT round-trips, not O(partitions). A regression that
+      # reintroduces a per-partition loop will fire one SELECT per
+      # partition and trip this test.
+      DispatchPolicy.config.batch_size = 50
+
+      partition_count = 40
+      partition_count.times do |i|
+        2.times { TimeWeightedJob.perform_later("p#{i}") }
+      end
+
+      staged_selects = []
+      callback = ->(_, _, _, _, payload) {
+        sql = payload[:sql]
+        next if payload[:name] == "SCHEMA"
+        next unless sql.include?("dispatch_policy_staged_jobs")
+        # Match SELECTs that filter on admitted_at IS NULL — those are
+        # the batch-fetch queries we care about.
+        staged_selects << sql if /^\s*(WITH|SELECT)/i.match?(sql) && sql.include?("admitted_at IS NULL")
+      }
+
+      ActiveSupport::Notifications.subscribed(callback, "sql.active_record") do
+        Tick.run(policy_name: TimeWeightedJob.resolved_dispatch_policy.name)
+      end
+
+      # Expected SELECTs per Tick.run for time-weighted with N partitions:
+      #   1 — distinct round_robin_key pluck (active partitions)
+      #   1 — CTE+LATERAL batch fetch
+      #   0 or 1 — top-up (only if quanta sum < batch_size)
+      # Cap at 5 to leave headroom for incidental queries (e.g. consumed_ms
+      # lookup in PartitionObservation if it ever scans staged_jobs).
+      assert_operator staged_selects.size, :<=, 5,
+        "fetch must be O(1) SELECTs, not O(partitions=#{partition_count}). " \
+        "Got #{staged_selects.size}:\n#{staged_selects.join("\n")}"
+    end
+
     test "concurrency gate caps admissions per partition" do
       CappedJob.perform_later("X")
       CappedJob.perform_later("X")
