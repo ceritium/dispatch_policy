@@ -33,6 +33,37 @@ module DispatchPolicy
       assert_equal 0, count["A"]
     end
 
+    test "reap issues a constant number of SQL statements regardless of expired-row count" do
+      # Architectural assertion: Tick.reap must be O(1) in SQL
+      # round-trips, not O(expired). A regression that loops one
+      # update per row will fire ~2 statements per row and trip this.
+      policy_name = ReapJob.resolved_dispatch_policy.name
+
+      40.times { |i| ReapJob.perform_later("p#{i}") }
+      Tick.run(policy_name: policy_name)
+      StagedJob.admitted.update_all(lease_expires_at: 1.hour.ago)
+
+      reap_writes = []
+      callback = ->(_, _, _, _, payload) {
+        sql = payload[:sql]
+        next if payload[:name] == "SCHEMA"
+        next unless /\A\s*UPDATE/i.match?(sql)
+        next unless sql.include?("dispatch_policy_staged_jobs") ||
+                    sql.include?("dispatch_policy_partition_counts")
+        reap_writes << sql
+      }
+
+      ActiveSupport::Notifications.subscribed(callback, "sql.active_record") do
+        Tick.reap
+      end
+
+      # Expected: 1 UPDATE … RETURNING on staged_jobs + 1 UPDATE FROM
+      # (VALUES …) on partition_counts. Cap at 4 to leave headroom.
+      assert_operator reap_writes.size, :<=, 4,
+        "reap must batch its updates, got #{reap_writes.size} writes for 40 expired rows:\n" \
+        "#{reap_writes.join("\n")}"
+    end
+
     test "prune_orphan_gate_rows removes rows for unknown policies" do
       PartitionInflightCount.increment(
         policy_name: "ghost_policy", gate_name: "concurrency", partition_key: "x"

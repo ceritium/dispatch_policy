@@ -84,21 +84,63 @@ module DispatchPolicy
     # there is no longer a "stuck admitted but never reached the
     # adapter" case to recover from — the adapter's own retry semantics
     # cover crashed jobs, dispatch_policy only releases the counters.
+    #
+    # Implementation is bulk: one UPDATE … RETURNING completes every
+    # expired row and hands back their partitions, then a single
+    # UPDATE … FROM (VALUES …) decrements all the (policy, gate,
+    # partition_key) counters at once. This keeps reap O(1) in SQL
+    # round-trips regardless of how many leases expired.
     def self.reap
-      StagedJob.expired_leases.find_each do |staged|
-        (staged.partitions || {}).each do |gate_name, partition_key|
-          policy = lookup_policy(staged.policy_name)
-          gate   = policy&.gates&.find { |g| g.name == gate_name.to_sym }
+      now = Time.current
+
+      complete_sql = <<~SQL.squish
+        UPDATE #{StagedJob.quoted_table_name}
+           SET completed_at = ?,
+               lease_expires_at = NULL
+         WHERE completed_at IS NULL
+           AND lease_expires_at IS NOT NULL
+           AND lease_expires_at < ?
+        RETURNING policy_name, partitions
+      SQL
+
+      expired = StagedJob.find_by_sql([ complete_sql, now, now ])
+      return 0 if expired.empty?
+
+      # Aggregate per-(policy, gate, partition_key) decrements, filtered
+      # to gates that actually track in-flight (throttle/etc. do not).
+      deltas = Hash.new(0)
+      expired.each do |row|
+        policy = lookup_policy(row.policy_name)
+        next unless policy
+
+        (row.partitions || {}).each do |gate_name, partition_key|
+          gate = policy.gates.find { |g| g.name == gate_name.to_sym }
           next unless gate&.tracks_inflight?
 
-          PartitionInflightCount.decrement(
-            policy_name:   staged.policy_name,
-            gate_name:     gate_name.to_s,
-            partition_key: partition_key.to_s
-          )
+          deltas[[ row.policy_name, gate_name.to_s, partition_key.to_s ]] += 1
         end
-        staged.update!(lease_expires_at: nil, completed_at: Time.current)
       end
+
+      return expired.size if deltas.empty?
+
+      values_clause = ([ "(?, ?, ?, ?::int)" ] * deltas.size).join(", ")
+      values_args   = deltas.flat_map { |(policy_name, gate, key), delta| [ policy_name, gate, key, delta ] }
+
+      decrement_sql = <<~SQL.squish
+        UPDATE #{PartitionInflightCount.quoted_table_name} AS c
+           SET in_flight  = GREATEST(c.in_flight - d.delta, 0),
+               updated_at = ?
+          FROM (VALUES #{values_clause}) AS d(policy_name, gate_name, partition_key, delta)
+         WHERE c.policy_name   = d.policy_name
+           AND c.gate_name     = d.gate_name
+           AND c.partition_key = d.partition_key
+      SQL
+
+      PartitionInflightCount.connection.exec_update(
+        PartitionInflightCount.send(:sanitize_sql_array, [ decrement_sql, now, *values_args ])
+      )
+
+      expired.size
     end
 
     def self.release(policy_name:, partitions:)
