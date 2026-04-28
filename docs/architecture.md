@@ -126,32 +126,31 @@ query plumbing. File an issue with a real use case to revive this.
 
 Numbers from `bundle exec rake test:benchmark` on local PostgreSQL
 13.19 (single-node, no tuning, defaults). batch_size=500,
-jobs_per_partition=3. Useful as a rough orientation, NOT an SLA —
+jobs_per_partition=3, table stats kept fresh with `ANALYZE` between
+seed and measurement. Useful as a rough orientation, NOT an SLA —
 remote PG, container limits, or noisy neighbours move these by
 multiples.
 
 | Operation                       |    100 |   1,000 |  10,000 | 100,000 |
 |---------------------------------|-------:|--------:|--------:|--------:|
-| `fetch_time_weighted_batch`     |   22ms |   107ms |   340ms | 1,089ms |
-| `fetch_round_robin_batch`       |   12ms |    95ms | 1,025ms |   785ms |
-| `Tick.run` end-to-end           |  328ms |   440ms |   423ms |   489ms |
-| `Tick.reap` (all rows expired)  |  2.8ms |    11ms |   182ms | 2,610ms |
-| `StagedJob.stage_many!`         |   15ms |   133ms | 1,316ms | 20,650ms |
+| `fetch_time_weighted_batch`     |   21ms |    24ms |   135ms | 1,200ms |
+| `fetch_round_robin_batch`       |   14ms |    21ms |    80ms |   773ms |
+| `Tick.run` end-to-end           |  380ms |   472ms |   479ms |   442ms |
+| `Tick.reap` (all rows expired)  |  3.6ms |    15ms |   205ms | 2,481ms |
+| `StagedJob.stage_many!`         |   16ms |   130ms | 1,419ms | 17,456ms |
 
 ### What this says
 
 - **`Tick.run` is flat**, regardless of how many partitions are
-  pending. Capped by `batch_size`. Roughly 1,000-1,200 admissions/sec
+  pending. Capped by `batch_size`. Roughly 1,000-1,150 admissions/sec
   steady-state across all scales tested.
 - **`Tick.reap` is bulk-batched**: two SQL statements regardless of
   expired-row count (one UPDATE … RETURNING on staged_jobs, one
-  UPDATE … FROM (VALUES …) on counters). ~40,000-90,000 rows/sec.
-- **Fetch operations dominate the tick cost beyond ~10k partitions**.
-  Time-weighted scales sub-linearly thanks to the CTE+VALUES driver.
-  Plain round-robin sits at ~800-1,000ms in the 10k-100k range — the
-  CTE pattern gave us plan stability (no more 44x run-to-run variance
-  the SELECT DISTINCT version had), but the planner still flips
-  between strategies based on LIMIT-per-LATERAL value (open issue).
+  UPDATE … FROM (VALUES …) on counters). ~30,000-70,000 rows/sec.
+- **Fetch operations are the dominant per-tick cost at high partition
+  counts**, but stay sub-second below 100k. Both use a CTE+VALUES
+  driver so plans are deterministic and the SQL count is constant
+  (2-3 queries) regardless of partition count.
 - **`stage_many!` is just `INSERT … VALUES` throughput**: ~7,000
   rows/sec on local PG. For sustained enqueue rates higher than that
   you'd need `COPY` or batch enqueue from a streaming source.
@@ -160,9 +159,9 @@ multiples.
 
 | Partitions | Status      | Notes                                                               |
 |-----------:|-------------|---------------------------------------------------------------------|
-|     ≤ 10k  | Comfortable | All ops sub-second. Default tick cadence (1s) leaves headroom.       |
-|  10k–100k  | Workable    | Round-robin / time-weighted fetch take 0.5-1s per tick. Bump `tick_sleep` to 2-5s, or the tick will spend most of its time fetching. Reap stays fast. |
-|    > 100k  | Investigate | Numbers extrapolate. Adding a covering index on `(policy_name, admitted_at, round_robin_key, priority, staged_at)` or capping partitions per tick will likely be necessary. |
+|     ≤ 10k  | Comfortable | All ops well under 200ms. Default tick cadence (1s) is plenty.       |
+|  10k–100k  | Workable    | Fetch grows to ~0.8-1.2s per tick at the upper end. Bump `tick_sleep` to 2-3s so the tick isn't back-to-back. Reap and Tick.run stay fast. |
+|    > 100k  | Investigate | Numbers haven't been validated. Cap partitions per tick or add a more selective index if your query patterns differ.                       |
 
 Beyond 100k partitions the gem hasn't been benchmarked. Operationally
 we have one data point: `pulso.run` runs in production with low
@@ -170,12 +169,43 @@ thousands of partitions and the tick is consistently <100ms. If you
 operate at hundreds of thousands of partitions and try this gem, file
 an issue with your numbers — it'd be useful baseline.
 
+### Operational note: keep table stats fresh
+
+The fetch path picks between two indexes
+(`idx_dp_staged_dispatch_order` on `(policy_name, priority,
+staged_at)` and `idx_dp_staged_round_robin` on `(policy_name,
+round_robin_key, priority, staged_at)`) based on Postgres' planner
+estimates. With stale stats — typically right after a burst of bulk
+inserts that outpaces autovacuum's analyze threshold — PG can pick
+the worse index, and fetch wall-time inflates 10-50× compared to the
+numbers above.
+
+For high-throughput staging tables, lower the autovacuum analyze
+threshold so stats keep up with the insert rate:
+
+```sql
+ALTER TABLE dispatch_policy_staged_jobs SET (
+  autovacuum_analyze_scale_factor = 0.01,  -- 1% of the table changed
+  autovacuum_analyze_threshold    = 100    -- min 100 rows changed
+);
+```
+
+If you're hitting bursts so large that even tuned autovacuum lags,
+schedule an explicit `ANALYZE dispatch_policy_staged_jobs` from cron
+or a periodic job (it's cheap — ~100ms on 30k rows, ~500ms on 1M).
+Symptom of staleness: a tick that suddenly takes 10× longer than
+usual without a corresponding load change.
+
 ### Re-running the benchmark
 
 ```sh
 SIMPLECOV_DISABLED=1 bundle exec rake test:benchmark             # up to 10k
 SIMPLECOV_DISABLED=1 MAX_PARTITIONS=100000 bundle exec rake test:benchmark
+SIMPLECOV_DISABLED=1 ANALYZE_AFTER_SEED=0 bundle exec rake test:benchmark  # see worst-case stale-stats behaviour
 ```
 
 Output is column-aligned markdown to stdout; progress bars on stderr
-erase themselves so `… > report.md` captures only the report.
+erase themselves so `… > report.md` captures only the report. To dig
+into where time is spent inside the fetch, run
+`bundle exec rake test:profile` — it captures every SQL the fetch
+path fires and prints `EXPLAIN (ANALYZE, BUFFERS)` for each.

@@ -109,6 +109,18 @@ results = {
 fetch_policy = FetchBenchmarkJob.resolved_dispatch_policy
 gated_policy = GatedBenchmarkJob.resolved_dispatch_policy
 
+# Set to "0" to skip ANALYZE between seed and measurement. Default ON
+# because insert_all-based seeding bypasses autovacuum and leaves stats
+# stale, which flips PG into a worse plan and inflates fetch wall-time
+# by 10-50x — not representative of steady-state production behaviour.
+ANALYZE_AFTER_SEED = ENV["ANALYZE_AFTER_SEED"] != "0"
+
+def analyze_staged!(label, n)
+  return unless ANALYZE_AFTER_SEED
+  status("#{label} N=#{fmt_int(n)}: ANALYZE staged_jobs…")
+  ActiveRecord::Base.connection.execute("ANALYZE dispatch_policy_staged_jobs")
+end
+
 SCALES.each do |n|
   # ── Phase A: shared seed for both fetch_* measurements ───────────
   truncate_all!
@@ -118,6 +130,7 @@ SCALES.each do |n|
     partitions:         n,
     jobs_per_partition: JOBS_PER_PARTITION
   )
+  analyze_staged!("fetch", n)
 
   status("fetch_time_weighted N=#{fmt_int(n)}: measuring…")
   wall_ms, sql_count, result = measure { DispatchPolicy::Tick.fetch_time_weighted_batch(fetch_policy) }
@@ -139,6 +152,7 @@ SCALES.each do |n|
     partitions:         n,
     jobs_per_partition: JOBS_PER_PARTITION
   )
+  analyze_staged!("Tick.run", n)
 
   status("Tick.run N=#{fmt_int(n)}: measuring…")
   wall_ms, sql_count, admitted = measure { DispatchPolicy::Tick.run(policy_name: gated_policy.name) }
@@ -153,6 +167,7 @@ SCALES.each do |n|
     partitions:         n,
     jobs_per_partition: 1
   )
+  analyze_staged!("reap", n)
 
   status("reap N=#{fmt_int(n)}: marking expired…")
   past = 1.hour.ago
