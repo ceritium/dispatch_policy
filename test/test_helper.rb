@@ -2,13 +2,15 @@
 
 ENV["RAILS_ENV"] = "test"
 
-require "simplecov"
-SimpleCov.start do
-  add_filter "/test/"
-  add_filter "/db/migrate/"
-  add_filter "/lib/dispatch_policy/version.rb"
-  enable_coverage :branch
-  track_files "{lib,app}/**/*.rb"
+unless ENV["SIMPLECOV_DISABLED"] == "1"
+  require "simplecov"
+  SimpleCov.start do
+    add_filter "/test/"
+    add_filter "/db/migrate/"
+    add_filter "/lib/dispatch_policy/version.rb"
+    enable_coverage :branch
+    track_files "{lib,app}/**/*.rb"
+  end
 end
 
 require_relative "dummy/config/environment"
