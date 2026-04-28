@@ -95,6 +95,35 @@ module DispatchPolicy
       assert_equal 25, StagedJob.admitted.count
     end
 
+    test "round-robin fetch issues a constant number of SELECTs regardless of partition count" do
+      # Same architectural assertion as the time-weighted test below.
+      # The pre-VALUES-driven version did a SELECT DISTINCT that the
+      # planner could realise with multiple plans; the assertion is
+      # the same upper bound either way.
+      DispatchPolicy.config.batch_size = 50
+
+      partition_count = 40
+      partition_count.times do |i|
+        2.times { FairJob.perform_later("p#{i}") }
+      end
+
+      staged_selects = []
+      callback = ->(_, _, _, _, payload) {
+        sql = payload[:sql]
+        next if payload[:name] == "SCHEMA"
+        next unless sql.include?("dispatch_policy_staged_jobs")
+        staged_selects << sql if /^\s*(WITH|SELECT)/i.match?(sql) && sql.include?("admitted_at IS NULL")
+      }
+
+      ActiveSupport::Notifications.subscribed(callback, "sql.active_record") do
+        Tick.run(policy_name: FairJob.resolved_dispatch_policy.name)
+      end
+
+      assert_operator staged_selects.size, :<=, 5,
+        "fetch must be O(1) SELECTs, not O(partitions=#{partition_count}). " \
+        "Got #{staged_selects.size}:\n#{staged_selects.join("\n")}"
+    end
+
     test "time-weighted fetch issues a constant number of SELECTs regardless of partition count" do
       # Architectural assertion: fetch_time_weighted_batch must be O(1)
       # in SELECT round-trips, not O(partitions). A regression that

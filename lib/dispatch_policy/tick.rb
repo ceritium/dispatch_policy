@@ -193,34 +193,46 @@ module DispatchPolicy
       batch_size = DispatchPolicy.config.batch_size
       now        = Time.current
 
+      partitions = StagedJob.pending
+        .where(policy_name: policy.name)
+        .where("not_before_at IS NULL OR not_before_at <= ?", now)
+        .where.not(round_robin_key: nil)
+        .distinct
+        .pluck(:round_robin_key)
+
+      return fetch_plain_batch(policy) if partitions.empty?
+
+      # Drive the LATERAL from a VALUES list of (round_robin_key,
+      # quantum) pairs instead of a SELECT DISTINCT subquery. The
+      # planner sees a known-size driver and produces a deterministic
+      # plan; the SELECT DISTINCT version flipped between sort+unique
+      # and hash-agg based on autovacuum'd stats, with 40x runtime
+      # variance across runs at 10k partitions.
+      values_clause = ([ "(?, ?::int)" ] * partitions.size).join(", ")
+      values_args   = partitions.flat_map { |key| [ key, quantum ] }
+
       sql = <<~SQL.squish
+        WITH plan(round_robin_key, quantum) AS (VALUES #{values_clause})
         SELECT rows.*
-        FROM (
-          SELECT DISTINCT round_robin_key
-          FROM dispatch_policy_staged_jobs
-          WHERE policy_name = ?
-            AND admitted_at IS NULL
-            AND round_robin_key IS NOT NULL
-            AND (not_before_at IS NULL OR not_before_at <= ?)
-        ) AS keys
+        FROM plan
         CROSS JOIN LATERAL (
           SELECT *
           FROM dispatch_policy_staged_jobs
           WHERE policy_name = ?
             AND admitted_at IS NULL
-            AND round_robin_key = keys.round_robin_key
+            AND round_robin_key = plan.round_robin_key
             AND (not_before_at IS NULL OR not_before_at <= ?)
           ORDER BY priority, staged_at
-          LIMIT ?
+          LIMIT plan.quantum
           FOR UPDATE SKIP LOCKED
         ) AS rows
         LIMIT ?
       SQL
 
-      batch = StagedJob.find_by_sql([ sql, policy.name, now, policy.name, now, quantum, batch_size ])
+      batch = StagedJob.find_by_sql([ sql, *values_args, policy.name, now, batch_size ])
 
       remaining = batch_size - batch.size
-      return batch if remaining <= 0
+      return batch if remaining <= 0 || batch.empty?
 
       top_up = StagedJob.pending
         .where(policy_name: policy.name)
