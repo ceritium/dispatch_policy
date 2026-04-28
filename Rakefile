@@ -19,6 +19,12 @@ namespace :test do
     $LOAD_PATH.unshift("test", "lib")
     load File.expand_path("test/benchmark/run_benchmarks.rb", __dir__)
   end
+
+  desc "EXPLAIN ANALYZE every SQL the fetch path fires, at chosen partition scales"
+  task :profile do
+    $LOAD_PATH.unshift("test", "lib")
+    load File.expand_path("test/benchmark/profile_fetch.rb", __dir__)
+  end
 end
 
 task default: :test

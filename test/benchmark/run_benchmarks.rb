@@ -74,14 +74,6 @@ puts "  postgres:           #{pg_version}"
 
 # ─── Helpers ─────────────────────────────────────────────────────────
 
-def seed_with_progress(label, **kwargs)
-  total = kwargs[:partitions] * kwargs[:jobs_per_partition]
-  bar = DispatchPolicy::BenchmarkHelpers::ProgressBar.new("#{label}: seeding", total)
-  seeded = seed_staged!(**kwargs) { |so_far| bar.update(so_far) }
-  bar.finish!
-  seeded
-end
-
 def fetch_row(n, seeded, wall_ms, sql_count, fetched)
   rows_per_s = wall_ms.zero? ? 0 : (fetched * 1000.0 / wall_ms).round
   [

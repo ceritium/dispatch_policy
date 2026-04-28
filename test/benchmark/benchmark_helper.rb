@@ -33,6 +33,16 @@ module DispatchPolicy
       adapter.enqueued_jobs.clear if adapter.respond_to?(:enqueued_jobs)
     end
 
+    # Convenience wrapper: seed_staged! with a progress bar drawn on
+    # stderr that erases itself when seeding finishes.
+    def seed_with_progress(label, **kwargs)
+      total = kwargs[:partitions] * kwargs[:jobs_per_partition]
+      bar = ProgressBar.new("#{label}: seeding", total)
+      seeded = seed_staged!(**kwargs) { |so_far| bar.update(so_far) }
+      bar.finish!
+      seeded
+    end
+
     # Bulk-stage `partitions × jobs_per_partition` rows for a given job
     # class. Uses the same code path as production (StagedJob.stage_many!)
     # but in chunks so we don't hold every ActiveJob instance in memory
