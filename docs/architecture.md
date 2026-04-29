@@ -133,10 +133,10 @@ multiples.
 
 | Operation                       |    100 |   1,000 |  10,000 | 100,000 |
 |---------------------------------|-------:|--------:|--------:|--------:|
-| `fetch_time_weighted_batch`     |   25ms |    26ms |   173ms | 1,187ms |
-| `fetch_round_robin_batch`       |   14ms |    19ms |    76ms |   729ms |
-| `Tick.run` end-to-end           |   51ms |    53ms |    65ms |    64ms |
-| `Tick.reap` (all rows expired)  |  4.8ms |    14ms |   183ms | 2,395ms |
+| `fetch_time_weighted_batch`     |   19ms |    16ms |    16ms |    71ms |
+| `fetch_round_robin_batch`       |   11ms |    12ms |    13ms |    27ms |
+| `Tick.run` end-to-end           |   37ms |    33ms |    35ms |    37ms |
+| `Tick.reap` (all rows expired)  |  1.9ms |    14ms |   183ms | 2,395ms |
 | `StagedJob.stage_many!`         |   15ms |   175ms | 1,488ms | 18,234ms |
 
 ### What this says
@@ -201,6 +201,70 @@ schedule an explicit `ANALYZE dispatch_policy_staged_jobs` from cron
 or a periodic job (it's cheap — ~100ms on 30k rows, ~500ms on 1M).
 Symptom of staleness: a tick that suddenly takes 10× longer than
 usual without a corresponding load change.
+
+## Observability
+
+Two complementary surfaces:
+
+### `ActiveSupport::Notifications` events
+
+Subscribe from anywhere — typically a Rails initializer that forwards
+to your metrics sink (StatsD, Prometheus, Datadog, OpenTelemetry).
+
+| Event                    | Payload keys                                                        |
+|--------------------------|---------------------------------------------------------------------|
+| `tick.dispatch_policy`   | `policy_name`, `admitted`, `partitions`, `declined` (true on rollback) |
+| `reap.dispatch_policy`   | `reaped` (count of expired leases swept)                             |
+
+`ActiveSupport::Notifications.instrument` automatically attaches
+duration to each event, so dashboards can graph p50/p95/p99 of tick
+wall time without extra work.
+
+```ruby
+# config/initializers/dispatch_policy_metrics.rb
+ActiveSupport::Notifications.subscribe("tick.dispatch_policy") do |*, payload|
+  StatsD.timing("dispatch_policy.tick_ms", payload[:duration])
+  StatsD.gauge("dispatch_policy.admitted", payload[:admitted])
+  StatsD.gauge("dispatch_policy.partitions_seen", payload[:partitions])
+end
+```
+
+### `DispatchPolicy::Stats` snapshot
+
+For health endpoints, console inspection, or scrape-style scrapers:
+
+```ruby
+DispatchPolicy::Stats.policy_summary("send_webhook_job")
+# => {
+#   policy_name: "send_webhook_job",
+#   pending: 1234,
+#   admitted: 12,
+#   completed_24h: 88_213,
+#   active_partitions: 540,
+#   drained_partitions: 19_460,
+#   oldest_pending_age_seconds: 0.83,
+#   stale_partitions_60s: 3,
+#   stale_partitions_300s: 0
+# }
+
+DispatchPolicy::Stats.summary  # array of one Hash per registered policy
+
+DispatchPolicy::Stats.health   # :ok | :starvation | :backlog_aging | :inflight_drift
+```
+
+`stale_partitions_Ns` counts active partitions whose `last_admitted_at`
+is older than N seconds. Spikes here indicate the round-robin cursor
+is falling behind — typical knob to tune is `quantum` (lower = faster
+rotation) or shard the policy across multiple TickLoops.
+
+`oldest_pending_age_seconds` is the simplest single-number SLO. If
+this exceeds your tolerance (e.g. monitor checks need < 60s freshness),
+you've outrun the current capacity.
+
+`Stats.health` returns a coarse signal suitable for `/up`-style health
+probes. `:starvation` fires when any active partition has gone longer
+than `lease_duration × 3` without admission; tune
+`stale_threshold_seconds:` if your SLA is tighter.
 
 ### Re-running the benchmark
 

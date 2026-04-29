@@ -21,52 +21,65 @@ module DispatchPolicy
     def self.run(policy_name: nil)
       return 0 unless DispatchPolicy.enabled?
 
-      admitted = 0
+      ActiveSupport::Notifications.instrument(
+        "tick.dispatch_policy",
+        policy_name: policy_name
+      ) do |payload|
+        admitted = 0
+        partitions_seen = 0
 
-      begin
-        StagedJob.transaction do
-          active_policies(policy_name).each do |pname|
-            policy = lookup_policy(pname)
-            next unless policy
+        begin
+          StagedJob.transaction do
+            active_policies(policy_name).each do |pname|
+              policy = lookup_policy(pname)
+              next unless policy
 
-            batch = fetch_batch(policy)
-            next if batch.empty?
+              batch = fetch_batch(policy)
+              next if batch.empty?
 
-            pairs = run_policy(policy, batch)
-            jobs  = pairs.map { |_staged, job| job }
+              partitions_seen += batch.map(&:round_robin_key).compact.uniq.size
 
-            # Bulk hand-off to the adapter in a single round-trip.
-            # GoodJob and Solid Queue override enqueue_all to do one
-            # INSERT with N rows; adapters without an override fall
-            # back to a per-job enqueue loop. Routes through
-            # ActiveJob.perform_all_later so the dispatch by queue_
-            # adapter is consistent with the rest of the host app.
-            # ActiveJobPerformAllLaterPatch sees _dispatch_admitted_at
-            # is already set on these jobs and skips the staging
-            # branch, going straight to the adapter.
-            ActiveJob.perform_all_later(jobs)
+              pairs = run_policy(policy, batch)
+              jobs  = pairs.map { |_staged, job| job }
 
-            # ActiveJob adapters can report failure by setting
-            # enqueue_error and leaving successfully_enqueued? false
-            # instead of raising. Treat that as a hard failure and
-            # roll back the entire transaction so admission, counters
-            # and the adapter rows all unwind together.
-            jobs.each do |job|
-              next if job.successfully_enqueued?
-              raise EnqueueDeclined,
-                "adapter declined active_job_id=#{job.job_id}: " \
-                "#{job.enqueue_error&.class}: #{job.enqueue_error&.message}"
+              # Bulk hand-off to the adapter in a single round-trip.
+              # GoodJob and Solid Queue override enqueue_all to do one
+              # INSERT with N rows; adapters without an override fall
+              # back to a per-job enqueue loop. Routes through
+              # ActiveJob.perform_all_later so the dispatch by queue_
+              # adapter is consistent with the rest of the host app.
+              # ActiveJobPerformAllLaterPatch sees _dispatch_admitted_at
+              # is already set on these jobs and skips the staging
+              # branch, going straight to the adapter.
+              ActiveJob.perform_all_later(jobs)
+
+              # ActiveJob adapters can report failure by setting
+              # enqueue_error and leaving successfully_enqueued? false
+              # instead of raising. Treat that as a hard failure and
+              # roll back the entire transaction so admission, counters
+              # and the adapter rows all unwind together.
+              jobs.each do |job|
+                next if job.successfully_enqueued?
+                raise EnqueueDeclined,
+                  "adapter declined active_job_id=#{job.job_id}: " \
+                  "#{job.enqueue_error&.class}: #{job.enqueue_error&.message}"
+              end
+
+              admitted += jobs.size
             end
-
-            admitted += jobs.size
           end
+        rescue EnqueueDeclined => e
+          Rails.logger&.warn("[DispatchPolicy] #{e.message} — transaction rolled back")
+          payload[:declined] = true
+          payload[:admitted] = 0
+          payload[:partitions] = partitions_seen
+          return 0
         end
-      rescue EnqueueDeclined => e
-        Rails.logger&.warn("[DispatchPolicy] #{e.message} — transaction rolled back")
-        return 0
-      end
 
-      admitted
+        payload[:admitted] = admitted
+        payload[:partitions] = partitions_seen
+        admitted
+      end
     end
 
     # Default batch size for the prune deletes. Keeps any single
@@ -147,57 +160,66 @@ module DispatchPolicy
     # partition_key) counters at once. This keeps reap O(1) in SQL
     # round-trips regardless of how many leases expired.
     def self.reap
-      now = Time.current
+      ActiveSupport::Notifications.instrument("reap.dispatch_policy") do |payload|
+        now = Time.current
 
-      complete_sql = <<~SQL.squish
-        UPDATE #{StagedJob.quoted_table_name}
-           SET completed_at = ?,
-               lease_expires_at = NULL
-         WHERE completed_at IS NULL
-           AND lease_expires_at IS NOT NULL
-           AND lease_expires_at < ?
-        RETURNING policy_name, partitions
-      SQL
+        complete_sql = <<~SQL.squish
+          UPDATE #{StagedJob.quoted_table_name}
+             SET completed_at = ?,
+                 lease_expires_at = NULL
+           WHERE completed_at IS NULL
+             AND lease_expires_at IS NOT NULL
+             AND lease_expires_at < ?
+          RETURNING policy_name, partitions
+        SQL
 
-      expired = StagedJob.find_by_sql([ complete_sql, now, now ])
-      return 0 if expired.empty?
-
-      # Aggregate per-(policy, gate, partition_key) decrements, filtered
-      # to gates that actually track in-flight (throttle/etc. do not).
-      deltas = Hash.new(0)
-      expired.each do |row|
-        policy = lookup_policy(row.policy_name)
-        next unless policy
-
-        (row.partitions || {}).each do |gate_name, partition_key|
-          gate = policy.gates.find { |g| g.name == gate_name.to_sym }
-          next unless gate&.tracks_inflight?
-
-          deltas[[ row.policy_name, gate_name.to_s, partition_key.to_s ]] += 1
+        expired = StagedJob.find_by_sql([ complete_sql, now, now ])
+        if expired.empty?
+          payload[:reaped] = 0
+          next 0
         end
+
+        # Aggregate per-(policy, gate, partition_key) decrements, filtered
+        # to gates that actually track in-flight (throttle/etc. do not).
+        deltas = Hash.new(0)
+        expired.each do |row|
+          policy = lookup_policy(row.policy_name)
+          next unless policy
+
+          (row.partitions || {}).each do |gate_name, partition_key|
+            gate = policy.gates.find { |g| g.name == gate_name.to_sym }
+            next unless gate&.tracks_inflight?
+
+            deltas[[ row.policy_name, gate_name.to_s, partition_key.to_s ]] += 1
+          end
+        end
+
+        if deltas.empty?
+          payload[:reaped] = expired.size
+          next expired.size
+        end
+
+        values_clause = ([ "(?, ?, ?, ?::int)" ] * deltas.size).join(", ")
+        values_args   = deltas.flat_map { |(policy_name, gate, key), delta| [ policy_name, gate, key, delta ] }
+
+        decrement_sql = <<~SQL.squish
+          UPDATE #{PartitionInflightCount.quoted_table_name} AS c
+             SET in_flight  = GREATEST(c.in_flight - d.delta, 0),
+                 updated_at = ?
+            FROM (VALUES #{values_clause}) AS d(policy_name, gate_name, partition_key, delta)
+           WHERE c.policy_name   = d.policy_name
+             AND c.gate_name     = d.gate_name
+             AND c.partition_key = d.partition_key
+        SQL
+
+        PartitionInflightCount.connection.exec_update(
+          PartitionInflightCount.send(:sanitize_sql_array, [ decrement_sql, now, *values_args ])
+        )
+        PartitionInflightCount.connection.clear_query_cache
+
+        payload[:reaped] = expired.size
+        expired.size
       end
-
-      return expired.size if deltas.empty?
-
-      values_clause = ([ "(?, ?, ?, ?::int)" ] * deltas.size).join(", ")
-      values_args   = deltas.flat_map { |(policy_name, gate, key), delta| [ policy_name, gate, key, delta ] }
-
-      decrement_sql = <<~SQL.squish
-        UPDATE #{PartitionInflightCount.quoted_table_name} AS c
-           SET in_flight  = GREATEST(c.in_flight - d.delta, 0),
-               updated_at = ?
-          FROM (VALUES #{values_clause}) AS d(policy_name, gate_name, partition_key, delta)
-         WHERE c.policy_name   = d.policy_name
-           AND c.gate_name     = d.gate_name
-           AND c.partition_key = d.partition_key
-      SQL
-
-      PartitionInflightCount.connection.exec_update(
-        PartitionInflightCount.send(:sanitize_sql_array, [ decrement_sql, now, *values_args ])
-      )
-      PartitionInflightCount.connection.clear_query_cache
-
-      expired.size
     end
 
     def self.release(policy_name:, partitions:)
