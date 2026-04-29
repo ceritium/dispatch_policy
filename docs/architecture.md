@@ -266,6 +266,72 @@ probes. `:starvation` fires when any active partition has gone longer
 than `lease_duration × 3` without admission; tune
 `stale_threshold_seconds:` if your SLA is tighter.
 
+### Tuning playbook: from metric to knob
+
+Each row maps a symptom you'd notice on a dashboard to the Stats
+field that confirms it and the config knobs that address it. Knobs
+are listed in order of "try first" → "last resort".
+
+| Symptom                                 | Confirming field(s)                                           | Knobs to try                                                                 |
+|-----------------------------------------|---------------------------------------------------------------|------------------------------------------------------------------------------|
+| Backlog growing, jobs taking too long   | `oldest_pending_age_seconds` rising; `pending` rising         | `batch_size` ↑ → admit more per tick. `tick_sleep_busy` ↓ → tick faster. Then add a parallel TickLoop scoped to a different policy/queue. |
+| Specific tenants seem starved           | `stale_partitions_60s` > 0; same tenant id consistently       | `round_robin_quantum` ↓ (toward 1) → more partitions per tick. Verify policy is round-robin (`round_robin_by`) — plain policies don't rotate. |
+| Tick wall time spiking                  | `tick.dispatch_policy` p95 of `duration`                      | `round_robin_max_partitions_per_tick` ↓ → bound the LATERAL plan. Drop to e.g. `batch_size / 4`. Check stats freshness (`ANALYZE` cadence) — stale stats can flip the planner to a 10× slower path. |
+| Adapter rejecting writes                | `tick.dispatch_policy` payload `declined: true`               | Inspect adapter health (GoodJob `good_jobs` table writable? Solid Queue `:queue` connection healthy?). The Tick TX rolls back, so no data loss — just retry next tick. If chronic, your adapter DB is the bottleneck. |
+| Workers crashing mid-perform            | `reap.dispatch_policy` `reaped` count climbing                | Investigate worker logs. `lease_duration` should be just above your worst perform — too short forces premature reap, too long delays counter recovery. Default 2 min suits most. |
+| Counters drifting high (admit blocked)  | `admitted` plateauing while `pending` rises                   | Run `Tick.reap` manually if not already on a TickLoop schedule. Lower `lease_duration` if leases routinely outlive perform. |
+| `partition_states` table bloating       | many `drained_partitions` per `active_partitions`             | `partition_drained_purge_threshold` ↓ (e.g. 0.3) → trigger ratio purge sooner. Or shorten `partition_idle_ttl`. |
+| Single tick hot-loops the same tenant   | `partitions` in `tick` event ≪ `batch_size`                   | A burst tenant: top-up was the old culprit; current refill_round_robin stays inside the cap'd LRU subset. Verify by sampling `last_admitted_at` distribution per partition — uniform-ish = healthy. |
+| `:starvation` health alert              | `Stats.health == :starvation`                                 | Check `stale_partitions_300s` for the count. Same fix as starvation row above (lower quantum, shard). Adjust `stale_threshold_seconds` if your SLA is < `lease_duration × 3`. |
+| `:backlog_aging` health alert           | `Stats.health == :backlog_aging`                              | At least one pending row > 5min old. `batch_size` ↑ or scale workers; if a single policy dominates, shard it into its own TickLoop. |
+
+### Single-number SLOs
+
+- **Latency SLO**: `oldest_pending_age_seconds`. Alert above your
+  freshness budget (e.g. 60s for monitor checks, 5s for webhooks).
+- **Fairness SLO**: `stale_partitions_60s` (or 300s). Should hover
+  near 0; > 0 means at least one tenant waited longer than the
+  threshold for its turn.
+- **Throughput**: `tick.dispatch_policy` `admitted` × tick rate
+  (visible from event timestamps). Multiply by `batch_size /
+  duration` for theoretical max.
+- **Capacity**: `active_partitions / config.batch_size`. If > 1,
+  fairness is rotational (some tenants wait); if < 1, you have
+  headroom.
+
+### Worked example: tuning for monitor checks
+
+Setup: 50,000 monitors, each enqueues 1 check/min. Target latency
+< 60s freshness for any monitor.
+
+Initial config (defaults): `batch_size=500, quantum=50, busy_sleep=0.05s`.
+
+After deploy, dashboard shows:
+- `oldest_pending_age_seconds`: 4 minutes (FAIL — over budget).
+- `stale_partitions_60s`: 12,000 (most monitors not seeing rotation).
+- `tick.dispatch_policy.duration` p95: 80ms.
+- `pending`: 1,200, growing slowly.
+
+Diagnosis: rotation is the bottleneck. With `batch_size/quantum = 10`
+partitions per tick, round-trip on 50k monitors takes ~5,000 ticks =
+5,000 × 80ms ≈ 7 minutes. Way over the 60s target.
+
+Tuning sequence:
+
+1. Drop `quantum` to 1: `partitions/tick = 500`, round-trip = 100
+   ticks ≈ 8s. Re-measure: `oldest_pending_age_seconds` should fall
+   under 60s.
+2. If `tick.duration` rises (more partitions in pluck means more
+   partition_states writes): set
+   `round_robin_max_partitions_per_tick = 500` to keep the cap tight
+   to batch_size.
+3. If still tight, add `tick_sleep_busy = 0.01`: 4× tick rate when
+   busy. Round-trip drops to 2s. Watch CPU on the worker.
+4. If hardware-bound at this point, shard the cron: instead of one
+   `DispatchTickLoopJob`, run 4 with disjoint policy_name args.
+
+Each step is reversible from a config initializer, no migration.
+
 ### Re-running the benchmark
 
 ```sh
