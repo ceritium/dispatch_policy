@@ -7,8 +7,13 @@ class AddPendingCountToPartitionStates < ActiveRecord::Migration[7.1]
     # mark_admitted_many!. Lets pluck_active_partitions skip the
     # O(N) DISTINCT scan over staged_jobs and read directly from
     # partition_states with an index seek.
+    #
+    # Both the column and the partial index are guarded with
+    # `if_not_exists: true` so this migration is safe to apply on a
+    # database that loaded schema.rb (which already contains both
+    # objects) before the migration list ran.
     add_column :dispatch_policy_partition_states, :pending_count,
-      :integer, null: false, default: 0
+      :integer, null: false, default: 0, if_not_exists: true
 
     # Partial index: only partitions with pending rows. ORDER BY
     # last_admitted_at ASC NULLS FIRST + LIMIT cap becomes a
@@ -17,7 +22,8 @@ class AddPendingCountToPartitionStates < ActiveRecord::Migration[7.1]
     add_index :dispatch_policy_partition_states,
       %i[policy_name last_admitted_at],
       where: "pending_count > 0",
-      name: "idx_dp_partition_states_active_lru"
+      name: "idx_dp_partition_states_active_lru",
+      if_not_exists: true
 
     # Backfill: existing pending staged_jobs with a round_robin_key
     # need to be reflected in partition_states.pending_count, otherwise
