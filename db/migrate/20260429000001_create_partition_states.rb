@@ -11,7 +11,12 @@ class CreatePartitionStates < ActiveRecord::Migration[7.1]
     create_table :dispatch_policy_partition_states do |t|
       t.string   :policy_name,      null: false
       t.string   :partition_key,    null: false
-      t.datetime :last_admitted_at, null: false
+      # Nullable: rows are first inserted by StagedJob.stage_many!
+      # which only sets pending_count. last_admitted_at is filled in
+      # by Tick.run_policy.admit_many! when the partition first
+      # admits. NULL sorts first in the LRU pluck (NULLS FIRST), which
+      # is exactly the "never admitted, give it a turn" semantics.
+      t.datetime :last_admitted_at
       t.timestamps
     end
 

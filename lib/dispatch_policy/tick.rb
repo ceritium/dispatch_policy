@@ -76,7 +76,12 @@ module DispatchPolicy
       cutoff = Time.current - ttl
       PartitionInflightCount.where(in_flight: 0).where("updated_at < ?", cutoff).delete_all
       ThrottleBucket.where("tokens <= ? AND refilled_at < ?", THROTTLE_ZERO_THRESHOLD, cutoff).delete_all
-      PartitionState.where("last_admitted_at < ?", cutoff).delete_all
+      # Only prune drained partitions (no pending rows). A partition
+      # whose pending_count > 0 stays even if last_admitted_at is old
+      # — those are partitions waiting their LRU turn.
+      PartitionState.where(pending_count: 0)
+                    .where("last_admitted_at IS NULL OR last_admitted_at < ?", cutoff)
+                    .delete_all
     end
 
     def self.prune_orphan_gate_rows
@@ -206,37 +211,25 @@ module DispatchPolicy
     # every active partition. NULL last_admitted_at (never-admitted)
     # rows go first by NULLS FIRST.
     #
+    # Reads partition_states directly via the partial index on
+    # (policy_name, last_admitted_at) WHERE pending_count > 0. Index
+    # seek + LIMIT is O(cap) regardless of total partitions known to
+    # the policy — sub-millisecond at any N.
+    #
     # Always LIMITs the result so a tick can't degrade as N grows.
     # By default the limit is config.batch_size — that's the smallest
-    # value that keeps the LATERAL inner full (cap × quantum ≥
-    # batch_size when quantum ≥ 1, so the top-up path can't fire and
-    # admit partitions outside the cap'd set). Power users with high
-    # quantum and very low latency budget can override via
-    # config.round_robin_max_partitions_per_tick.
-    def self.pluck_active_partitions(policy, now)
+    # value that keeps the LATERAL inner full when quantum ≥ 1.
+    # Override via config.round_robin_max_partitions_per_tick.
+    def self.pluck_active_partitions(policy, _now)
       cap = DispatchPolicy.config.round_robin_max_partitions_per_tick ||
             DispatchPolicy.config.batch_size
 
-      sql = <<~SQL.squish
-        SELECT s.round_robin_key
-        FROM (
-          SELECT DISTINCT round_robin_key
-          FROM #{StagedJob.quoted_table_name}
-          WHERE policy_name = ?
-            AND admitted_at IS NULL
-            AND completed_at IS NULL
-            AND round_robin_key IS NOT NULL
-            AND (not_before_at IS NULL OR not_before_at <= ?)
-        ) s
-        LEFT JOIN #{PartitionState.quoted_table_name} ps
-          ON ps.policy_name = ? AND ps.partition_key = s.round_robin_key
-        ORDER BY ps.last_admitted_at ASC NULLS FIRST
-        LIMIT ?
-      SQL
-
-      StagedJob.connection.select_values(
-        StagedJob.send(:sanitize_sql_array, [ sql, policy.name, now, policy.name, cap.to_i ])
-      )
+      PartitionState
+        .where(policy_name: policy.name)
+        .where("pending_count > 0")
+        .order(Arel.sql("last_admitted_at ASC NULLS FIRST"))
+        .limit(cap.to_i)
+        .pluck(:partition_key)
     end
 
     def self.fetch_round_robin_batch(policy)
@@ -280,16 +273,50 @@ module DispatchPolicy
       remaining = batch_size - batch.size
       return batch if remaining <= 0 || batch.empty?
 
-      top_up = StagedJob.pending
-        .where(policy_name: policy.name)
-        .where("not_before_at IS NULL OR not_before_at <= ?", now)
-        .where.not(id: batch.map(&:id))
-        .order(:priority, :staged_at)
-        .limit(remaining)
-        .lock("FOR UPDATE SKIP LOCKED")
-        .to_a
+      refill_round_robin(policy, partitions, batch, remaining, now)
+    end
 
-      batch + top_up
+    # Round-robin-aware refill: when the first LATERAL pass leaves the
+    # batch short of batch_size (some plucked partitions had fewer rows
+    # than their quantum), do a second LATERAL pass distributing the
+    # remaining slots equally across the SAME plucked partitions. The
+    # old FIFO top-up grabbed rows from anywhere ordered by staged_at,
+    # which let a hot partition outside the cap'd subset bypass the
+    # rotation; this version stays inside the LRU subset.
+    def self.refill_round_robin(policy, partitions, batch, remaining, now)
+      return batch if partitions.empty?
+
+      refill_quantum = (remaining.to_f / partitions.size).ceil
+      values_clause  = ([ "(?, ?::int)" ] * partitions.size).join(", ")
+      values_args    = partitions.flat_map { |k| [ k, refill_quantum ] }
+
+      excluded_ids = batch.map(&:id)
+      # IDs are integers from staged_jobs.id (bigint), no SQL-injection
+      # risk. Avoids spreading them as binds — there can be batch_size
+      # of them and `?` placeholder substitution gets clunky.
+      exclude_clause = excluded_ids.empty? ? "" : "AND s.id NOT IN (#{excluded_ids.join(',')})"
+
+      sql = <<~SQL.squish
+        WITH plan(round_robin_key, quantum) AS (VALUES #{values_clause})
+        SELECT rows.*
+        FROM plan
+        CROSS JOIN LATERAL (
+          SELECT s.*
+          FROM dispatch_policy_staged_jobs s
+          WHERE s.policy_name = ?
+            AND s.admitted_at IS NULL
+            AND s.round_robin_key = plan.round_robin_key
+            AND (s.not_before_at IS NULL OR s.not_before_at <= ?)
+            #{exclude_clause}
+          ORDER BY s.priority, s.staged_at
+          LIMIT plan.quantum
+          FOR UPDATE SKIP LOCKED
+        ) AS rows
+        LIMIT ?
+      SQL
+
+      refill = StagedJob.find_by_sql([ sql, *values_args, policy.name, now, remaining ])
+      batch + refill
     end
 
     # Time-weighted variant of round-robin: instead of an equal quantum
@@ -360,16 +387,7 @@ module DispatchPolicy
       remaining = batch_size - batch.size
       return batch if remaining <= 0 || batch.empty?
 
-      top_up = StagedJob.pending
-        .where(policy_name: policy.name)
-        .where("not_before_at IS NULL OR not_before_at <= ?", now)
-        .where.not(id: batch.map(&:id))
-        .order(:priority, :staged_at)
-        .limit(remaining)
-        .lock("FOR UPDATE SKIP LOCKED")
-        .to_a
-
-      batch + top_up
+      refill_round_robin(policy, partitions, batch, remaining, now)
     end
 
     def self.lookup_policy(policy_name)
@@ -397,10 +415,10 @@ module DispatchPolicy
       lease_expires = now + DispatchPolicy.config.lease_duration
       gate_index    = policy.gates.each_with_object({}) { |g, h| h[g.name.to_s] = g }
 
-      staged_updates = []
-      counter_deltas = Hash.new(0)
-      partition_keys = {}
-      pairs          = []
+      staged_updates  = []
+      counter_deltas  = Hash.new(0)
+      admit_counts    = Hash.new(0)
+      pairs           = []
 
       survivors.each do |staged|
         partitions = context.partitions_for(staged)
@@ -411,11 +429,11 @@ module DispatchPolicy
           counter_deltas[[ policy.name, gate_name.to_s, partition_key.to_s ]] += 1
         end
 
-        # Track per-(policy, round_robin_key) admissions for the LRU
-        # cursor — this is what the round-robin fetch reads to give
-        # late-sorting partitions a turn. Skip rows without a
-        # round_robin_key (plain policies don't need rotation).
-        partition_keys[[ policy.name, staged.round_robin_key ]] = true if staged.round_robin_key
+        # Track per-round_robin_key admissions for the LRU + count
+        # decrement on partition_states. Skip rows without a
+        # round_robin_key (plain policies don't need rotation and
+        # don't get tracked in partition_states).
+        admit_counts[staged.round_robin_key] += 1 if staged.round_robin_key
 
         job = staged.instantiate_active_job
         job._dispatch_partitions  = partitions
@@ -431,7 +449,11 @@ module DispatchPolicy
         lease_expires_at: lease_expires
       )
       PartitionInflightCount.increment_many!(deltas: counter_deltas)
-      PartitionState.touch_many!(rows: partition_keys.keys, now: now)
+      PartitionState.admit_many!(
+        policy_name: policy.name,
+        counts:      admit_counts,
+        now:         now
+      )
 
       pairs
     end

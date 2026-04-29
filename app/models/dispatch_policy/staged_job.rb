@@ -33,7 +33,10 @@ module DispatchPolicy
         return nil
       end
 
-      create!(
+      rrk = policy.build_round_robin_key(job_instance.arguments)
+      now = Time.current
+
+      staged = create!(
         job_class:       job_instance.class.name,
         policy_name:     policy.name,
         arguments:       job_instance.serialize,
@@ -41,10 +44,22 @@ module DispatchPolicy
         context:         context_for(job_instance, policy),
         priority:        job_instance.priority || 100,
         not_before_at:   job_instance.scheduled_at,
-        staged_at:       Time.current,
+        staged_at:       now,
         dedupe_key:      dedupe_key,
-        round_robin_key: policy.build_round_robin_key(job_instance.arguments)
+        round_robin_key: rrk
       )
+
+      # Materialize partition activity so pluck_active_partitions can
+      # skip the DISTINCT scan over staged_jobs at high N.
+      if rrk
+        PartitionState.bulk_increment_pending!(
+          policy_name: policy.name,
+          counts:      { rrk => 1 },
+          now:         now
+        )
+      end
+
+      staged
     rescue ActiveRecord::RecordNotUnique
       nil
     end
@@ -72,7 +87,30 @@ module DispatchPolicy
         }
       end
 
-      result = insert_all(rows, unique_by: :idx_dp_staged_dedupe_active)
+      # Use returning to get the round_robin_key of inserted-not-deduped
+      # rows so partition_states.pending_count reflects exactly the
+      # rows that landed in staged_jobs.
+      result = insert_all(
+        rows,
+        unique_by: :idx_dp_staged_dedupe_active,
+        returning: %i[round_robin_key]
+      )
+
+      partition_counts = Hash.new(0)
+      result.rows.each do |row|
+        # rows is array of [round_robin_key] for this returning clause.
+        rrk = row.first
+        partition_counts[rrk] += 1 if rrk
+      end
+
+      if partition_counts.any?
+        PartitionState.bulk_increment_pending!(
+          policy_name: policy.name,
+          counts:      partition_counts,
+          now:         now
+        )
+      end
+
       result.rows.size
     end
 
