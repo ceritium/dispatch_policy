@@ -25,6 +25,7 @@ migration_path = File.expand_path("../db/migrate", __dir__)
   dispatch_policy_adaptive_concurrency_stats
   dispatch_policy_adaptive_concurrency_samples
   dispatch_policy_partition_observations
+  dispatch_policy_partition_states
   schema_migrations
   ar_internal_metadata
 ].each { |t| ActiveRecord::Base.connection.drop_table t.to_sym, if_exists: true }

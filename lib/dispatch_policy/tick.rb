@@ -65,6 +65,7 @@ module DispatchPolicy
       cutoff = Time.current - ttl
       PartitionInflightCount.where(in_flight: 0).where("updated_at < ?", cutoff).delete_all
       ThrottleBucket.where("tokens <= ? AND refilled_at < ?", THROTTLE_ZERO_THRESHOLD, cutoff).delete_all
+      PartitionState.where("last_admitted_at < ?", cutoff).delete_all
     end
 
     def self.prune_orphan_gate_rows
@@ -139,6 +140,7 @@ module DispatchPolicy
       PartitionInflightCount.connection.exec_update(
         PartitionInflightCount.send(:sanitize_sql_array, [ decrement_sql, now, *values_args ])
       )
+      PartitionInflightCount.connection.clear_query_cache
 
       expired.size
     end
@@ -188,17 +190,48 @@ module DispatchPolicy
         .to_a
     end
 
+    # Pluck active round_robin_keys for `policy`, ordered least-recently-
+    # admitted first so high-cardinality policies still rotate through
+    # every active partition. NULL last_admitted_at (never-admitted)
+    # rows go first by NULLS FIRST. Optional cap from config bounds the
+    # fetch wall time and gives a hard round-trip guarantee:
+    # ceil(active_partitions / cap) ticks.
+    def self.pluck_active_partitions(policy, now)
+      cap = DispatchPolicy.config.round_robin_max_partitions_per_tick
+
+      sql = +<<~SQL.squish
+        SELECT s.round_robin_key
+        FROM (
+          SELECT DISTINCT round_robin_key
+          FROM #{StagedJob.quoted_table_name}
+          WHERE policy_name = ?
+            AND admitted_at IS NULL
+            AND completed_at IS NULL
+            AND round_robin_key IS NOT NULL
+            AND (not_before_at IS NULL OR not_before_at <= ?)
+        ) s
+        LEFT JOIN #{PartitionState.quoted_table_name} ps
+          ON ps.policy_name = ? AND ps.partition_key = s.round_robin_key
+        ORDER BY ps.last_admitted_at ASC NULLS FIRST
+      SQL
+
+      binds = [ policy.name, now, policy.name ]
+      if cap
+        sql << " LIMIT ?"
+        binds << cap.to_i
+      end
+
+      StagedJob.connection.select_values(
+        StagedJob.send(:sanitize_sql_array, [ sql, *binds ])
+      )
+    end
+
     def self.fetch_round_robin_batch(policy)
       quantum    = DispatchPolicy.config.round_robin_quantum
       batch_size = DispatchPolicy.config.batch_size
       now        = Time.current
 
-      partitions = StagedJob.pending
-        .where(policy_name: policy.name)
-        .where("not_before_at IS NULL OR not_before_at <= ?", now)
-        .where.not(round_robin_key: nil)
-        .distinct
-        .pluck(:round_robin_key)
+      partitions = pluck_active_partitions(policy, now)
 
       return fetch_plain_batch(policy) if partitions.empty?
 
@@ -261,12 +294,7 @@ module DispatchPolicy
       batch_size = DispatchPolicy.config.batch_size
       now        = Time.current
 
-      partitions = StagedJob.pending
-        .where(policy_name: policy.name)
-        .where("not_before_at IS NULL OR not_before_at <= ?", now)
-        .where.not(round_robin_key: nil)
-        .distinct
-        .pluck(:round_robin_key)
+      partitions = pluck_active_partitions(policy, now)
 
       return fetch_plain_batch(policy) if partitions.empty?
 
@@ -358,6 +386,7 @@ module DispatchPolicy
 
       staged_updates = []
       counter_deltas = Hash.new(0)
+      partition_keys = {}
       pairs          = []
 
       survivors.each do |staged|
@@ -368,6 +397,12 @@ module DispatchPolicy
           next unless gate&.tracks_inflight?
           counter_deltas[[ policy.name, gate_name.to_s, partition_key.to_s ]] += 1
         end
+
+        # Track per-(policy, round_robin_key) admissions for the LRU
+        # cursor — this is what the round-robin fetch reads to give
+        # late-sorting partitions a turn. Skip rows without a
+        # round_robin_key (plain policies don't need rotation).
+        partition_keys[[ policy.name, staged.round_robin_key ]] = true if staged.round_robin_key
 
         job = staged.instantiate_active_job
         job._dispatch_partitions  = partitions
@@ -383,6 +418,7 @@ module DispatchPolicy
         lease_expires_at: lease_expires
       )
       PartitionInflightCount.increment_many!(deltas: counter_deltas)
+      PartitionState.touch_many!(rows: partition_keys.keys, now: now)
 
       pairs
     end

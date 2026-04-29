@@ -63,6 +63,7 @@ module DispatchPolicy
       SQL
 
       connection.exec_update(sanitize_sql_array([ sql, *values_args ]))
+      connection.clear_query_cache
     end
   end
 end

@@ -12,6 +12,7 @@ module DispatchPolicy
     :lease_duration,
     :batch_size,
     :round_robin_quantum,
+    :round_robin_max_partitions_per_tick,
     :tick_max_duration,
     :tick_sleep,
     :tick_sleep_busy,
@@ -42,6 +43,14 @@ module DispatchPolicy
       lease_duration:        2 * 60,           # 2.minutes
       batch_size:            500,
       round_robin_quantum:   50,
+      # Cap on how many partitions a round-robin / time-weighted fetch
+      # considers per tick. nil means "all active partitions". When
+      # set, partitions are picked least-recently-admitted first
+      # (rotating LRU cursor in dispatch_policy_partition_states),
+      # bounding fetch wall time at high cardinality. Round-trip
+      # guarantee: every active partition entered the batch within
+      # ceil(active_partitions / cap) ticks.
+      round_robin_max_partitions_per_tick: nil,
       tick_max_duration:     60,               # 1.minute
       tick_sleep:            1,                # idle sleep
       tick_sleep_busy:       0.05,             # busy sleep

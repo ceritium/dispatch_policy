@@ -25,11 +25,13 @@ module DispatchPolicy
     setup do
       @orig_quantum    = DispatchPolicy.config.round_robin_quantum
       @orig_batch_size = DispatchPolicy.config.batch_size
+      @orig_max_parts  = DispatchPolicy.config.round_robin_max_partitions_per_tick
     end
 
     teardown do
-      DispatchPolicy.config.round_robin_quantum = @orig_quantum
-      DispatchPolicy.config.batch_size          = @orig_batch_size
+      DispatchPolicy.config.round_robin_quantum                 = @orig_quantum
+      DispatchPolicy.config.batch_size                          = @orig_batch_size
+      DispatchPolicy.config.round_robin_max_partitions_per_tick = @orig_max_parts
     end
 
     test "each key gets at least quantum when batch_size is tight" do
@@ -169,6 +171,28 @@ module DispatchPolicy
       Tick.run(policy_name: CappedJob.resolved_dispatch_policy.name)
       assert_equal 1, StagedJob.admitted.count
       assert_equal 2, StagedJob.pending.count
+    end
+
+    test "round-robin LRU cursor rotates partitions across ticks under cap" do
+      # batch_size = cap × quantum so the top-up path doesn't widen
+      # past the cap. With cap=2 and 5 partitions, ceil(5/2)=3 ticks
+      # is the round-trip guarantee.
+      DispatchPolicy.config.batch_size                          = 2
+      DispatchPolicy.config.round_robin_quantum                 = 1
+      DispatchPolicy.config.round_robin_max_partitions_per_tick = 2
+
+      keys = %w[a b c d e]
+      keys.each { |k| FairJob.perform_later(k) }
+      assert_equal 5, StagedJob.pending.count, "seed setup"
+
+      seen = Set.new
+      3.times do
+        Tick.run(policy_name: FairJob.resolved_dispatch_policy.name)
+        StagedJob.where.not(admitted_at: nil).pluck(:round_robin_key).each { |k| seen << k }
+      end
+
+      assert_equal keys.to_set, seen,
+        "expected every partition admitted within ceil(5/2)=3 ticks, missing: #{keys.to_set - seen}"
     end
 
     test "Tick.run issues a constant number of SQL writes regardless of batch size" do

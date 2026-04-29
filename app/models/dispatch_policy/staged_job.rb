@@ -125,6 +125,12 @@ module DispatchPolicy
       connection.exec_update(
         sanitize_sql_array([ sql, admitted_at, lease_expires_at, *values_args ])
       )
+      # exec_update with raw SQL doesn't invalidate the AR query
+      # cache the way update_all does. Without this, callers running
+      # subsequent SELECTs against staged_jobs in the same query-cache
+      # scope see stale rows. TickLoop wraps in uncached so this is a
+      # no-op there, but we want correct semantics on direct callers.
+      connection.clear_query_cache
     end
 
     def instantiate_active_job

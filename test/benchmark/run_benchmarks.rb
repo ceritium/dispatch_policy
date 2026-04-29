@@ -57,6 +57,9 @@ JOBS_PER_PARTITION  = (ENV["JOBS_PER_PARTITION"]  || 3).to_i
 MAX_PARTITIONS      = (ENV["MAX_PARTITIONS"]      || 10_000).to_i
 
 DispatchPolicy.config.batch_size = BATCH_SIZE
+if (cap = ENV["MAX_PARTITIONS_PER_TICK"])
+  DispatchPolicy.config.round_robin_max_partitions_per_tick = cap.to_i
+end
 
 SCALES = [ 100, 1_000, 10_000, 100_000 ].select { |n| n <= MAX_PARTITIONS }.freeze
 raise "MAX_PARTITIONS must allow at least 100" if SCALES.empty?
