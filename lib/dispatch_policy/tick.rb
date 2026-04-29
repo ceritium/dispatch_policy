@@ -69,19 +69,26 @@ module DispatchPolicy
       admitted
     end
 
+    # Default batch size for the prune deletes. Keeps any single
+    # statement bounded so we don't lock or block writers when the
+    # table has many candidate rows. Overridable via config if you
+    # need to tune for an unusually high or low churn rate.
+    PRUNE_BATCH_SIZE = 5_000
+
     def self.prune_idle_partitions
       ttl = DispatchPolicy.config.partition_idle_ttl
       return if ttl.nil? || ttl <= 0
 
       cutoff = Time.current - ttl
-      PartitionInflightCount.where(in_flight: 0).where("updated_at < ?", cutoff).delete_all
-      ThrottleBucket.where("tokens <= ? AND refilled_at < ?", THROTTLE_ZERO_THRESHOLD, cutoff).delete_all
+      delete_in_batches(PartitionInflightCount.where(in_flight: 0).where("updated_at < ?", cutoff))
+      delete_in_batches(ThrottleBucket.where("tokens <= ? AND refilled_at < ?", THROTTLE_ZERO_THRESHOLD, cutoff))
       # Only prune drained partitions (no pending rows). A partition
       # whose pending_count > 0 stays even if last_admitted_at is old
       # — those are partitions waiting their LRU turn.
-      PartitionState.where(pending_count: 0)
-                    .where("last_admitted_at IS NULL OR last_admitted_at < ?", cutoff)
-                    .delete_all
+      delete_in_batches(
+        PartitionState.where(pending_count: 0)
+                      .where("last_admitted_at IS NULL OR last_admitted_at < ?", cutoff)
+      )
 
       prune_drained_partition_states
     end
@@ -103,7 +110,17 @@ module DispatchPolicy
       drained = PartitionState.where(pending_count: 0).count
       return if total.zero? || (drained.to_f / total) < threshold
 
-      PartitionState.where(pending_count: 0).delete_all
+      delete_in_batches(PartitionState.where(pending_count: 0))
+    end
+
+    # Delete in primary-key-paginated batches so a single statement
+    # never locks the whole result set. PG `in_batches` walks `id`
+    # ranges and yields a relation per chunk; deleting the chunk
+    # then moving on is the standard Rails pattern for bulk delete.
+    def self.delete_in_batches(scope, batch_size: PRUNE_BATCH_SIZE)
+      total = 0
+      scope.in_batches(of: batch_size) { |relation| total += relation.delete_all }
+      total
     end
 
     def self.prune_orphan_gate_rows
@@ -112,7 +129,7 @@ module DispatchPolicy
           policy = lookup_policy(policy_name)
           next if policy && policy.gates.any? { |g| g.name == gate_name.to_sym }
 
-          model.where(policy_name: policy_name, gate_name: gate_name).delete_all
+          delete_in_batches(model.where(policy_name: policy_name, gate_name: gate_name))
         end
       end
     end
