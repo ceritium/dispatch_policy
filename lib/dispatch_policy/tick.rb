@@ -204,13 +204,20 @@ module DispatchPolicy
     # Pluck active round_robin_keys for `policy`, ordered least-recently-
     # admitted first so high-cardinality policies still rotate through
     # every active partition. NULL last_admitted_at (never-admitted)
-    # rows go first by NULLS FIRST. Optional cap from config bounds the
-    # fetch wall time and gives a hard round-trip guarantee:
-    # ceil(active_partitions / cap) ticks.
+    # rows go first by NULLS FIRST.
+    #
+    # Always LIMITs the result so a tick can't degrade as N grows.
+    # By default the limit is config.batch_size — that's the smallest
+    # value that keeps the LATERAL inner full (cap × quantum ≥
+    # batch_size when quantum ≥ 1, so the top-up path can't fire and
+    # admit partitions outside the cap'd set). Power users with high
+    # quantum and very low latency budget can override via
+    # config.round_robin_max_partitions_per_tick.
     def self.pluck_active_partitions(policy, now)
-      cap = DispatchPolicy.config.round_robin_max_partitions_per_tick
+      cap = DispatchPolicy.config.round_robin_max_partitions_per_tick ||
+            DispatchPolicy.config.batch_size
 
-      sql = +<<~SQL.squish
+      sql = <<~SQL.squish
         SELECT s.round_robin_key
         FROM (
           SELECT DISTINCT round_robin_key
@@ -224,16 +231,11 @@ module DispatchPolicy
         LEFT JOIN #{PartitionState.quoted_table_name} ps
           ON ps.policy_name = ? AND ps.partition_key = s.round_robin_key
         ORDER BY ps.last_admitted_at ASC NULLS FIRST
+        LIMIT ?
       SQL
 
-      binds = [ policy.name, now, policy.name ]
-      if cap
-        sql << " LIMIT ?"
-        binds << cap.to_i
-      end
-
       StagedJob.connection.select_values(
-        StagedJob.send(:sanitize_sql_array, [ sql, *binds ])
+        StagedJob.send(:sanitize_sql_array, [ sql, policy.name, now, policy.name, cap.to_i ])
       )
     end
 

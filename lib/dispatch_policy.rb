@@ -44,12 +44,11 @@ module DispatchPolicy
       batch_size:            500,
       round_robin_quantum:   50,
       # Cap on how many partitions a round-robin / time-weighted fetch
-      # considers per tick. nil means "all active partitions". When
-      # set, partitions are picked least-recently-admitted first
-      # (rotating LRU cursor in dispatch_policy_partition_states),
-      # bounding fetch wall time at high cardinality. Round-trip
-      # guarantee: every active partition entered the batch within
-      # ceil(active_partitions / cap) ticks.
+      # considers per tick. nil falls back to batch_size — the smallest
+      # value that lets the LATERAL fully fill the batch (cap × quantum
+      # ≥ batch_size when quantum ≥ 1) without falling back to the
+      # top-up path. Override only if you want a tighter ceiling on
+      # fetch wall time at the cost of slower rotation.
       round_robin_max_partitions_per_tick: nil,
       tick_max_duration:     60,               # 1.minute
       tick_sleep:            1,                # idle sleep
