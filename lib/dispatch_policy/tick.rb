@@ -32,22 +32,33 @@ module DispatchPolicy
             batch = fetch_batch(policy)
             next if batch.empty?
 
-            run_policy(policy, batch).each do |staged, job|
-              job.enqueue(_bypass_staging: true)
+            pairs = run_policy(policy, batch)
+            jobs  = pairs.map { |_staged, job| job }
 
-              # ActiveJob adapters can report failure by setting
-              # enqueue_error and leaving successfully_enqueued? false
-              # instead of raising. We treat that as a hard failure and
-              # roll back the entire transaction so admission, counters
-              # and the adapter row all unwind together.
-              unless job.successfully_enqueued?
-                raise EnqueueDeclined,
-                  "adapter declined staged=#{staged.id}: " \
-                  "#{job.enqueue_error&.class}: #{job.enqueue_error&.message}"
-              end
+            # Bulk hand-off to the adapter in a single round-trip.
+            # GoodJob and Solid Queue override enqueue_all to do one
+            # INSERT with N rows; adapters without an override fall
+            # back to a per-job enqueue loop. Routes through
+            # ActiveJob.perform_all_later so the dispatch by queue_
+            # adapter is consistent with the rest of the host app.
+            # ActiveJobPerformAllLaterPatch sees _dispatch_admitted_at
+            # is already set on these jobs and skips the staging
+            # branch, going straight to the adapter.
+            ActiveJob.perform_all_later(jobs)
 
-              admitted += 1
+            # ActiveJob adapters can report failure by setting
+            # enqueue_error and leaving successfully_enqueued? false
+            # instead of raising. Treat that as a hard failure and
+            # roll back the entire transaction so admission, counters
+            # and the adapter rows all unwind together.
+            jobs.each do |job|
+              next if job.successfully_enqueued?
+              raise EnqueueDeclined,
+                "adapter declined active_job_id=#{job.job_id}: " \
+                "#{job.enqueue_error&.class}: #{job.enqueue_error&.message}"
             end
+
+            admitted += jobs.size
           end
         end
       rescue EnqueueDeclined => e

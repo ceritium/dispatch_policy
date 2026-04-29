@@ -12,7 +12,12 @@ module DispatchPolicy
         klass = job.class
         klass.respond_to?(:dispatch_policy?) &&
           klass.dispatch_policy? &&
-          DispatchPolicy.enabled?
+          DispatchPolicy.enabled? &&
+          # Already-admitted jobs (handed to perform_all_later from
+          # Tick.run) carry _dispatch_admitted_at and must skip the
+          # staging branch — re-staging would loop them back into
+          # pending right after the tick admitted them.
+          job._dispatch_admitted_at.nil?
       end
 
       staged_count = 0
