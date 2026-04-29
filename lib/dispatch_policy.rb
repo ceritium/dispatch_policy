@@ -17,6 +17,8 @@ module DispatchPolicy
     :tick_sleep,
     :tick_sleep_busy,
     :partition_idle_ttl,
+    :partition_drained_purge_threshold,
+    :partition_drained_purge_min_total,
     :admin_partition_limit,
     :database_role,
     :allowed_adapters,
@@ -54,6 +56,15 @@ module DispatchPolicy
       tick_sleep:            1,                # idle sleep
       tick_sleep_busy:       0.05,             # busy sleep
       partition_idle_ttl:    30 * 60,          # 30.minutes
+      # Aggressive purge of drained partition_states rows. When the
+      # ratio of drained (pending_count = 0) to total rows exceeds
+      # this threshold AND the table has at least
+      # partition_drained_purge_min_total rows, all drained rows are
+      # deleted regardless of last_admitted_at age. Insurance for
+      # policies that churn through many short-lived partitions.
+      # Set to nil to disable.
+      partition_drained_purge_threshold: 0.5,
+      partition_drained_purge_min_total: 10_000,
       # Hard cap on rows the admin's partition breakdown will pull per
       # aggregation. Protects the host DB and process when a policy has
       # tens of thousands of partitions: the admin shows the top-N most

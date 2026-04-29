@@ -64,6 +64,60 @@ module DispatchPolicy
         "#{reap_writes.join("\n")}"
     end
 
+    test "prune_drained_partition_states purges drained rows when ratio crosses the threshold" do
+      orig_threshold = DispatchPolicy.config.partition_drained_purge_threshold
+      orig_min       = DispatchPolicy.config.partition_drained_purge_min_total
+      DispatchPolicy.config.partition_drained_purge_threshold = 0.5
+      DispatchPolicy.config.partition_drained_purge_min_total = 10
+
+      now = Time.current
+      # 8 drained + 2 active = 10 total, drained_ratio = 0.8 ≥ 0.5
+      8.times do |i|
+        PartitionState.create!(
+          policy_name: "p", partition_key: "drained-#{i}",
+          pending_count: 0, last_admitted_at: now - 1.minute
+        )
+      end
+      2.times do |i|
+        PartitionState.create!(
+          policy_name: "p", partition_key: "active-#{i}",
+          pending_count: 3, last_admitted_at: nil
+        )
+      end
+
+      Tick.prune_drained_partition_states
+
+      assert_equal 2, PartitionState.count, "drained rows above threshold must be deleted"
+      assert_equal 2, PartitionState.where("pending_count > 0").count
+    ensure
+      DispatchPolicy.config.partition_drained_purge_threshold = orig_threshold
+      DispatchPolicy.config.partition_drained_purge_min_total = orig_min
+    end
+
+    test "prune_drained_partition_states is a no-op below min_total even at high ratio" do
+      orig_threshold = DispatchPolicy.config.partition_drained_purge_threshold
+      orig_min       = DispatchPolicy.config.partition_drained_purge_min_total
+      DispatchPolicy.config.partition_drained_purge_threshold = 0.5
+      DispatchPolicy.config.partition_drained_purge_min_total = 100
+
+      # 9 drained + 1 active = below min_total — even though
+      # drained_ratio = 0.9, the purge skips.
+      now = Time.current
+      9.times do |i|
+        PartitionState.create!(policy_name: "p", partition_key: "drained-#{i}",
+          pending_count: 0, last_admitted_at: now - 1.minute)
+      end
+      PartitionState.create!(policy_name: "p", partition_key: "active",
+        pending_count: 1, last_admitted_at: nil)
+
+      Tick.prune_drained_partition_states
+
+      assert_equal 10, PartitionState.count, "below min_total purge must skip"
+    ensure
+      DispatchPolicy.config.partition_drained_purge_threshold = orig_threshold
+      DispatchPolicy.config.partition_drained_purge_min_total = orig_min
+    end
+
     test "prune_orphan_gate_rows removes rows for unknown policies" do
       PartitionInflightCount.increment(
         policy_name: "ghost_policy", gate_name: "concurrency", partition_key: "x"

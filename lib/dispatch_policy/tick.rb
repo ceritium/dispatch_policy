@@ -82,6 +82,28 @@ module DispatchPolicy
       PartitionState.where(pending_count: 0)
                     .where("last_admitted_at IS NULL OR last_admitted_at < ?", cutoff)
                     .delete_all
+
+      prune_drained_partition_states
+    end
+
+    # Aggressive purge: when partition_states accumulates a high
+    # proportion of drained (pending_count = 0) rows, delete them
+    # regardless of last_admitted_at age. Cheap insurance against
+    # policies that churn through many short-lived partition keys
+    # — without this, the table can keep many drained rows for up
+    # to partition_idle_ttl even when they outnumber active ones.
+    def self.prune_drained_partition_states
+      threshold = DispatchPolicy.config.partition_drained_purge_threshold
+      min_total = DispatchPolicy.config.partition_drained_purge_min_total.to_i
+      return if threshold.nil? || threshold <= 0
+
+      total = PartitionState.count
+      return if total < min_total
+
+      drained = PartitionState.where(pending_count: 0).count
+      return if total.zero? || (drained.to_f / total) < threshold
+
+      PartitionState.where(pending_count: 0).delete_all
     end
 
     def self.prune_orphan_gate_rows
