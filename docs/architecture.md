@@ -282,8 +282,9 @@ are listed in order of "try first" → "last resort".
 | Counters drifting high (admit blocked)  | `admitted` plateauing while `pending` rises                   | Run `Tick.reap` manually if not already on a TickLoop schedule. Lower `lease_duration` if leases routinely outlive perform. |
 | `partition_states` table bloating       | many `drained_partitions` per `active_partitions`             | `partition_drained_purge_threshold` ↓ (e.g. 0.3) → trigger ratio purge sooner. Or shorten `partition_idle_ttl`. |
 | Single tick hot-loops the same tenant   | `partitions` in `tick` event ≪ `batch_size`                   | A burst tenant: top-up was the old culprit; current refill_round_robin stays inside the cap'd LRU subset. Verify by sampling `last_admitted_at` distribution per partition — uniform-ish = healthy. |
-| `:starvation` health alert              | `Stats.health == :starvation`                                 | Check `stale_partitions_300s` for the count. Same fix as starvation row above (lower quantum, shard). Adjust `stale_threshold_seconds` if your SLA is < `lease_duration × 3`. |
-| `:backlog_aging` health alert           | `Stats.health == :backlog_aging`                              | At least one pending row > 5min old. `batch_size` ↑ or scale workers; if a single policy dominates, shard it into its own TickLoop. |
+| `:rotation_lag` health alert            | `Stats.health == :rotation_lag` AND `Stats.bottleneck(name)[:diagnosis] == :rotation_lag` | At least one partition is waiting its LRU turn while all gates have headroom for it. Tune `round_robin_quantum` ↓ (toward 1) → more partitions touched per tick. Or `round_robin_max_partitions_per_tick` if you want a tighter cap. Last resort: shard the policy across multiple TickLoops. |
+| Diagnosis is `:capacity_strain`         | `Stats.bottleneck(name)[:diagnosis] == :capacity_strain`      | `active_partitions > batch_size` AND LRU lag → the cap is the binding constraint. `batch_size` ↑ to widen the per-tick window, or shard. |
+| Diagnosis is `:gate_constrained`        | `Stats.bottleneck(name)[:stale_partitions][:lru_lagged] == 0` AND `gate_blocked > 0` | Backlog is on partitions whose concurrency / throttle / global_cap is at cap. **This is by design** — not a dispatch_policy tuning concern. If the backlog is unwanted, raise the gate cap or scale workers; otherwise `:ok` is the right answer for the gem. |
 
 ### Single-number SLOs
 
@@ -299,7 +300,8 @@ DispatchPolicy::Stats.slo("monitor_check_v2_job",
 # => {
 #   policy_name: "monitor_check_v2_job",
 #   latency:    { seconds: 0.83, budget: 60, ok: true },
-#   fairness:   { stale_partitions: 0, threshold: 60, ok: true },
+#   fairness:   { stale_partitions: 0, gate_blocked: 12,
+#                 threshold: 60, ok: true },
 #   throughput: { admissions_per_sec: 41.2, window_seconds: 60 },
 #   capacity:   { active_partitions: 540, batch_size: 500,
 #                 utilization: 1.08, headroom: false }
@@ -313,9 +315,12 @@ What each signal means:
 
 - **Latency** — `oldest_pending_age_seconds` against your freshness
   budget. The single most important SLO. Alert when `ok: false`.
-- **Fairness** — count of active partitions whose last admission
-  (or first stage, for never-admitted ones) is older than the
-  threshold. `ok: true` ⇔ no rotational starvation.
+- **Fairness** — count of active partitions waiting their LRU turn
+  while all gates have headroom (`stale_partitions`), plus a
+  separate informational count of partitions blocked by an
+  at-cap gate (`gate_blocked`). `ok: true` ⇔ `stale_partitions == 0`.
+  Gate-blocked partitions are **by design** (operator chose those
+  caps) and never trip the verdict.
 - **Throughput** — admissions per second over a rolling window. No
   `ok:` flag because only you know your ingress rate; alert when
   `admissions_per_sec < your enqueue_rate × safety_factor`.
@@ -323,6 +328,59 @@ What each signal means:
   when batch can hold every active partition this tick (no rotation
   needed). When `false`, you're rotating and the fairness SLO
   becomes the operative constraint.
+
+### Bottleneck diagnosis: which knob to turn
+
+`Stats.bottleneck(policy_name)` returns the dominant cause of any
+fairness lag plus the config knobs that address it:
+
+```ruby
+DispatchPolicy::Stats.bottleneck("monitor_check_v2_job")
+# => {
+#   policy_name: "monitor_check_v2_job",
+#   applicable: true,
+#   stale_partitions: { gate_blocked: 12, lru_lagged: 3 },
+#   diagnosis: :rotation_lag,
+#   suggested_knobs: [:round_robin_quantum,
+#                     :round_robin_max_partitions_per_tick]
+# }
+```
+
+`diagnosis` is one of:
+
+- `:ok` — no LRU lag (any backlog is gate-constrained or none).
+- `:rotation_lag` — partitions are waiting their LRU turn while
+  gates have headroom. Tune `round_robin_quantum` ↓ or
+  `round_robin_max_partitions_per_tick`.
+- `:capacity_strain` — `active_partitions > batch_size` AND LRU lag.
+  The cap itself is the binding constraint; widen `batch_size` or
+  shard.
+
+For policies without `round_robin_by`, `applicable: false` is
+returned — fairness rotation doesn't apply, only the gate-level
+caps do.
+
+### Why `Stats.health` no longer signals on intentional gate caps
+
+Older versions of `Stats.health` returned `:starvation` for any
+partition with stale `last_admitted_at` and `:backlog_aging` for any
+pending row > 5min, both of which lit up when a `:concurrency` gate
+hit its cap or a `:throttle` ran out of tokens. Operators paged on
+limits they had configured themselves.
+
+Current `health` returns:
+
+- `:ok` — no actionable issue.
+- `:rotation_lag` — at least one partition is LRU-lagged with no
+  gate at cap. Fixable via config.
+- `:inflight_drift` — admitted rows past their lease (workers
+  crashing faster than the reaper). Investigate workers / lower
+  `lease_duration`.
+
+Gate-induced backlog (concurrency at max, throttle exhausted,
+global_cap saturated) does **not** trigger `health`. Use the
+adapter's queue depth or your application-level metrics if you want
+to alert on those.
 
 ### Worked example: tuning for monitor checks
 
@@ -332,8 +390,10 @@ Setup: 50,000 monitors, each enqueues 1 check/min. Target latency
 Initial config (defaults): `batch_size=500, quantum=50, busy_sleep=0.05s`.
 
 After deploy, dashboard shows:
+- `Stats.health`: `:rotation_lag`.
+- `Stats.bottleneck("monitor_check_v2_job")[:diagnosis]`: `:rotation_lag`.
+- `Stats.bottleneck(...)[:stale_partitions]`: `{lru_lagged: 12_000, gate_blocked: 0}` (rotation, not gates).
 - `oldest_pending_age_seconds`: 4 minutes (FAIL — over budget).
-- `stale_partitions_60s`: 12,000 (most monitors not seeing rotation).
 - `tick.dispatch_policy.duration` p95: 80ms.
 - `pending`: 1,200, growing slowly.
 
