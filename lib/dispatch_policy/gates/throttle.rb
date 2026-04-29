@@ -3,6 +3,8 @@
 module DispatchPolicy
   module Gates
     class Throttle < Gate
+      attr_reader :rate, :per, :burst
+
       def configure(rate:, per:, burst: nil)
         @rate  = rate
         @per   = per

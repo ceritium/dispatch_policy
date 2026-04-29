@@ -3,6 +3,8 @@
 module DispatchPolicy
   module Gates
     class Concurrency < Gate
+      attr_reader :max
+
       def configure(max:)
         @max = max
       end
