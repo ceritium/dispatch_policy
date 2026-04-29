@@ -287,17 +287,42 @@ are listed in order of "try first" → "last resort".
 
 ### Single-number SLOs
 
-- **Latency SLO**: `oldest_pending_age_seconds`. Alert above your
-  freshness budget (e.g. 60s for monitor checks, 5s for webhooks).
-- **Fairness SLO**: `stale_partitions_60s` (or 300s). Should hover
-  near 0; > 0 means at least one tenant waited longer than the
-  threshold for its turn.
-- **Throughput**: `tick.dispatch_policy` `admitted` × tick rate
-  (visible from event timestamps). Multiply by `batch_size /
-  duration` for theoretical max.
-- **Capacity**: `active_partitions / config.batch_size`. If > 1,
-  fairness is rotational (some tenants wait); if < 1, you have
-  headroom.
+`Stats.slo(policy_name, **budgets)` returns the four canonical
+signals with the operator's budgets attached and a verdict where
+applicable:
+
+```ruby
+DispatchPolicy::Stats.slo("monitor_check_v2_job",
+  latency_budget_seconds:     60,
+  fairness_threshold_seconds: 60,
+  throughput_window_seconds:  60)
+# => {
+#   policy_name: "monitor_check_v2_job",
+#   latency:    { seconds: 0.83, budget: 60, ok: true },
+#   fairness:   { stale_partitions: 0, threshold: 60, ok: true },
+#   throughput: { admissions_per_sec: 41.2, window_seconds: 60 },
+#   capacity:   { active_partitions: 540, batch_size: 500,
+#                 utilization: 1.08, headroom: false }
+# }
+```
+
+`Stats.slos(**budgets)` returns one Hash per registered policy,
+suitable for a JSON endpoint or a periodic scrape.
+
+What each signal means:
+
+- **Latency** — `oldest_pending_age_seconds` against your freshness
+  budget. The single most important SLO. Alert when `ok: false`.
+- **Fairness** — count of active partitions whose last admission
+  (or first stage, for never-admitted ones) is older than the
+  threshold. `ok: true` ⇔ no rotational starvation.
+- **Throughput** — admissions per second over a rolling window. No
+  `ok:` flag because only you know your ingress rate; alert when
+  `admissions_per_sec < your enqueue_rate × safety_factor`.
+- **Capacity** — `active_partitions / batch_size`. `headroom: true`
+  when batch can hold every active partition this tick (no rotation
+  needed). When `false`, you're rotating and the fairness SLO
+  becomes the operative constraint.
 
 ### Worked example: tuning for monitor checks
 

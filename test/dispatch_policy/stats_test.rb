@@ -63,6 +63,54 @@ module DispatchPolicy
       assert_equal :ok, Stats.health
     end
 
+    test "slo returns the four canonical signals with budgets and verdicts" do
+      policy_name = StatsJob.resolved_dispatch_policy.name
+      3.times { |i| StatsJob.perform_later("p#{i}") }
+
+      slo = Stats.slo(policy_name,
+        latency_budget_seconds:     60,
+        fairness_threshold_seconds: 60,
+        throughput_window_seconds:  60)
+
+      assert_equal policy_name, slo[:policy_name]
+
+      assert_includes slo[:latency].keys, :seconds
+      assert_equal 60, slo[:latency][:budget]
+      assert slo[:latency][:ok], "fresh seed should be within latency budget"
+
+      assert_equal 0, slo[:fairness][:stale_partitions]
+      assert_equal 60, slo[:fairness][:threshold]
+      assert slo[:fairness][:ok]
+
+      assert_kind_of Float, slo[:throughput][:admissions_per_sec]
+      assert_equal 60, slo[:throughput][:window_seconds]
+
+      assert_equal 3, slo[:capacity][:active_partitions]
+      assert slo[:capacity][:headroom], "3 partitions < default batch_size means headroom"
+    end
+
+    test "slo flips latency.ok when oldest pending exceeds budget" do
+      policy_name = StatsJob.resolved_dispatch_policy.name
+      StatsJob.perform_later("p0")
+      StagedJob.where(policy_name: policy_name).update_all(staged_at: 5.minutes.ago)
+
+      slo = Stats.slo(policy_name, latency_budget_seconds: 60)
+      assert_not slo[:latency][:ok], "5min-old pending should breach 60s budget"
+      assert_operator slo[:latency][:seconds], :>, 60
+    end
+
+    test "slo flips fairness.ok when a partition is stale beyond threshold" do
+      policy_name = StatsJob.resolved_dispatch_policy.name
+      StatsJob.perform_later("p0")
+      PartitionState.where(policy_name: policy_name).update_all(
+        last_admitted_at: 1.hour.ago, pending_count: 1
+      )
+
+      slo = Stats.slo(policy_name, fairness_threshold_seconds: 60)
+      assert_not slo[:fairness][:ok]
+      assert_equal 1, slo[:fairness][:stale_partitions]
+    end
+
     test "Tick.run emits tick.dispatch_policy notification with payload" do
       policy_name = StatsJob.resolved_dispatch_policy.name
       StatsJob.perform_later("p0")
