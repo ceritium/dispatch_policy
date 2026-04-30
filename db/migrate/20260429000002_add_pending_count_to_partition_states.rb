@@ -37,7 +37,13 @@ class AddPendingCountToPartitionStates < ActiveRecord::Migration[7.1]
     # see them and they'd never be admitted via round-robin until a
     # fresh stage_many! call re-populated their partition state.
     # ON CONFLICT clause makes this safe to re-run.
-    execute <<~SQL.squish
+    #
+    # Wrapped in safety_assured so strong_migrations (which can't
+    # introspect raw SQL) doesn't block the migration in host apps.
+    # Falls back to a plain execute when strong_migrations isn't
+    # loaded — the helper defines safety_assured at the migration
+    # level, not as a global, so we guard with respond_to?.
+    backfill_sql = <<~SQL.squish
       INSERT INTO dispatch_policy_partition_states
         (policy_name, partition_key, pending_count, last_admitted_at, created_at, updated_at)
       SELECT
@@ -57,6 +63,12 @@ class AddPendingCountToPartitionStates < ActiveRecord::Migration[7.1]
         pending_count = dispatch_policy_partition_states.pending_count + EXCLUDED.pending_count,
         updated_at    = EXCLUDED.updated_at
     SQL
+
+    if respond_to?(:safety_assured)
+      safety_assured { execute(backfill_sql) }
+    else
+      execute(backfill_sql)
+    end
   end
 
   def down
