@@ -27,6 +27,19 @@ module DispatchPolicy
       @expired_leases    = StagedJob.expired_leases.count
       @tick_perf_window  = tick_perf_window
       @tick_perf         = Stats.tick_runs(window: @tick_perf_window)
+
+      # Live SLO snapshot per policy: latency, fairness (LRU vs
+      # gate-blocked split), capacity utilization, plus the
+      # bottleneck diagnosis and concrete recommended_config so the
+      # operator can see what to tune at a glance.
+      @health = Stats.health
+      @slos   = DispatchPolicy.registry.keys.map do |name|
+        slo = Stats.slo(name)
+        slo.merge(
+          policy_name: name,
+          bottleneck:  Stats.bottleneck(name)
+        )
+      end
     end
 
     def show

@@ -1,0 +1,75 @@
+<%
+  fmt_ms = ->(v) { v.nil? ? "—" : "#{v.round(1)}s" }
+  health_ok = health == :ok
+%>
+
+<div class="live-stats-panel">
+  <div class="live-stats-header">
+    <h2>SLOs &amp; bottlenecks</h2>
+    <span class="health-banner <%= health_ok ? "ok" : "bad" %>">health: <%= health %></span>
+  </div>
+
+  <% if slos.empty? %>
+    <p class="muted">No policies registered.</p>
+  <% else %>
+    <div class="slo-grid">
+      <div class="h">Policy</div>
+      <div class="h">Latency</div>
+      <div class="h">Fairness (lru / gated)</div>
+      <div class="h">Capacity (active/batch)</div>
+      <div class="h">Diagnosis</div>
+
+      <% slos.each do |s| %>
+        <%
+          fair = s[:fairness]
+          cap  = s[:capacity]
+          bn   = s[:bottleneck] || {}
+          lat  = s[:latency]
+        %>
+        <div class="cell"><%= link_to(content_tag(:code, s[:policy_name]), policy_path(policy_name: s[:policy_name])) %></div>
+
+        <div class="cell">
+          <span class="slo-pill <%= lat[:ok] ? "ok" : "bad" %>"><%= fmt_ms.call(lat[:seconds]) %></span>
+          <span class="muted">/ <%= lat[:budget] %>s</span>
+        </div>
+
+        <div class="cell">
+          <% if bn[:applicable] == false %>
+            <span class="slo-pill info">—</span>
+            <span class="muted">no round_robin</span>
+          <% else %>
+            <% lru = fair[:stale_partitions].to_i; gated = fair[:gate_blocked].to_i %>
+            <span class="slo-pill <%= lru.zero? ? "ok" : "bad" %>"><%= lru %> lru</span>
+            <span class="muted">/</span>
+            <span class="slo-pill info"><%= gated %> gated</span>
+          <% end %>
+        </div>
+
+        <div class="cell">
+          <span class="slo-pill info"><%= cap[:active_partitions] %>/<%= cap[:batch_size] %></span>
+          <% unless cap[:headroom] %>
+            <span class="slo-pill bad">rotating</span>
+          <% end %>
+        </div>
+
+        <div class="cell">
+          <% if bn[:applicable] && bn[:diagnosis] && bn[:diagnosis] != :ok %>
+            <span class="slo-pill bad"><%= bn[:diagnosis] %></span>
+            <% rec = bn[:recommended_config] || {} %>
+            <% if rec.any? %>
+              <div class="rec-list">
+                <% rec.each do |knob, vals| %>
+                  <div><code><%= knob %></code>: <%= vals[:current] %> → <strong><%= vals[:suggested] %></strong></div>
+                <% end %>
+              </div>
+            <% end %>
+          <% elsif bn[:applicable] == false %>
+            <span class="muted">—</span>
+          <% else %>
+            <span class="slo-pill ok">ok</span>
+          <% end %>
+        </div>
+      <% end %>
+    </div>
+  <% end %>
+</div>

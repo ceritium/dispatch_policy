@@ -3,6 +3,8 @@
       tick_perf_window: @tick_perf_window,
       base_params:      {} %>
 
+<%= render "live_stats", slos: @slos, health: @health %>
+
 <h1>DispatchPolicy</h1>
 <p class="muted">Admission-control policies registered in this app.</p>
 
