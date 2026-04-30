@@ -57,6 +57,9 @@ module DispatchPolicy
         flush_samples!(buffer) if buffer.size >= SAMPLE_FLUSH_BATCH
       end
 
+      auto_tune_interval = DispatchPolicy.config.auto_tune_interval_seconds.to_f
+      last_auto_tune     = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+
       begin
         loop do
           break if stop_when.call
@@ -69,6 +72,18 @@ module DispatchPolicy
           rescue StandardError => e
             Rails.logger&.error("[DispatchPolicy] tick error: #{e.class}: #{e.message}")
             Rails.error.report(e, handled: true) if defined?(Rails) && Rails.respond_to?(:error)
+          end
+
+          # Periodic re-tune so bottlenecks that develop mid-loop
+          # get applied without waiting for the next TickLoop spawn.
+          # Skipped when auto_tune_interval_seconds <= 0 — the at-
+          # boot run is then the only tune pass.
+          if auto_tune_interval.positive?
+            now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+            if now - last_auto_tune >= auto_tune_interval
+              maybe_auto_tune!(policy_name)
+              last_auto_tune = now
+            end
           end
 
           break if stop_when.call

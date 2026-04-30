@@ -24,6 +24,7 @@ module DispatchPolicy
     :allowed_adapters,
     :policy_config_source,
     :auto_tune,
+    :auto_tune_interval_seconds,
     keyword_init: true
   )
 
@@ -92,13 +93,20 @@ module DispatchPolicy
       #           is the canonical source of truth.
       policy_config_source:  :db,
       # Closed-loop self-tuning. When :apply, the TickLoop calls
-      # Stats.bottleneck for each round-robin policy at boot and
-      # persists the recommended_config knobs (batch_size,
+      # Stats.bottleneck for each round-robin policy and persists
+      # the recommended_config knobs (batch_size,
       # round_robin_quantum) to the DB-backed table with
       # source: "auto". The next reload picks them up. Set to
       # :recommend to log recommendations without writing, or false
       # to disable.
-      auto_tune:             false
+      auto_tune:             false,
+      # How often (seconds) the running TickLoop re-runs auto-tune
+      # in the body of its loop. Without this, auto-tune would only
+      # fire at TickLoop boot — bottlenecks that develop mid-run
+      # wouldn't get applied until the next spawn. 30s is a good
+      # tradeoff between reactivity and DB chatter; raise it if you
+      # have many policies and want fewer Stats.bottleneck queries.
+      auto_tune_interval_seconds: 30
     )
   end
 
