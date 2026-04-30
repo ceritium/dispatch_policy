@@ -171,6 +171,32 @@ module DispatchPolicy
       assert_nil PolicyConfig.find_by(policy_name: @policy_name, config_key: "round_robin_quantum")
     end
 
+    test "per-policy auto_tune :apply wins over global false" do
+      DispatchPolicy.config.auto_tune = false
+      LiveTunedJob.resolved_dispatch_policy.auto_tune :apply
+      stage_lru_lagged_partitions
+
+      TickLoop.maybe_auto_tune!(@policy_name)
+
+      row = PolicyConfig.find_by(policy_name: @policy_name, config_key: "round_robin_quantum")
+      refute_nil row, "policy-level :apply should still write recommendations"
+      assert_equal "auto", row.source
+    ensure
+      LiveTunedJob.resolved_dispatch_policy.instance_variable_set(:@override_auto_tune, nil)
+    end
+
+    test "per-policy auto_tune false disables it even when global is :apply" do
+      DispatchPolicy.config.auto_tune = :apply
+      LiveTunedJob.resolved_dispatch_policy.auto_tune false
+      stage_lru_lagged_partitions
+
+      TickLoop.maybe_auto_tune!(@policy_name)
+
+      assert_nil PolicyConfig.find_by(policy_name: @policy_name, config_key: "round_robin_quantum")
+    ensure
+      LiveTunedJob.resolved_dispatch_policy.instance_variable_set(:@override_auto_tune, nil)
+    end
+
     test "TickLoop.maybe_auto_tune! false is a no-op" do
       DispatchPolicy.config.auto_tune = false
 

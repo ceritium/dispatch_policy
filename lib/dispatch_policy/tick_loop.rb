@@ -123,11 +123,18 @@ module DispatchPolicy
     # (source: "auto"). The next reload_policy_configs! picks them
     # up. :recommend logs without writing; false is a no-op.
     def self.maybe_auto_tune!(policy_name)
-      mode = DispatchPolicy.config.auto_tune
-      return unless mode
-
       names = policy_name ? [ policy_name ] : DispatchPolicy.registry.keys
       names.each do |name|
+        job_class = DispatchPolicy.registry[name]
+        policy    = job_class&.resolved_dispatch_policy
+        next unless policy
+
+        # Per-policy override wins over the global flag, and a
+        # policy-level `false` disables auto-tune even when the
+        # global is :apply.
+        mode = policy.effective_auto_tune
+        next unless mode
+
         result = Stats.bottleneck(name)
         recommended = result[:recommended_config]
         next if recommended.nil? || recommended.empty?
@@ -140,8 +147,7 @@ module DispatchPolicy
             values:      flat,
             source:      "auto"
           )
-          job_class = DispatchPolicy.registry[name]
-          job_class&.resolved_dispatch_policy&.reload_overrides_from_db!
+          policy.reload_overrides_from_db!
           Rails.logger&.info("[DispatchPolicy] auto_tune applied to #{name}: #{flat.inspect}")
         else
           Rails.logger&.info("[DispatchPolicy] auto_tune recommends for #{name}: #{flat.inspect}")

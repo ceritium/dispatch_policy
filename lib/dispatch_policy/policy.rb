@@ -21,6 +21,10 @@ module DispatchPolicy
       @override_round_robin_quantum                 = nil
       @override_round_robin_max_partitions_per_tick = nil
       @override_lease_duration                      = nil
+      # Per-policy auto_tune override. nil falls back to
+      # DispatchPolicy.config.auto_tune. Accepts the same values
+      # as the global flag: false | :recommend | :apply.
+      @override_auto_tune                           = nil
       instance_eval(&block) if block
       DispatchPolicy.registry[@name] = job_class
     end
@@ -103,6 +107,21 @@ module DispatchPolicy
       @override_lease_duration = value
     end
 
+    # Auto-tune mode override at the policy level. Accepts:
+    #   false      — disable for this policy regardless of global setting
+    #   :recommend — log recommendations only
+    #   :apply     — write Stats.bottleneck recommendations to the DB
+    #
+    # When set to nil (or never declared), falls back to
+    # DispatchPolicy.config.auto_tune.
+    def auto_tune(value = NIL_DEFAULT)
+      return effective_auto_tune if value.equal?(NIL_DEFAULT)
+      unless [ false, nil, :recommend, :apply ].include?(value)
+        raise ArgumentError, "auto_tune must be false, :recommend or :apply (got #{value.inspect})"
+      end
+      @override_auto_tune = value
+    end
+
     def effective_batch_size
       @override_batch_size || DispatchPolicy.config.batch_size
     end
@@ -119,6 +138,14 @@ module DispatchPolicy
 
     def effective_lease_duration
       @override_lease_duration || DispatchPolicy.config.lease_duration
+    end
+
+    # Resolve auto_tune. The policy-level override wins (including
+    # `false` to disable for this policy specifically) — only fall
+    # back to the global flag when no override was declared.
+    def effective_auto_tune
+      return @override_auto_tune unless @override_auto_tune.nil?
+      DispatchPolicy.config.auto_tune
     end
 
     # Reports which knobs are overridden vs inheriting global defaults.
