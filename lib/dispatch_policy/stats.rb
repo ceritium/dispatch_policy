@@ -242,6 +242,85 @@ module DispatchPolicy
       :ok
     end
 
+    # Aggregated TickLoop performance over the last `window` seconds.
+    # Reads from dispatch_policy_tick_runs (populated in batches by
+    # TickLoop). Returns p50/p95/p99 of duration_ms, total ticks,
+    # admitted, partitions, and error/decline counts. Use to drive a
+    # performance dashboard or detect deploys that slowed the loop.
+    #
+    #   DispatchPolicy::Stats.tick_runs(window: 60)
+    #   # => {
+    #   #   ticks: 312,
+    #   #   admitted: 4_280,
+    #   #   partitions: 1_205,
+    #   #   p50_ms: 12.4,
+    #   #   p95_ms: 34.8,
+    #   #   p99_ms: 78.1,
+    #   #   max_ms: 142.0,
+    #   #   errored: 0,
+    #   #   declined: 1,
+    #   #   per_policy: { "send_webhook_job" => { ticks: 312, ...}, ... }
+    #   # }
+    def tick_runs(window: 300, policy_name: nil)
+      scope = TickRun.where("started_at > ?", window.seconds.ago)
+      scope = scope.where(policy_name: policy_name) if policy_name
+
+      rows = scope.pluck(:policy_name, :duration_ms, :admitted, :partitions,
+                         :declined, :error_class)
+
+      overall = aggregate_tick_rows(rows)
+
+      per_policy = rows.group_by { |r| r[0] }.transform_values do |group|
+        aggregate_tick_rows(group)
+      end
+
+      overall.merge(window_seconds: window, per_policy: per_policy)
+    end
+
+    def aggregate_tick_rows(rows)
+      ticks = rows.size
+      return blank_tick_summary(ticks) if ticks.zero?
+
+      durations = rows.map { |r| r[1].to_f }.sort
+      admitted   = rows.sum { |r| r[2].to_i }
+      partitions = rows.sum { |r| r[3].to_i }
+      declined   = rows.count { |r| r[4] }
+      errored    = rows.count { |r| r[5].present? }
+
+      {
+        ticks:      ticks,
+        admitted:   admitted,
+        partitions: partitions,
+        p50_ms:     percentile(durations, 0.5),
+        p95_ms:     percentile(durations, 0.95),
+        p99_ms:     percentile(durations, 0.99),
+        max_ms:     durations.last.round(2),
+        errored:    errored,
+        declined:   declined
+      }
+    end
+    private_class_method :aggregate_tick_rows
+
+    def blank_tick_summary(ticks)
+      {
+        ticks: ticks, admitted: 0, partitions: 0,
+        p50_ms: nil, p95_ms: nil, p99_ms: nil, max_ms: nil,
+        errored: 0, declined: 0
+      }
+    end
+    private_class_method :blank_tick_summary
+
+    # Linear-interpolation percentile on a pre-sorted array. We only
+    # call this with ticks > 0, so no nil branch needed here.
+    def percentile(sorted, q)
+      return sorted.first.round(2) if sorted.size == 1
+      idx = (sorted.size - 1) * q
+      lo  = sorted[idx.floor]
+      hi  = sorted[idx.ceil]
+      (lo + (hi - lo) * (idx - idx.floor)).round(2)
+    end
+    private_class_method :percentile
+
     # ─── Internal helpers ─────────────────────────────────────────
 
     # Returns { stale_partitions: int, gate_blocked: int, ok: bool }.
