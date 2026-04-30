@@ -81,8 +81,13 @@ module DispatchPolicy
         .order(:priority, :staged_at)
         .limit(50)
 
+      # TickLoop normally runs in "all-policies" mode (one tick admits
+      # from every policy in a single TX), so per-policy filtering
+      # would return 0 samples even though the loop is healthy. Show
+      # the aggregate — it's the engine's perf, not the policy's, and
+      # that's still the right diagnostic on a per-policy page.
       @tick_perf_window = tick_perf_window
-      @tick_perf        = Stats.tick_runs(window: @tick_perf_window, policy_name: @policy_name)
+      @tick_perf        = Stats.tick_runs(window: @tick_perf_window)
     end
 
     private
