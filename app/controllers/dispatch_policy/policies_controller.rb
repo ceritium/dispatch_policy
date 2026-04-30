@@ -5,6 +5,7 @@ module DispatchPolicy
     STALE_PENDING_THRESHOLD = 1.hour
     PARTITION_LIST_PAGE_SIZE = 25
 
+    before_action :reload_policies_from_db
     before_action :load_policy, only: :show
 
     def index
@@ -95,6 +96,23 @@ module DispatchPolicy
     end
 
     private
+
+    # Each process (Puma vs GoodJob worker) has its own in-memory
+    # @override_* on Policy. Without this, the admin shows whatever
+    # config was loaded at boot — stale relative to what auto_tune
+    # / the UI may have written from another process. Reloading
+    # before the request paints from the same source of truth that
+    # the next TickLoop spawn will use.
+    def reload_policies_from_db
+      DispatchPolicy.registry.each_value do |job_class|
+        policy = job_class.resolved_dispatch_policy
+        policy&.reload_overrides_from_db!
+      end
+    rescue ActiveRecord::StatementInvalid,
+           ActiveRecord::ConnectionNotEstablished,
+           ActiveRecord::NoDatabaseError
+      # Migration not run yet — show what's in memory.
+    end
 
     # Build a per-policy snapshot of effective config + source-of-
     # value (default / code DSL / DB row) + auto_tune mode. Used by
