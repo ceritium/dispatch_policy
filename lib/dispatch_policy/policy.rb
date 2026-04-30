@@ -14,6 +14,13 @@ module DispatchPolicy
       @round_robin_builder = nil
       @round_robin_weight  = :equal
       @round_robin_window  = 60
+      # Per-policy config overrides. nil means "fall back to
+      # DispatchPolicy.config.X". Set inside the dispatch_policy block
+      # via the DSL methods of the same name (without override_).
+      @override_batch_size                          = nil
+      @override_round_robin_quantum                 = nil
+      @override_round_robin_max_partitions_per_tick = nil
+      @override_lease_duration                      = nil
       instance_eval(&block) if block
       DispatchPolicy.registry[@name] = job_class
     end
@@ -71,6 +78,62 @@ module DispatchPolicy
       key = @round_robin_builder.call(arguments)
       key.nil? || key.to_s.empty? ? nil : key.to_s
     end
+
+    # Per-policy config overrides — DSL inside the dispatch_policy block.
+    # Each setter accepts a value; the matching effective_X reader
+    # returns the override or falls back to DispatchPolicy.config.
+
+    def batch_size(value = NIL_DEFAULT)
+      return effective_batch_size if value.equal?(NIL_DEFAULT)
+      @override_batch_size = value
+    end
+
+    def round_robin_quantum(value = NIL_DEFAULT)
+      return effective_round_robin_quantum if value.equal?(NIL_DEFAULT)
+      @override_round_robin_quantum = value
+    end
+
+    def round_robin_max_partitions_per_tick(value = NIL_DEFAULT)
+      return effective_round_robin_max_partitions_per_tick if value.equal?(NIL_DEFAULT)
+      @override_round_robin_max_partitions_per_tick = value
+    end
+
+    def lease_duration(value = NIL_DEFAULT)
+      return effective_lease_duration if value.equal?(NIL_DEFAULT)
+      @override_lease_duration = value
+    end
+
+    def effective_batch_size
+      @override_batch_size || DispatchPolicy.config.batch_size
+    end
+
+    def effective_round_robin_quantum
+      @override_round_robin_quantum || DispatchPolicy.config.round_robin_quantum
+    end
+
+    def effective_round_robin_max_partitions_per_tick
+      @override_round_robin_max_partitions_per_tick ||
+        DispatchPolicy.config.round_robin_max_partitions_per_tick ||
+        effective_batch_size
+    end
+
+    def effective_lease_duration
+      @override_lease_duration || DispatchPolicy.config.lease_duration
+    end
+
+    # Reports which knobs are overridden vs inheriting global defaults.
+    # Useful for Stats and operator visibility.
+    def config_overrides
+      {
+        batch_size:                          @override_batch_size,
+        round_robin_quantum:                 @override_round_robin_quantum,
+        round_robin_max_partitions_per_tick: @override_round_robin_max_partitions_per_tick,
+        lease_duration:                      @override_lease_duration
+      }.compact
+    end
+
+    NIL_DEFAULT = Object.new.freeze
+    private_constant :NIL_DEFAULT
 
     def gate(type, **opts)
       gate_class = DispatchPolicy::Gate.registry.fetch(type.to_sym) do

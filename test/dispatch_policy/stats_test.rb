@@ -160,6 +160,10 @@ module DispatchPolicy
       assert_equal 3, result[:stale_partitions][:lru_lagged]
       assert_equal :rotation_lag, result[:diagnosis]
       assert_includes result[:suggested_knobs], :round_robin_quantum
+
+      # Recommended config: concrete suggested value, not just knob name
+      assert_equal 1, result[:recommended_config][:round_robin_quantum][:suggested]
+      refute_nil result[:current_config][:batch_size]
     end
 
     class ThrottleRoundRobinJob < ActiveJob::Base

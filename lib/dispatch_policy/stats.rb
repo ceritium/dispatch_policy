@@ -161,29 +161,60 @@ module DispatchPolicy
       active       = PartitionState.where(policy_name: policy_name)
                                    .where("pending_count > 0").count
 
-      diagnosis, knobs =
+      current_batch_size = policy.effective_batch_size
+      current_quantum    = policy.effective_round_robin_quantum
+      current_cap        = policy.effective_round_robin_max_partitions_per_tick
+
+      diagnosis, knobs, recommended =
         if lru_lagged.zero?
-          [ :ok, [] ]
-        elsif active > DispatchPolicy.config.batch_size
+          [ :ok, [], {} ]
+        elsif active > current_batch_size
+          # More active partitions than fit in one tick — widen the
+          # batch first, then drop quantum to make every plucked
+          # partition contribute.
+          recommended_batch = [ next_size_step(active), 5_000 ].min
           [
             :capacity_strain,
-            %i[batch_size tick_sleep_busy round_robin_max_partitions_per_tick sharding]
+            %i[batch_size round_robin_quantum round_robin_max_partitions_per_tick],
+            {
+              batch_size:          { current: current_batch_size, suggested: recommended_batch },
+              round_robin_quantum: { current: current_quantum,    suggested: 1 }
+            }
           ]
         else
+          # Active partitions fit but rotation isn't reaching them all.
+          # Lower quantum is the cleanest knob.
           [
             :rotation_lag,
-            %i[round_robin_quantum round_robin_max_partitions_per_tick]
+            %i[round_robin_quantum round_robin_max_partitions_per_tick],
+            {
+              round_robin_quantum: { current: current_quantum, suggested: 1 }
+            }
           ]
         end
 
       {
-        policy_name:      policy_name,
-        applicable:       true,
-        stale_partitions: { gate_blocked: gate_blocked, lru_lagged: lru_lagged },
-        diagnosis:        diagnosis,
-        suggested_knobs:  knobs
+        policy_name:        policy_name,
+        applicable:         true,
+        stale_partitions:   { gate_blocked: gate_blocked, lru_lagged: lru_lagged },
+        diagnosis:          diagnosis,
+        suggested_knobs:    knobs,
+        recommended_config: recommended,
+        current_config:     {
+          batch_size:                          current_batch_size,
+          round_robin_quantum:                 current_quantum,
+          round_robin_max_partitions_per_tick: current_cap,
+          lease_duration:                      policy.effective_lease_duration
+        }
       }
     end
+
+    # Round `n` up to the next sensible "operator value": 100, 200, 500,
+    # 1000, 2000, 5000. Avoids suggestions like batch_size=237.
+    def next_size_step(n)
+      [ 100, 200, 500, 1000, 2000, 5000 ].find { |v| v >= n } || 5_000
+    end
+    private_class_method :next_size_step
 
     # Coarse health signal: returns :ok or a Symbol describing the
     # first dispatch_policy-tunable concern. Intentional gate caps

@@ -262,7 +262,7 @@ module DispatchPolicy
         .where(policy_name: policy.name)
         .where("not_before_at IS NULL OR not_before_at <= ?", Time.current)
         .order(:priority, :staged_at)
-        .limit(DispatchPolicy.config.batch_size)
+        .limit(policy.effective_batch_size)
         .lock("FOR UPDATE SKIP LOCKED")
         .to_a
     end
@@ -282,8 +282,7 @@ module DispatchPolicy
     # value that keeps the LATERAL inner full when quantum ≥ 1.
     # Override via config.round_robin_max_partitions_per_tick.
     def self.pluck_active_partitions(policy, _now)
-      cap = DispatchPolicy.config.round_robin_max_partitions_per_tick ||
-            DispatchPolicy.config.batch_size
+      cap = policy.effective_round_robin_max_partitions_per_tick
 
       PartitionState
         .where(policy_name: policy.name)
@@ -294,8 +293,8 @@ module DispatchPolicy
     end
 
     def self.fetch_round_robin_batch(policy)
-      quantum    = DispatchPolicy.config.round_robin_quantum
-      batch_size = DispatchPolicy.config.batch_size
+      quantum    = policy.effective_round_robin_quantum
+      batch_size = policy.effective_batch_size
       now        = Time.current
 
       partitions = pluck_active_partitions(policy, now)
@@ -392,7 +391,7 @@ module DispatchPolicy
     DEFAULT_TIME_SHARE_DURATION_MS = 100
 
     def self.fetch_time_weighted_batch(policy)
-      batch_size = DispatchPolicy.config.batch_size
+      batch_size = policy.effective_batch_size
       now        = Time.current
 
       partitions = pluck_active_partitions(policy, now)
@@ -473,7 +472,7 @@ module DispatchPolicy
       return [] if survivors.empty?
 
       now           = Time.current
-      lease_expires = now + DispatchPolicy.config.lease_duration
+      lease_expires = now + policy.effective_lease_duration
       gate_index    = policy.gates.each_with_object({}) { |g, h| h[g.name.to_s] = g }
 
       staged_updates  = []
