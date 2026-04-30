@@ -1,0 +1,76 @@
+<%
+  # Helper: pill style per source label.
+  source_class = ->(s) {
+    case s
+    when "auto"            then "src-auto"
+    when "ui"              then "src-ui"
+    when "code"            then "src-code"
+    when "code (in-memory)" then "src-code"
+    else                        "src-default"
+    end
+  }
+
+  auto_tune_class = ->(mode) {
+    case mode
+    when :apply     then "auto-apply"
+    when :recommend then "auto-recommend"
+    else                 "auto-off"
+    end
+  }
+  auto_tune_label = ->(mode) {
+    case mode
+    when :apply     then "apply"
+    when :recommend then "recommend"
+    when false, nil then "off"
+    else mode.to_s
+    end
+  }
+
+  show_link = local_assigns[:show_link] != false
+%>
+
+<div class="config-panel">
+  <h2>Config &amp; auto-tune</h2>
+
+  <% if policy_configs.empty? %>
+    <p class="muted">No policies registered.</p>
+  <% else %>
+    <table class="config-table">
+      <thead>
+        <tr>
+          <th>Policy</th>
+          <th>Auto-tune</th>
+          <% DispatchPolicy::PolicyConfig::KNOWN_KEYS.each do |k| %>
+            <th class="text-end"><%= k %></th>
+          <% end %>
+        </tr>
+      </thead>
+      <tbody>
+        <% policy_configs.each do |row| %>
+          <tr>
+            <td>
+              <% if show_link %>
+                <%= link_to(content_tag(:code, row[:policy_name]), policy_path(policy_name: row[:policy_name])) %>
+              <% else %>
+                <code><%= row[:policy_name] %></code>
+              <% end %>
+            </td>
+            <td>
+              <span class="auto-tune-pill <%= auto_tune_class.call(row[:auto_tune]) %>"
+                    title="from <%= row[:auto_tune_source] %>">
+                <%= auto_tune_label.call(row[:auto_tune]) %>
+              </span>
+              <span class="muted" style="font-size: 0.75em;">(<%= row[:auto_tune_source] %>)</span>
+            </td>
+            <% row[:config].each do |c| %>
+              <td class="text-end">
+                <strong><%= c[:value] %></strong>
+                <div class="src-pill <%= source_class.call(c[:source]) %>"><%= c[:source] %></div>
+              </td>
+            <% end %>
+          </tr>
+        <% end %>
+      </tbody>
+    </table>
+  <% end %>
+</div>

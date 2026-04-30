@@ -40,6 +40,8 @@ module DispatchPolicy
           bottleneck:  Stats.bottleneck(name)
         )
       end
+
+      @policy_configs = build_policy_configs
     end
 
     def show
@@ -88,9 +90,63 @@ module DispatchPolicy
       # that's still the right diagnostic on a per-policy page.
       @tick_perf_window = tick_perf_window
       @tick_perf        = Stats.tick_runs(window: @tick_perf_window)
+
+      @policy_config = build_policy_configs(@policy_name).first
     end
 
     private
+
+    # Build a per-policy snapshot of effective config + source-of-
+    # value (default / code DSL / DB row) + auto_tune mode. Used by
+    # the Config panel on the index and show pages.
+    def build_policy_configs(only_name = nil)
+      keys  = PolicyConfig::KNOWN_KEYS
+      names = only_name ? [ only_name ] : DispatchPolicy.registry.keys
+
+      # One query for all DB-stored sources so the index doesn't issue
+      # N round-trips when there are many policies.
+      db_rows = PolicyConfig.where(policy_name: names)
+        .pluck(:policy_name, :config_key, :value, :source)
+        .each_with_object({}) { |(pn, k, v, s), h| h[[ pn, k ]] = { value: v, source: s } }
+
+      names.map do |name|
+        job_class = DispatchPolicy.registry[name]
+        policy    = job_class&.resolved_dispatch_policy
+        next unless policy
+
+        rows = keys.map do |key|
+          db    = db_rows[[ name, key.to_s ]]
+          override = policy.config_overrides[key]
+          # Source precedence:
+          # - "auto" / "ui" / "code" come from the DB row's source field
+          # - "code (in-memory)" if there's a Ruby override but no DB row
+          #   (policy_config_source = :db hasn't run reload yet)
+          # - "default" if neither override nor DB row exist
+          source =
+            if db
+              db[:source]
+            elsif override
+              "code (in-memory)"
+            else
+              "default"
+            end
+          {
+            key:     key,
+            value:   policy.public_send("effective_#{key}"),
+            source:  source,
+            db_value: db && db[:value]
+          }
+        end
+
+        {
+          policy_name: name,
+          config:      rows,
+          auto_tune:   policy.effective_auto_tune,
+          # Distinguish "policy declared it" from "fell back to global"
+          auto_tune_source: policy.instance_variable_get(:@override_auto_tune).nil? ? "global" : "policy"
+        }
+      end.compact
+    end
 
     # Window in seconds for the TickLoop perf widget. Configurable via
     # ?window= so an operator investigating a regression can widen

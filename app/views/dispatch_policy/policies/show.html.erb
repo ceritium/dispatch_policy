@@ -207,6 +207,12 @@
   <% end %>
 </turbo-frame>
 
+<% if @policy_config %>
+  <%= render "policy_configs",
+        policy_configs: [ @policy_config ],
+        show_link:      false %>
+<% end %>
+
 <h2>Throttle buckets</h2>
 <% if @throttle_buckets.empty? %>
   <p class="muted">No throttle buckets yet.</p>
