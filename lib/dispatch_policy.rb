@@ -22,6 +22,8 @@ module DispatchPolicy
     :admin_partition_limit,
     :database_role,
     :allowed_adapters,
+    :policy_config_source,
+    :auto_tune,
     keyword_init: true
   )
 
@@ -76,7 +78,27 @@ module DispatchPolicy
       database_role:         nil,
       # Override the adapter allowlist if you know what you're doing.
       # Defaults to PG_BACKED_ADAPTERS + IN_PROCESS_ADAPTERS.
-      allowed_adapters:      nil
+      allowed_adapters:      nil,
+      # Source of truth for per-policy config overrides on TickLoop
+      # boot.
+      #   :db   — DB rows win. The Policy DSL still seeds rows on first
+      #           boot, but afterwards the live values in
+      #           dispatch_policy_policy_configs override the code DSL.
+      #           Use this when you want to tune at runtime via the
+      #           console / admin UI without redeploying.
+      #   :code — Code DSL wins. Every TickLoop boot mirrors the DSL
+      #           values back into the DB (source: "code"), erasing
+      #           any UI-driven changes. Use this when the DSL block
+      #           is the canonical source of truth.
+      policy_config_source:  :db,
+      # Closed-loop self-tuning. When :apply, the TickLoop calls
+      # Stats.bottleneck for each round-robin policy at boot and
+      # persists the recommended_config knobs (batch_size,
+      # round_robin_quantum) to the DB-backed table with
+      # source: "auto". The next reload picks them up. Set to
+      # :recommend to log recommendations without writing, or false
+      # to disable.
+      auto_tune:             false
     )
   end
 

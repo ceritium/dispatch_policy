@@ -135,6 +135,42 @@ module DispatchPolicy
     NIL_DEFAULT = Object.new.freeze
     private_constant :NIL_DEFAULT
 
+    # Reload @override_X ivars from the dispatch_policy_policy_configs
+    # table. Called by TickLoop at startup so cluster-wide tunes
+    # propagate within tick_max_duration without a redeploy.
+    #
+    # Behavior depends on DispatchPolicy.config.policy_config_source:
+    #   :db   — DB rows overwrite the in-memory DSL values.
+    #   :code — DSL values overwrite the DB rows (mirror back).
+    #
+    # Returns the Hash of overrides that ended up applied.
+    def reload_overrides_from_db!
+      mode = DispatchPolicy.config.policy_config_source || :db
+
+      if mode == :code
+        # Mirror current DSL values into the DB so the table reflects
+        # the canonical source. No-op if values already match.
+        DispatchPolicy::PolicyConfig.upsert_many!(
+          policy_name: @name,
+          values:      config_overrides,
+          source:      "code"
+        )
+        return config_overrides
+      end
+
+      DispatchPolicy::PolicyConfig.load_into(self)
+    end
+
+    # Persist the current in-memory overrides to the DB. Used by the
+    # console / admin UI when an operator tunes a knob at runtime.
+    def persist_overrides!(source: "ui")
+      DispatchPolicy::PolicyConfig.upsert_many!(
+        policy_name: @name,
+        values:      config_overrides,
+        source:      source
+      )
+    end
+
     def gate(type, **opts)
       gate_class = DispatchPolicy::Gate.registry.fetch(type.to_sym) do
         raise ArgumentError, "Unknown gate: #{type}. Known: #{DispatchPolicy::Gate.registry.keys}"
