@@ -88,6 +88,36 @@ module DispatchPolicy
         "light should be admitted more than heavy when heavy has burned 20s (got #{grouped.inspect})"
     end
 
+    test "weight: :time records observations by round_robin_key without any gates" do
+      # Regression: previously the around_perform callback only wrote
+      # PartitionObservation entries from job._dispatch_partitions, which
+      # is empty for a policy that has round_robin_by but no gates with
+      # partition_by. The result was that consumed_ms_by_partition saw
+      # nothing and the time-weighted fetch silently degraded to equal
+      # round-robin. We backfill an observation keyed by round_robin_key
+      # so the allocator gets data without a phantom gate.
+      DispatchPolicy.config.batch_size = 5
+      policy_name = TimeWeightedJob.resolved_dispatch_policy.name
+
+      TimeWeightedJob.perform_later("solo")
+      Tick.run(policy_name: policy_name)
+
+      staged = StagedJob.where(policy_name: policy_name).order(:id).last
+      job = ActiveJob::Base.deserialize(staged.arguments)
+      # Empty by design: the policy has no gates with partition_by, so
+      # _dispatch_partitions is {} and the gate-driven observation
+      # branch is skipped.
+      job._dispatch_partitions  = {}
+      job._dispatch_admitted_at = staged.admitted_at
+      job.perform_now
+
+      observed = PartitionObservation.where(
+        policy_name: policy_name, partition_key: "solo"
+      ).count
+      assert observed.positive?,
+        "expected at least one observation keyed by round_robin_key (solo)"
+    end
+
     test "weight: :time with a solo tenant fetches up to batch_size" do
       DispatchPolicy.config.batch_size = 25
 

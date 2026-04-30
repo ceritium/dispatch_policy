@@ -44,6 +44,7 @@ module DispatchPolicy
           duration_ms = ((Time.current - perform_start) * 1000).to_i
           policy_name = job.class.resolved_dispatch_policy&.name
 
+          policy = job.class.resolved_dispatch_policy
           if job._dispatch_partitions.present?
             DispatchPolicy::Tick.release(
               policy_name: policy_name,
@@ -53,7 +54,6 @@ module DispatchPolicy
             # Let adaptive gates update their AIMD state first; the
             # generic observation below then captures the resulting
             # current_max alongside lag + duration for the chart.
-            policy = job.class.resolved_dispatch_policy
             job._dispatch_partitions.each do |gate_name, partition_key|
               gate = policy&.gates&.find { |g| g.name == gate_name.to_sym }
               next unless gate.is_a?(DispatchPolicy::Gates::AdaptiveConcurrency)
@@ -81,6 +81,28 @@ module DispatchPolicy
               )
             end
           end
+
+          # Time-weighted round-robin reads PartitionObservation by
+          # round_robin_key. If no gate's partition_by produces that
+          # key (or the policy has no gates at all), the loop above
+          # never recorded one and weight: :time would silently fall
+          # back to equal round-robin. Backfill an observation here
+          # so the time-share allocator has data without forcing the
+          # operator to declare a "phantom" gate just to feed it.
+          if policy&.round_robin? && policy.round_robin_weight == :time
+            rr_key = policy.build_round_robin_key(job.arguments)
+            already_recorded = (job._dispatch_partitions || {}).values.include?(rr_key)
+            if rr_key && !already_recorded
+              DispatchPolicy::PartitionObservation.observe!(
+                policy_name:   policy_name,
+                partition_key: rr_key,
+                queue_lag_ms:  queue_lag_ms,
+                duration_ms:   duration_ms,
+                current_max:   nil
+              )
+            end
+          end
+
           DispatchPolicy::StagedJob.mark_completed_by_active_job_id(job.job_id)
         end
       end
