@@ -1,5 +1,4 @@
 <%
-  fmt_ms = ->(v) { v.nil? ? "—" : "#{v.round(1)}s" }
   health_ok = health == :ok
 %>
 
@@ -14,7 +13,6 @@
   <% else %>
     <div class="slo-grid">
       <div class="h">Policy</div>
-      <div class="h">Latency</div>
       <div class="h">Fairness (lru / gated)</div>
       <div class="h">Capacity (active/batch)</div>
       <div class="h">Diagnosis</div>
@@ -24,14 +22,8 @@
           fair = s[:fairness]
           cap  = s[:capacity]
           bn   = s[:bottleneck] || {}
-          lat  = s[:latency]
         %>
         <div class="cell"><%= link_to(content_tag(:code, s[:policy_name]), policy_path(policy_name: s[:policy_name])) %></div>
-
-        <div class="cell">
-          <span class="slo-pill <%= lat[:ok] ? "ok" : "bad" %>"><%= fmt_ms.call(lat[:seconds]) %></span>
-          <span class="muted">/ <%= lat[:budget] %>s</span>
-        </div>
 
         <div class="cell">
           <% if bn[:applicable] == false %>
