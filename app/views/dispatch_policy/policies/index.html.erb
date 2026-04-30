@@ -1,3 +1,8 @@
+<%= render "tick_perf",
+      tick_perf:        @tick_perf,
+      tick_perf_window: @tick_perf_window,
+      base_params:      {} %>
+
 <h1>DispatchPolicy</h1>
 <p class="muted">Admission-control policies registered in this app.</p>
 
@@ -11,11 +16,6 @@
     <div class="value"><%= @expired_leases %></div>
   </div>
 </div>
-
-<%= render "tick_perf",
-      tick_perf:        @tick_perf,
-      tick_perf_window: @tick_perf_window,
-      base_params:      {} %>
 
 <h2>Policies</h2>
 <% if @policies.empty? %>

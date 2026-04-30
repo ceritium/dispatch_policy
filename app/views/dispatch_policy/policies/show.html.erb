@@ -1,3 +1,9 @@
+<%= render "tick_perf",
+      tick_perf:        @tick_perf,
+      tick_perf_window: @tick_perf_window,
+      show_breakdown:   false,
+      base_params:      { policy_name: @policy_name } %>
+
 <p class="back"><%= link_to "← All policies", root_path %></p>
 <h1><%= @policy_name %> <small class="muted"><%= @job_class.name %></small></h1>
 
@@ -200,12 +206,6 @@
     <% end %>
   <% end %>
 </turbo-frame>
-
-<%= render "tick_perf",
-      tick_perf:        @tick_perf,
-      tick_perf_window: @tick_perf_window,
-      show_breakdown:   false,
-      base_params:      { policy_name: @policy_name } %>
 
 <h2>Throttle buckets</h2>
 <% if @throttle_buckets.empty? %>
