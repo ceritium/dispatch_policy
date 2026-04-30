@@ -12,6 +12,11 @@
   </div>
 </div>
 
+<%= render "tick_perf",
+      tick_perf:        @tick_perf,
+      tick_perf_window: @tick_perf_window,
+      base_params:      {} %>
+
 <h2>Policies</h2>
 <% if @policies.empty? %>
   <p class="muted">No policies registered yet.</p>

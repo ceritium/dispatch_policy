@@ -25,6 +25,8 @@ module DispatchPolicy
 
       @active_partitions = PartitionInflightCount.where("in_flight > 0").count
       @expired_leases    = StagedJob.expired_leases.count
+      @tick_perf_window  = tick_perf_window
+      @tick_perf         = Stats.tick_runs(window: @tick_perf_window)
     end
 
     def show
@@ -65,9 +67,23 @@ module DispatchPolicy
         .select(:id, :dedupe_key, :round_robin_key, :priority, :staged_at, :not_before_at)
         .order(:priority, :staged_at)
         .limit(50)
+
+      @tick_perf_window = tick_perf_window
+      @tick_perf        = Stats.tick_runs(window: @tick_perf_window, policy_name: @policy_name)
     end
 
     private
+
+    # Window in seconds for the TickLoop perf widget. Configurable via
+    # ?window= so an operator investigating a regression can widen
+    # the lens (e.g. 3600 = last hour) without leaving the page.
+    # Clamped to 60..86_400 so a malformed value can't crash the
+    # query planner with an absurd time range.
+    def tick_perf_window
+      raw = params[:window].to_i
+      raw = 300 if raw <= 0
+      raw.clamp(60, 86_400)
+    end
 
     def load_policy
       @policy_name = params[:policy_name]
