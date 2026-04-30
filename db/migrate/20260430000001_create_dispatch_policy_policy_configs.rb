@@ -18,11 +18,12 @@ class CreateDispatchPolicyPolicyConfigs < ActiveRecord::Migration[7.1]
       #   "auto"   — written by the auto_tune loop
       t.string   :source,      null: false, default: "ui"
       t.timestamps
+      # Inline so the unique index is built as part of the empty
+      # CREATE TABLE — no need for concurrent ADD INDEX (the table
+      # has no rows to lock against).
+      t.index %i[policy_name config_key],
+        unique: true,
+        name:   "idx_dp_policy_configs_unique"
     end
-
-    add_index :dispatch_policy_policy_configs,
-      %i[policy_name config_key],
-      unique: true,
-      name: "idx_dp_policy_configs_unique"
   end
 end

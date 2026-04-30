@@ -18,12 +18,13 @@ class CreateDispatchPolicyTickRuns < ActiveRecord::Migration[7.1]
       t.string   :error_class                               # set when Tick.run raised
       t.string   :error_message
       t.datetime :created_at,   null: false
-    end
 
-    add_index :dispatch_policy_tick_runs, :started_at,
-      name: "idx_dp_tick_runs_started_at"
-    add_index :dispatch_policy_tick_runs,
-      %i[policy_name started_at],
-      name: "idx_dp_tick_runs_policy_started"
+      # Inline so the indexes are part of the empty CREATE TABLE —
+      # safe without concurrent ADD INDEX (the table has no rows).
+      t.index :started_at,
+        name: "idx_dp_tick_runs_started_at"
+      t.index %i[policy_name started_at],
+        name: "idx_dp_tick_runs_policy_started"
+    end
   end
 end

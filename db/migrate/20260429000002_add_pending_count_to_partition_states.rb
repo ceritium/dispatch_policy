@@ -1,6 +1,11 @@
 # frozen_string_literal: true
 
 class AddPendingCountToPartitionStates < ActiveRecord::Migration[7.1]
+  # add_index is run with algorithm: :concurrently below so it
+  # doesn't block writes on a populated table; that requires
+  # running the migration outside a DDL transaction.
+  disable_ddl_transaction!
+
   def up
     # Counter of staged_jobs in pending state for this (policy,
     # partition_key). Incremented on stage_many!, decremented on
@@ -23,7 +28,8 @@ class AddPendingCountToPartitionStates < ActiveRecord::Migration[7.1]
       %i[policy_name last_admitted_at],
       where: "pending_count > 0",
       name: "idx_dp_partition_states_active_lru",
-      if_not_exists: true
+      if_not_exists: true,
+      algorithm: :concurrently
 
     # Backfill: existing pending staged_jobs with a round_robin_key
     # need to be reflected in partition_states.pending_count, otherwise
