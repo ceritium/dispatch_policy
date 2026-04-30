@@ -22,7 +22,6 @@ module DispatchPolicy
       busy_sleep = (sleep_for_busy || DispatchPolicy.config.tick_sleep_busy).to_f
 
       reload_policy_configs!(policy_name)
-      maybe_auto_tune!(policy_name)
 
       begin
         ActiveRecord::Base.uncached { Tick.reap }
@@ -57,9 +56,6 @@ module DispatchPolicy
         flush_samples!(buffer) if buffer.size >= SAMPLE_FLUSH_BATCH
       end
 
-      auto_tune_interval = DispatchPolicy.config.auto_tune_interval_seconds.to_f
-      last_auto_tune     = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-
       begin
         loop do
           break if stop_when.call
@@ -74,23 +70,23 @@ module DispatchPolicy
             Rails.error.report(e, handled: true) if defined?(Rails) && Rails.respond_to?(:error)
           end
 
-          # Periodic re-tune so bottlenecks that develop mid-loop
-          # get applied without waiting for the next TickLoop spawn.
-          # Skipped when auto_tune_interval_seconds <= 0 — the at-
-          # boot run is then the only tune pass.
-          if auto_tune_interval.positive?
-            now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-            if now - last_auto_tune >= auto_tune_interval
-              maybe_auto_tune!(policy_name)
-              last_auto_tune = now
-            end
-          end
-
           break if stop_when.call
 
           interruptible_sleep(admitted.positive? ? busy_sleep : idle_sleep, stop_when)
         end
       ensure
+        # Run auto-tune AFTER the loop has finished so the
+        # recommendations reflect the state observed during this
+        # run. The next TickLoop spawn (chained DispatchTickLoopJob
+        # or rake task respawn) will reload_policy_configs! and
+        # pick up the freshly persisted values.
+        begin
+          maybe_auto_tune!(policy_name)
+        rescue StandardError => e
+          Rails.logger&.error("[DispatchPolicy] auto_tune error: #{e.class}: #{e.message}")
+          Rails.error.report(e, handled: true) if defined?(Rails) && Rails.respond_to?(:error)
+        end
+
         ActiveSupport::Notifications.unsubscribe(subscriber) if subscriber
         flush_samples!(buffer)
       end
