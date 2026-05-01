@@ -57,8 +57,12 @@ module DispatchPolicy
 
         PolicyPartition.bulk_seed!(
           policy: policy,
-          counts: { partition_key => 1 },
-          now:    now
+          seeds: [ {
+            partition_key:    partition_key,
+            delta:            1,
+            concurrency_max:  policy.resolve_concurrency_max(job_instance.arguments)
+          } ],
+          now: now
         )
 
         staged
@@ -89,6 +93,15 @@ module DispatchPolicy
         }
       end
 
+      # First, resolve concurrency_max per partition_key. Each job
+      # in the batch may belong to a different partition; we want
+      # to evaluate the proc once per partition (not once per job).
+      caps_by_partition = {}
+      jobs.each do |job|
+        pk = policy.build_partition_key(job.arguments)
+        caps_by_partition[pk] ||= policy.resolve_concurrency_max(job.arguments)
+      end
+
       transaction do
         # `RETURNING partition_key` so we count only rows that
         # actually inserted (dedupe ON CONFLICT skips duplicates).
@@ -100,7 +113,10 @@ module DispatchPolicy
         actual_counts = Hash.new(0)
         result.rows.each { |row| actual_counts[row.first] += 1 }
 
-        PolicyPartition.bulk_seed!(policy: policy, counts: actual_counts, now: now) unless actual_counts.empty?
+        seeds = actual_counts.map do |pk, delta|
+          { partition_key: pk, delta: delta, concurrency_max: caps_by_partition[pk] }
+        end
+        PolicyPartition.bulk_seed!(policy: policy, seeds: seeds, now: now) unless seeds.empty?
         actual_counts.values.sum
       end
     end

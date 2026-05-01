@@ -57,14 +57,29 @@ module DispatchPolicy
       end
     end
 
-    test "concurrency max must be Integer (not Proc)" do
+    test "concurrency max accepts a callable for per-partition resolution" do
+      klass = Class.new(ActiveJob::Base) do
+        include DispatchPolicy::Dispatchable
+        def self.name; "Anon::Dynamic"; end
+        dispatch_policy do
+          partition_by ->(args) { args.first[:id] }
+          concurrency  max: ->(args) { args.first[:tier] == "high" ? 10 : 2 }
+        end
+        def perform(*); end
+      end
+      policy = klass.resolved_dispatch_policy
+      assert_equal 10, policy.resolve_concurrency_max([ { id: "a", tier: "high" } ])
+      assert_equal 2,  policy.resolve_concurrency_max([ { id: "b", tier: "low" } ])
+    end
+
+    test "concurrency max rejects non-Integer non-callable" do
       assert_raises ArgumentError do
         Class.new(ActiveJob::Base) do
           include DispatchPolicy::Dispatchable
-          def self.name; "Anon::C"; end
+          def self.name; "Anon::Bad"; end
           dispatch_policy do
             partition_by ->(args) { args.first }
-            concurrency  max: ->(_ctx) { 5 }
+            concurrency  max: "not a number"
           end
           def perform(*); end
         end

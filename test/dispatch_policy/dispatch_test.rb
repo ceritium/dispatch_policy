@@ -122,6 +122,40 @@ module DispatchPolicy
 
     # ─── Reap ───────────────────────────────────────────────────
 
+    # ─── Dynamic concurrency cap ────────────────────────────────
+
+    class DynamicCappedJob < ActiveJob::Base
+      include DispatchPolicy::Dispatchable
+      # Plan-aware cap: pro accounts get 5 concurrent, others get 1.
+      dispatch_policy do
+        partition_by ->(args) { args.first[:account_id] }
+        concurrency  max: ->(args) {
+          args.first[:plan] == "pro" ? 5 : 1
+        }
+      end
+      def perform(*); end
+    end
+
+    test "dynamic concurrency max resolves per-partition at stage time" do
+      DynamicCappedJob.perform_later(account_id: "free-1", plan: "free")
+      DynamicCappedJob.perform_later(account_id: "pro-1",  plan: "pro")
+
+      free = PolicyPartition.find_by(partition_key: "free-1")
+      pro  = PolicyPartition.find_by(partition_key: "pro-1")
+      assert_equal 1, free.concurrency_max
+      assert_equal 5, pro.concurrency_max
+    end
+
+    test "dynamic concurrency max persists per partition; subsequent jobs don't change it" do
+      DynamicCappedJob.perform_later(account_id: "x", plan: "pro")
+      assert_equal 5, PolicyPartition.find_by(partition_key: "x").concurrency_max
+
+      # Even if "plan" changes mid-flight, the persisted cap stays.
+      DynamicCappedJob.perform_later(account_id: "x", plan: "free")
+      assert_equal 5, PolicyPartition.find_by(partition_key: "x").concurrency_max,
+        "first stage wins; partition cap doesn't update on subsequent stages"
+    end
+
     # ─── Cursor lag ─────────────────────────────────────────────
 
     test "Dispatch.run emits cursor_lag_ms + active_partitions" do

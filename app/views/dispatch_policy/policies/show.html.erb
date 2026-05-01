@@ -24,7 +24,8 @@
     <div class="label">Gates</div>
     <div class="value" style="font-size: 1em;">
       <% if @policy&.concurrency_max %>
-        <span class="badge">concurrency max=<%= @policy.concurrency_max %></span>
+        <% display = @policy.concurrency_max.is_a?(Integer) ? @policy.concurrency_max : "dynamic" %>
+        <span class="badge">concurrency max=<%= display %></span>
       <% end %>
       <% if @policy&.throttle_rate %>
         <span class="badge">

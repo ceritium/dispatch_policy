@@ -18,21 +18,23 @@ module DispatchPolicy
     # Bulk-upsert: increments pending_count by `delta` for each
     # partition, seeding new rows with the policy's gate config.
     # `counts` is { partition_key => delta }. Idempotent on rerun.
-    def self.bulk_seed!(policy:, counts:, now: Time.current)
-      return 0 if counts.empty?
+    # `seeds` is an Array<Hash> with keys :partition_key, :delta and
+    # an optional :concurrency_max (overriding the policy default).
+    # Each entry seeds (or upserts) one (policy, partition_key) row.
+    # On conflict only pending_count grows — concurrency_max is set
+    # by the first job that creates the partition.
+    def self.bulk_seed!(policy:, seeds:, now: Time.current)
+      return 0 if seeds.empty?
 
-      cmax  = policy.concurrency_max
       rate  = policy.throttle_rate
       burst = policy.throttle_burst
+      default_cmax = policy.concurrency_max if policy.concurrency_max.is_a?(Integer)
 
-      # New row defaults: tokens = full burst, refilled_at = NOW(),
-      # last_checked_at = NULL (so it's first in the cursor — gets
-      # a turn ASAP). Existing rows: only pending_count increments;
-      # the cursor position is left alone.
-      values_clause = ([ "(?, ?, ?::int, ?::int, ?::numeric, ?::numeric, ?::int, ?, ?, ?)" ] * counts.size).join(", ")
-      values_args   = counts.flat_map do |pk, delta|
+      values_clause = ([ "(?, ?, ?::int, ?::int, ?::numeric, ?::numeric, ?::int, ?, ?, ?)" ] * seeds.size).join(", ")
+      values_args   = seeds.flat_map do |seed|
+        cmax = seed[:concurrency_max] || default_cmax
         [
-          policy.name, pk.to_s, delta.to_i,
+          policy.name, seed[:partition_key].to_s, seed[:delta].to_i,
           cmax,
           burst, rate, burst,    # tokens / rate / burst
           rate ? now : nil,      # refilled_at only when throttled

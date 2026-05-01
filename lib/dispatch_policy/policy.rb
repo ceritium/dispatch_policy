@@ -61,11 +61,36 @@ module DispatchPolicy
       @partition_builder = builder
     end
 
-    # gate :concurrency, max: N → concurrency max: N
+    # Concurrency cap. `max` can be:
+    #   - a positive Integer (same cap for every partition), or
+    #   - a callable that takes the job's arguments and returns the
+    #     cap for THAT partition. The callable is invoked at stage
+    #     time and the result is persisted to policy_partitions.
+    #     concurrency_max for the partition_key, so each partition's
+    #     cap is set by the FIRST job that creates the row. Plan
+    #     upgrades take effect once the old partition row drains
+    #     and gets purged, or via a manual partition_cap update.
+    #
+    #   concurrency max: 5
+    #   concurrency max: ->(args) { Account.find(args.first[:account_id]).max_concurrent }
     def concurrency(max:)
-      raise ArgumentError, "concurrency max must be a positive Integer (got #{max.inspect})" \
-        unless max.is_a?(Integer) && max.positive?
+      if max.is_a?(Integer)
+        raise ArgumentError, "concurrency max must be positive (got #{max})" unless max.positive?
+      elsif !max.respond_to?(:call)
+        raise ArgumentError,
+          "concurrency max must be a positive Integer or a callable (got #{max.inspect})"
+      end
       @concurrency_max = max
+    end
+
+    # Resolve `concurrency_max` for a specific job's arguments. Used
+    # at stage time. Returns nil when no concurrency gate is declared.
+    def resolve_concurrency_max(arguments)
+      return nil if @concurrency_max.nil?
+      value = @concurrency_max.is_a?(Integer) ? @concurrency_max : @concurrency_max.call(arguments)
+      raise ArgumentError, "concurrency max callable returned non-positive #{value.inspect} for #{name}" \
+        unless value.is_a?(Integer) && value.positive?
+      value
     end
 
     # throttle rate: 60, per: 60.seconds, burst: 60
