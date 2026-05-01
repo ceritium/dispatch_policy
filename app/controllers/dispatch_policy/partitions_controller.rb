@@ -8,31 +8,32 @@ module DispatchPolicy
     DRAIN_BATCH_SIZE      = 200
 
     PAGE_SIZE = 100
-    SORT_OPTIONS = {
-      "pending"    => "pending_count DESC, last_admit_at DESC NULLS LAST, id ASC",
-      "admitted"   => "total_admitted DESC, id ASC",
-      "stale"      => "last_checked_at ASC NULLS FIRST, id ASC",
-      "recent"     => "last_admit_at DESC NULLS LAST, id ASC",
-      "key"        => "partition_key ASC, id ASC"
-    }.freeze
-    DEFAULT_SORT = "pending"
 
     def index
-      scope = Partition.all
-      scope = scope.for_policy(params[:policy]) if params[:policy].present?
-      scope = scope.for_shard(params[:shard])   if params[:shard].present?
-      scope = scope.where("partition_key ILIKE ?", "%#{params[:q]}%") if params[:q].present?
-      scope = scope.where("pending_count > 0")                         if params[:only_pending] == "1"
+      base = Partition.all
+      base = base.for_policy(params[:policy]) if params[:policy].present?
+      base = base.for_shard(params[:shard])   if params[:shard].present?
+      base = base.where("partition_key ILIKE ?", "%#{params[:q]}%") if params[:q].present?
+      base = base.where("pending_count > 0")                         if params[:only_pending] == "1"
 
-      @sort  = SORT_OPTIONS.key?(params[:sort]) ? params[:sort] : DEFAULT_SORT
-      scope  = scope.order(Arel.sql(SORT_OPTIONS.fetch(@sort)))
+      @sort = DispatchPolicy::CursorPagination::SORTS.key?(params[:sort]) ? params[:sort] : DispatchPolicy::CursorPagination::DEFAULT_SORT
+      sort_def = DispatchPolicy::CursorPagination.sort_for(@sort)
 
-      @page       = [Integer(params[:page] || 1), 1].max
-      @page_size  = PAGE_SIZE
-      @total      = scope.count
-      @last_page  = [(@total.to_f / @page_size).ceil, 1].max
-      @page       = [@page, @last_page].min
-      @partitions = scope.offset((@page - 1) * @page_size).limit(@page_size)
+      @total  = base.count   # cheap on indexed columns; nice to display
+      @cursor = DispatchPolicy::CursorPagination.decode(params[:cursor])
+
+      paginated = DispatchPolicy::CursorPagination.apply(base, @sort, @cursor)
+                                                   .order(Arel.sql(sort_def[:sql_order]))
+                                                   .limit(PAGE_SIZE + 1)
+                                                   .to_a
+
+      @has_more   = paginated.size > PAGE_SIZE
+      @partitions = paginated.first(PAGE_SIZE)
+      @next_cursor =
+        if @has_more && @partitions.any?
+          v, id = DispatchPolicy::CursorPagination.extract(@partitions.last, @sort)
+          DispatchPolicy::CursorPagination.encode(v, id)
+        end
 
       @policy        = params[:policy]
       @shard         = params[:shard]
@@ -44,14 +45,15 @@ module DispatchPolicy
       @shards      = shards_scope.distinct.pluck(:shard).sort
     end
 
+    # Build URL params preserving filters, replacing the cursor.
     def pagination_params(overrides = {})
       {
         policy:        @policy.presence,
         shard:         @shard.presence,
         q:             @query.presence,
-        sort:          (@sort if @sort != DEFAULT_SORT),
+        sort:          (@sort if @sort != DispatchPolicy::CursorPagination::DEFAULT_SORT),
         only_pending:  ("1" if @only_pending),
-        page:          (@page if @page > 1)
+        cursor:        nil
       }.compact.merge(overrides)
     end
     helper_method :pagination_params
