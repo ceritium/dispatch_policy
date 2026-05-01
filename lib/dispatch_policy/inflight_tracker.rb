@@ -31,13 +31,15 @@ module DispatchPolicy
       ctx              = policy.build_context(job.arguments, queue_name: job.queue_name&.to_s)
       concurrency_gate = policy.gates.find { |g| g.name == :concurrency }
 
-      unless concurrency_gate
-        return yield
+      partition_key = if concurrency_gate
+        concurrency_gate.inflight_partition_key(policy.name, ctx)
+      else
+        policy.partition_key_for(ctx)
       end
 
       Repository.insert_inflight!([{
         policy_name:    policy.name,
-        partition_key:  concurrency_gate.inflight_partition_key(policy.name, ctx),
+        partition_key:  partition_key,
         active_job_id:  job.job_id
       }])
 
