@@ -6,7 +6,9 @@ class HomeController < ApplicationController
     "bulk_account"      => BulkAccountJob,
     "mixed"             => MixedJob,
     "perform_in"        => PerformInJob,
-    "retry_flaky"       => RetryFlakyJob
+    "retry_flaky"       => RetryFlakyJob,
+    "high_concurrency"  => HighConcurrencyJob,
+    "high_throttle"     => HighThrottleJob
   }.freeze
 
   def index

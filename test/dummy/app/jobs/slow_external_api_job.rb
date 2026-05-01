@@ -17,7 +17,7 @@ class SlowExternalApiJob < ApplicationJob
 
     gate :throttle,
          rate:         ->(c) { c[:rate] },
-         per:          60,
+         per:          60000,
          partition_by: ->(c) { c[:endpoint_id] }
   end
 

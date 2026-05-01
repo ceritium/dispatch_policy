@@ -46,6 +46,30 @@
   <% end %>
 </div>
 
+<h2>Stress tests</h2>
+
+<div class="card">
+  <h3 style="margin:6px 0;">HighConcurrencyJob (concurrency only, max=100, sleep=0.1s)</h3>
+  <%= form_with url: enqueue_many_path(job: "high_concurrency"), method: :post, local: true do %>
+    <label>bucket</label> <input name="attrs[bucket]" value="hot"><br>
+    <label>max</label>    <input name="attrs[max]"    value="100" size="6"><br>
+    <label>count</label>  <input name="count"         value="500" size="6"><br>
+    <button>Flood with HighConcurrencyJob</button>
+  <% end %>
+  <p style="font-size:12px;color:#6b7280;">Watch <code>/dispatch_policy</code> dashboard: <code>in_flight</code> should rise toward <code>max</code>; <code>avg tick</code> should stay low.</p>
+</div>
+
+<div class="card">
+  <h3 style="margin:6px 0;">HighThrottleJob (throttle only, rate=10k/min, sleep=0.05s)</h3>
+  <%= form_with url: enqueue_many_path(job: "high_throttle"), method: :post, local: true do %>
+    <label>endpoint</label> <input name="attrs[endpoint]" value="hot"><br>
+    <label>rate</label>     <input name="attrs[rate]"     value="10000" size="8"><br>
+    <label>count</label>    <input name="count"           value="2000"  size="6"><br>
+    <button>Flood with HighThrottleJob</button>
+  <% end %>
+  <p style="font-size:12px;color:#6b7280;">Bucket fills instantly so the limiter is your worker pool: tick should saturate <code>admission_batch_size</code> per partition.</p>
+</div>
+
 <h2>Bulk enqueue (perform_all_later)</h2>
 
 <div class="card">
