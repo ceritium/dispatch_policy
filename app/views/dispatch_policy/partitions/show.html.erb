@@ -8,7 +8,6 @@
   <div class="dp-stat"><span class="dp-stat-label">Policy</span><span class="dp-stat-value"><%= @partition.policy_name %></span></div>
   <div class="dp-stat"><span class="dp-stat-label">Status</span><span class="dp-stat-value <%= @partition.paused? ? "dp-warn" : "" %>"><%= @partition.status %></span></div>
   <div class="dp-stat"><span class="dp-stat-label">Pending</span><span class="dp-stat-value"><%= format_count(@partition.pending_count) %></span></div>
-  <div class="dp-stat"><span class="dp-stat-label">In flight</span><span class="dp-stat-value"><%= format_count(@partition.in_flight_count) %></span></div>
 </section>
 
 <section class="dp-section">

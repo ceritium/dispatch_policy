@@ -37,7 +37,7 @@
             <td><%= link_to p.partition_key, partition_path(p), class: "dp-link" %></td>
             <td><%= p.status %></td>
             <td class="dp-num"><%= format_count(p.pending_count) %></td>
-            <td class="dp-num"><%= format_count(p.in_flight_count) %></td>
+            <td class="dp-num">—</td>
             <td><%= format_time(p.next_eligible_at) %></td>
             <td><%= format_time(p.last_admit_at) %></td>
             <td><%= link_to "→", partition_path(p), class: "dp-link" %></td>

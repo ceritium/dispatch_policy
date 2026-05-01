@@ -11,17 +11,23 @@ module DispatchPolicy
         in_flight:     InflightJob.count
       }
 
-      @policies = Partition
+      pending_by_policy = Partition
         .group(:policy_name)
-        .pluck(
-          :policy_name,
-          Arel.sql("SUM(pending_count)::int"),
-          Arel.sql("SUM(in_flight_count)::int"),
-          Arel.sql("MAX(last_admit_at)")
-        )
-        .map { |name, pending, in_flight, last_admit|
-          { name: name, pending: pending || 0, in_flight: in_flight || 0, last_admit_at: last_admit }
+        .pluck(:policy_name, Arel.sql("SUM(pending_count)::int"), Arel.sql("MAX(last_admit_at)"))
+        .to_h { |name, pending, last_admit| [name, { pending: pending || 0, last_admit_at: last_admit }] }
+
+      in_flight_by_policy = InflightJob.group(:policy_name).count
+
+      names = (pending_by_policy.keys + in_flight_by_policy.keys).uniq.sort
+      @policies = names.map do |name|
+        info = pending_by_policy[name] || {}
+        {
+          name:           name,
+          pending:        info[:pending] || 0,
+          in_flight:      in_flight_by_policy[name] || 0,
+          last_admit_at:  info[:last_admit_at]
         }
+      end
     end
   end
 end

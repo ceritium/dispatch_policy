@@ -320,12 +320,16 @@ module DispatchPolicy
       )
     end
 
+    # Removes partitions that have no pending staged jobs and have been
+    # idle for `cutoff_seconds`. The default cutoff (24h) is well past any
+    # reasonable inflight job — concurrency state lives in inflight_jobs
+    # and is independent of partition rows, so a recreated partition will
+    # re-observe the live in-flight count via the concurrency gate.
     def sweep_inactive_partitions!(cutoff_seconds:)
       connection.exec_query(
         <<~SQL.squish,
           DELETE FROM #{PARTITIONS_TABLE}
           WHERE pending_count = 0
-            AND in_flight_count = 0
             AND status = 'active'
             AND (
               (last_admit_at IS NOT NULL AND last_admit_at < now() - ($1 || ' seconds')::interval)
