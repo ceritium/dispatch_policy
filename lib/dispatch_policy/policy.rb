@@ -184,6 +184,38 @@ module DispatchPolicy
       )
     end
 
+    # Reconcile dispatch_policy_partitions rows so that
+    # concurrency_max / throttle_rate / throttle_burst match the
+    # values currently declared in the DSL. Without this, changing
+    # the DSL between deploys leaves old partition rows with stale
+    # caps — bulk_seed!'s ON CONFLICT only touches pending_count.
+    #
+    # Skips concurrency when `max` is a callable: we can't recompute
+    # without the original job args. Operators who use a Proc need
+    # to either let partitions drain or update the column manually.
+    def sync_partition_gates!
+      if @concurrency_max.is_a?(Integer)
+        DispatchPolicy::PolicyPartition
+          .where(policy_name: @name)
+          .where("concurrency_max IS DISTINCT FROM ?", @concurrency_max)
+          .update_all(concurrency_max: @concurrency_max, updated_at: Time.current)
+      end
+
+      if @throttle_rate
+        DispatchPolicy::PolicyPartition
+          .where(policy_name: @name)
+          .where(
+            "throttle_rate IS DISTINCT FROM ? OR throttle_burst IS DISTINCT FROM ?",
+            @throttle_rate, @throttle_burst
+          )
+          .update_all(
+            throttle_rate:  @throttle_rate,
+            throttle_burst: @throttle_burst,
+            updated_at:     Time.current
+          )
+      end
+    end
+
     # ─── Validation ──────────────────────────────────────────────
 
     def validate!

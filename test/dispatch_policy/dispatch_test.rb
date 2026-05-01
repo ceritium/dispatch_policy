@@ -156,6 +156,37 @@ module DispatchPolicy
         "first stage wins; partition cap doesn't update on subsequent stages"
     end
 
+    # ─── DSL change propagation ─────────────────────────────────
+
+    test "TickLoop reload syncs partition rows to current DSL cap" do
+      # Stage a job; its partition is seeded with cap=1 (from CappedJob).
+      CappedJob.perform_later("acct-x")
+      part = PolicyPartition.find_by(policy_name: CappedJob.resolved_dispatch_policy.name, partition_key: "acct-x")
+      assert_equal 1, part.concurrency_max
+
+      # Simulate a DSL change: same policy is now declared with max=10.
+      original = CappedJob.resolved_dispatch_policy.instance_variable_get(:@concurrency_max)
+      CappedJob.resolved_dispatch_policy.instance_variable_set(:@concurrency_max, 10)
+
+      DispatchPolicy::TickLoop.reload_policy_configs!(CappedJob.resolved_dispatch_policy.name)
+
+      assert_equal 10, part.reload.concurrency_max
+    ensure
+      CappedJob.resolved_dispatch_policy.instance_variable_set(:@concurrency_max, original) if original
+    end
+
+    test "TickLoop reload preserves partition cap when DSL uses a callable" do
+      # Dynamic policies opt out of sync (we can't recompute without args).
+      DynamicCappedJob.perform_later(account_id: "x", plan: "pro")
+      pname = DynamicCappedJob.resolved_dispatch_policy.name
+      assert_equal 5, PolicyPartition.find_by(policy_name: pname, partition_key: "x").concurrency_max
+
+      DispatchPolicy::TickLoop.reload_policy_configs!(pname)
+
+      assert_equal 5, PolicyPartition.find_by(policy_name: pname, partition_key: "x").concurrency_max,
+        "callable-cap policies must not be touched by sync"
+    end
+
     # ─── Cursor lag ─────────────────────────────────────────────
 
     test "Dispatch.run emits cursor_lag_ms + active_partitions" do

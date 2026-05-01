@@ -122,6 +122,11 @@ module DispatchPolicy
         policy = job_class&.resolved_dispatch_policy
         next unless policy
         policy.reload_overrides_from_db!
+        # After config reload, push gate values from the DSL down
+        # to existing policy_partitions rows. Without this, a deploy
+        # that changes `concurrency max:` wouldn't take effect on
+        # partitions seeded under the old cap.
+        policy.sync_partition_gates!
       end
     rescue ActiveRecord::StatementInvalid,
            ActiveRecord::ConnectionNotEstablished,
