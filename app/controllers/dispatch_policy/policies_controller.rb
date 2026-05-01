@@ -29,11 +29,25 @@ module DispatchPolicy
       @partitions    = Partition.for_policy(@policy_name)
                                 .order(Arel.sql("pending_count DESC, last_admit_at DESC NULLS LAST"))
                                 .limit(100)
+      @top_admitted  = Partition.for_policy(@policy_name)
+                                .order(total_admitted: :desc)
+                                .limit(20)
+
       @totals = {
         pending:    Partition.for_policy(@policy_name).sum(:pending_count),
         in_flight:  InflightJob.where(policy_name: @policy_name).count,
         partitions: Partition.for_policy(@policy_name).count
       }
+
+      now = Time.current
+      @windows = {
+        "1m"  => Repository.tick_summary(policy_name: @policy_name, since: now - 60),
+        "5m"  => Repository.tick_summary(policy_name: @policy_name, since: now - 5 * 60),
+        "15m" => Repository.tick_summary(policy_name: @policy_name, since: now - 15 * 60)
+      }
+      @denied_reasons = Repository.denied_reasons_summary(policy_name: @policy_name, since: now - 15 * 60)
+      @round_trip     = Repository.partition_round_trip_stats(policy_name: @policy_name)
+      @sparkline      = Repository.tick_samples_buckets(policy_name: @policy_name, since: now - 30 * 60, bucket_seconds: 60)
     end
 
     def pause

@@ -3,8 +3,50 @@
     <div class="dp-stat"><span class="dp-stat-label">Staged</span><span class="dp-stat-value"><%= format_count(@totals[:staged]) %></span></div>
     <div class="dp-stat"><span class="dp-stat-label">Partitions</span><span class="dp-stat-value"><%= format_count(@totals[:partitions]) %></span></div>
     <div class="dp-stat"><span class="dp-stat-label">Active</span><span class="dp-stat-value"><%= format_count(@totals[:active_parts]) %></span></div>
-    <div class="dp-stat"><span class="dp-stat-label">Paused</span><span class="dp-stat-value dp-warn"><%= format_count(@totals[:paused_parts]) %></span></div>
+    <div class="dp-stat"><span class="dp-stat-label">Paused</span><span class="dp-stat-value <%= "dp-warn" if @totals[:paused_parts].positive? %>"><%= format_count(@totals[:paused_parts]) %></span></div>
     <div class="dp-stat"><span class="dp-stat-label">In flight</span><span class="dp-stat-value"><%= format_count(@totals[:in_flight]) %></span></div>
+  </section>
+
+  <section class="dp-section">
+    <h2>Throughput</h2>
+    <table class="dp-table">
+      <thead>
+        <tr><th>Window</th><th class="dp-num">Jobs admitted</th><th class="dp-num">Ticks</th><th class="dp-num">Avg tick</th><th class="dp-num">Max tick</th><th class="dp-num">Forward fail</th></tr>
+      </thead>
+      <tbody>
+        <% @windows.each do |label, m| %>
+          <tr>
+            <td><strong><%= label %></strong></td>
+            <td class="dp-num"><%= format_count(m[:jobs_admitted]) %></td>
+            <td class="dp-num"><%= format_count(m[:ticks]) %></td>
+            <td class="dp-num"><%= format_duration_ms(m[:avg_duration_ms]) %></td>
+            <td class="dp-num"><%= format_duration_ms(m[:max_duration_ms]) %></td>
+            <td class="dp-num <%= "dp-warn" if m[:forward_failures].positive? %>"><%= format_count(m[:forward_failures]) %></td>
+          </tr>
+        <% end %>
+      </tbody>
+    </table>
+  </section>
+
+  <section class="dp-section">
+    <h2>Round-trip across active partitions</h2>
+    <% if @round_trip[:active_partitions].zero? %>
+      <p class="dp-empty">No active partitions with pending jobs.</p>
+    <% else %>
+      <div class="dp-stats">
+        <div class="dp-stat"><span class="dp-stat-label">Active w/ pending</span><span class="dp-stat-value"><%= format_count(@round_trip[:active_partitions]) %></span></div>
+        <div class="dp-stat"><span class="dp-stat-label">Never checked</span><span class="dp-stat-value <%= "dp-warn" if @round_trip[:never_checked].positive? %>"><%= format_count(@round_trip[:never_checked]) %></span></div>
+        <div class="dp-stat"><span class="dp-stat-label">In backoff</span><span class="dp-stat-value"><%= format_count(@round_trip[:in_backoff]) %></span></div>
+        <div class="dp-stat"><span class="dp-stat-label">Oldest age</span><span class="dp-stat-value"><%= format_duration_seconds(@round_trip[:oldest_age_seconds]) %></span></div>
+        <div class="dp-stat"><span class="dp-stat-label">P50 age</span><span class="dp-stat-value"><%= format_duration_seconds(@round_trip[:p50_age_seconds]) %></span></div>
+        <div class="dp-stat"><span class="dp-stat-label">P95 age</span><span class="dp-stat-value"><%= format_duration_seconds(@round_trip[:p95_age_seconds]) %></span></div>
+      </div>
+      <p class="dp-hint">
+        If <strong>oldest age</strong> is bigger than your tolerable latency for the slowest partition, increase
+        <code>partition_batch_size</code> or shard ticks per <code>policy_name</code>.
+        If <strong>never checked</strong> stays positive across refreshes, the tick is not keeping up — same remedy.
+      </p>
+    <% end %>
   </section>
 
   <section class="dp-section">
@@ -14,7 +56,19 @@
     <% else %>
       <table class="dp-table">
         <thead>
-          <tr><th>Name</th><th class="dp-num">Pending</th><th class="dp-num">In flight</th><th>Last admit</th><th></th></tr>
+          <tr>
+            <th>Name</th>
+            <th class="dp-num">Pending</th>
+            <th class="dp-num">In flight</th>
+            <th class="dp-num">Admit/min (1m)</th>
+            <th class="dp-num">Ticks (1m)</th>
+            <th class="dp-num">Avg tick</th>
+            <th class="dp-num">P95 age</th>
+            <th class="dp-num">Backoff</th>
+            <th>Top denial</th>
+            <th>Last admit</th>
+            <th></th>
+          </tr>
         </thead>
         <tbody>
           <% @policies.each do |p| %>
@@ -22,6 +76,18 @@
               <td><%= link_to p[:name], policy_path(p[:name]), class: "dp-link" %></td>
               <td class="dp-num"><%= format_count(p[:pending]) %></td>
               <td class="dp-num"><%= format_count(p[:in_flight]) %></td>
+              <td class="dp-num"><%= format_count(p[:admitted_1m]) %></td>
+              <td class="dp-num"><%= format_count(p[:ticks_1m]) %></td>
+              <td class="dp-num"><%= format_duration_ms(p[:avg_tick_ms_1m]) %></td>
+              <td class="dp-num"><%= format_duration_seconds(p[:p95_age_seconds]) %></td>
+              <td class="dp-num <%= "dp-warn" if p[:in_backoff].to_i.positive? %>"><%= format_count(p[:in_backoff]) %></td>
+              <td>
+                <% if p[:top_denial_reason] %>
+                  <code><%= p[:top_denial_reason] %></code> ×<%= p[:top_denial_count] %>
+                <% else %>
+                  —
+                <% end %>
+              </td>
               <td><%= format_time(p[:last_admit_at]) %></td>
               <td><%= link_to "Partitions →", partitions_path(policy: p[:name]), class: "dp-link" %></td>
             </tr>

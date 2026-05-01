@@ -90,3 +90,18 @@ h2 { font-size: 15px; margin: 24px 0 10px; font-weight: 600; color: #374151; tex
   border-radius: 6px; overflow-x: auto;
   font-family: "SFMono-Regular", Menlo, monospace; font-size: 12.5px; line-height: 1.45;
 }
+
+.dp-hint {
+  font-size: 12.5px; color: #6b7280; margin-top: 8px;
+  border-left: 3px solid #cfd5df; padding: 6px 12px; background: #fafbfd;
+  border-radius: 0 4px 4px 0;
+}
+.dp-hint code { background: #eef2f7; }
+
+.dp-spark {
+  margin-top: 10px; font-size: 13px; color: #374151;
+}
+.dp-spark code {
+  font-family: "SFMono-Regular", Menlo, monospace; font-size: 16px;
+  background: #1d2330; color: #f6f7fa; padding: 2px 8px; letter-spacing: 1px;
+}

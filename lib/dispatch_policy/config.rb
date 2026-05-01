@@ -12,7 +12,8 @@ module DispatchPolicy
                   :real_adapter,
                   :logger,
                   :clock,
-                  :sweep_every_ticks
+                  :sweep_every_ticks,
+                  :metrics_retention
 
     def initialize
       @tick_max_duration         = 25
@@ -26,6 +27,7 @@ module DispatchPolicy
       @logger                    = nil
       @clock                     = -> { Time.now.utc }
       @sweep_every_ticks         = 50
+      @metrics_retention         = 24 * 60 * 60
     end
 
     def now
