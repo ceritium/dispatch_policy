@@ -13,10 +13,20 @@ namespace :dispatch_policy do
     end
   end
 
-  desc "Kick off the dispatch tick loop in the dummy"
+  desc "Run the dispatch tick loop in-process (long-running; foreman-friendly)"
   task dummy_tick: :environment do
-    DispatchTickLoopJob.perform_later
-    Rails.logger.info("[dummy] DispatchTickLoopJob enqueued; the worker will pick it up.")
+    # Eager-load the predefined jobs so their `dispatch_policy` macros register
+    # in DispatchPolicy.registry before the tick loop starts looking for them.
+    %w[SlowExternalApiJob BulkAccountJob MixedJob PerformInJob RetryFlakyJob].each(&:constantize)
+
+    Rails.logger.info("[dummy] starting in-process tick loop (policies: #{DispatchPolicy.registry.names.inspect})")
+
+    stop = false
+    %w[INT TERM].each { |sig| trap(sig) { stop = true } }
+
+    DispatchPolicy::TickLoop.run(stop_when: -> { stop })
+
+    Rails.logger.info("[dummy] tick loop stopped")
   end
 
   desc "Reset dummy database, migrate, and seed nothing"

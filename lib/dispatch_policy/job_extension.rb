@@ -72,17 +72,21 @@ module DispatchPolicy
     # ---- perform_all_later support -------------------------------------------
 
     # Rails 7.1+ exposes ActiveJob.perform_all_later. We override it to route
-    # jobs declaring a dispatch_policy through a single bulk INSERT.
+    # jobs declaring a dispatch_policy through a single bulk INSERT, while
+    # delegating jobs without a policy to the original enqueue_all path.
     module BulkEnqueue
-      def perform_all_later(*jobs, options: {})
+      def perform_all_later(*jobs)
         flat = jobs.flatten
         return super if flat.empty?
         return super unless DispatchPolicy.registry.size.positive?
 
-        with_policy, without_policy = flat.partition { |j| j.class.respond_to?(:dispatch_policy_name) && j.class.dispatch_policy_name }
-        super(without_policy, options: options) if without_policy.any?
+        with_policy, without_policy = flat.partition do |j|
+          j.class.respond_to?(:dispatch_policy_name) && j.class.dispatch_policy_name
+        end
 
-        return if with_policy.empty?
+        super(without_policy) if without_policy.any?
+
+        return nil if with_policy.empty?
 
         rows = with_policy.filter_map do |job|
           policy = DispatchPolicy.registry.fetch(job.class.dispatch_policy_name)
@@ -105,7 +109,8 @@ module DispatchPolicy
           }
         end
 
-        Repository.stage_many!(rows)
+        Repository.stage_many!(rows) if rows.any?
+        nil # ActiveJob.perform_all_later contract returns nil
       end
     end
   end
