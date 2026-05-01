@@ -86,21 +86,25 @@ module DispatchPolicy
           )
 
           if rows.any?
+            # Always pre-insert an inflight row per admitted job so the UI
+            # has an accurate count regardless of gates. If a concurrency
+            # gate exists, use its (coarser) partition key so the gate's
+            # query keeps aggregating correctly across staged partitions.
             concurrency_gate = @policy.gates.find { |g| g.name == :concurrency }
-            if concurrency_gate
-              inflight_rows = rows.filter_map do |row|
-                ajid = row.dig("job_data", "job_id")
-                next unless ajid
+            inflight_rows = rows.filter_map do |row|
+              ajid = row.dig("job_data", "job_id")
+              next unless ajid
 
-                preinserted_ids << ajid
-                {
-                  policy_name:   @policy_name,
-                  partition_key: concurrency_gate.inflight_partition_key(@policy_name, Context.wrap(row["context"])),
-                  active_job_id: ajid
-                }
+              key = if concurrency_gate
+                concurrency_gate.inflight_partition_key(@policy_name, Context.wrap(row["context"]))
+              else
+                row["partition_key"]
               end
-              Repository.insert_inflight!(inflight_rows) if inflight_rows.any?
+
+              preinserted_ids << ajid
+              { policy_name: @policy_name, partition_key: key, active_job_id: ajid }
             end
+            Repository.insert_inflight!(inflight_rows) if inflight_rows.any?
           end
 
           rows
