@@ -7,6 +7,72 @@
 </section>
 
 <section class="dp-section">
+  <h2>Throughput</h2>
+  <table class="dp-table">
+    <thead>
+      <tr><th>Window</th><th class="dp-num">Admitted</th><th class="dp-num">Ticks</th><th class="dp-num">Avg tick</th><th class="dp-num">Max tick</th><th class="dp-num">Forward fail</th><th class="dp-num">Partitions seen</th></tr>
+    </thead>
+    <tbody>
+      <% @windows.each do |label, m| %>
+        <tr>
+          <td><strong><%= label %></strong></td>
+          <td class="dp-num"><%= format_count(m[:jobs_admitted]) %></td>
+          <td class="dp-num"><%= format_count(m[:ticks]) %></td>
+          <td class="dp-num"><%= format_duration_ms(m[:avg_duration_ms]) %></td>
+          <td class="dp-num"><%= format_duration_ms(m[:max_duration_ms]) %></td>
+          <td class="dp-num <%= "dp-warn" if m[:forward_failures].positive? %>"><%= format_count(m[:forward_failures]) %></td>
+          <td class="dp-num"><%= format_count(m[:partitions_seen]) %></td>
+        </tr>
+      <% end %>
+    </tbody>
+  </table>
+
+  <% spark_admit = @sparkline.map { |b| b[:jobs_admitted] } %>
+  <% if spark_admit.any? %>
+    <p class="dp-spark">
+      Last 30 minutes (1-minute buckets): <code><%= sparkline(spark_admit, width: 30) %></code>
+      &nbsp;peak: <%= format_count(spark_admit.max) %> jobs/min
+    </p>
+  <% end %>
+</section>
+
+<section class="dp-section">
+  <h2>Round-trip</h2>
+  <% if @round_trip[:active_partitions].zero? %>
+    <p class="dp-empty">No active partitions with pending jobs in this policy.</p>
+  <% else %>
+    <div class="dp-stats">
+      <div class="dp-stat"><span class="dp-stat-label">Active w/ pending</span><span class="dp-stat-value"><%= format_count(@round_trip[:active_partitions]) %></span></div>
+      <div class="dp-stat"><span class="dp-stat-label">Never checked</span><span class="dp-stat-value <%= "dp-warn" if @round_trip[:never_checked].positive? %>"><%= format_count(@round_trip[:never_checked]) %></span></div>
+      <div class="dp-stat"><span class="dp-stat-label">In backoff</span><span class="dp-stat-value"><%= format_count(@round_trip[:in_backoff]) %></span></div>
+      <div class="dp-stat"><span class="dp-stat-label">Oldest age</span><span class="dp-stat-value"><%= format_duration_seconds(@round_trip[:oldest_age_seconds]) %></span></div>
+      <div class="dp-stat"><span class="dp-stat-label">P50</span><span class="dp-stat-value"><%= format_duration_seconds(@round_trip[:p50_age_seconds]) %></span></div>
+      <div class="dp-stat"><span class="dp-stat-label">P95</span><span class="dp-stat-value"><%= format_duration_seconds(@round_trip[:p95_age_seconds]) %></span></div>
+    </div>
+  <% end %>
+</section>
+
+<section class="dp-section">
+  <h2>Denials (last 15m)</h2>
+  <% if @denied_reasons.empty? %>
+    <p class="dp-empty">No denials recorded in the window.</p>
+  <% else %>
+    <table class="dp-table">
+      <thead><tr><th>Reason</th><th class="dp-num">Count</th></tr></thead>
+      <tbody>
+        <% @denied_reasons.each do |reason, count| %>
+          <tr><td><code><%= reason %></code></td><td class="dp-num"><%= format_count(count) %></td></tr>
+        <% end %>
+      </tbody>
+    </table>
+    <p class="dp-hint">
+      <code>throttle_empty</code> dominating? Raise the policy's <code>rate</code> or accept the throttle and shard tenants.
+      <code>concurrency_full</code> dominating? Raise <code>max</code> on the concurrency gate or scale the worker pool.
+    </p>
+  <% end %>
+</section>
+
+<section class="dp-section">
   <h2>Gates</h2>
   <% if @policy_object %>
     <ul class="dp-list">
@@ -21,13 +87,34 @@
 </section>
 
 <section class="dp-section">
-  <h2>Top partitions</h2>
+  <h2>Top partitions by lifetime admitted</h2>
+  <% if @top_admitted.any? %>
+    <table class="dp-table">
+      <thead><tr><th>Partition key</th><th class="dp-num">Lifetime admitted</th><th class="dp-num">Pending</th><th>Last admit</th></tr></thead>
+      <tbody>
+        <% @top_admitted.each do |p| %>
+          <tr>
+            <td><%= link_to p.partition_key, partition_path(p), class: "dp-link" %></td>
+            <td class="dp-num"><%= format_count(p.total_admitted) %></td>
+            <td class="dp-num"><%= format_count(p.pending_count) %></td>
+            <td><%= format_time(p.last_admit_at) %></td>
+          </tr>
+        <% end %>
+      </tbody>
+    </table>
+  <% else %>
+    <p class="dp-empty">No partitions have admitted any jobs yet.</p>
+  <% end %>
+</section>
+
+<section class="dp-section">
+  <h2>Top partitions by pending</h2>
   <% if @partitions.any? %>
     <table class="dp-table">
       <thead>
         <tr>
           <th>Partition key</th><th>Status</th>
-          <th class="dp-num">Pending</th><th class="dp-num">In flight</th>
+          <th class="dp-num">Pending</th>
           <th>Next eligible</th><th>Last admit</th><th></th>
         </tr>
       </thead>
@@ -37,7 +124,6 @@
             <td><%= link_to p.partition_key, partition_path(p), class: "dp-link" %></td>
             <td><%= p.status %></td>
             <td class="dp-num"><%= format_count(p.pending_count) %></td>
-            <td class="dp-num">—</td>
             <td><%= format_time(p.next_eligible_at) %></td>
             <td><%= format_time(p.last_admit_at) %></td>
             <td><%= link_to "→", partition_path(p), class: "dp-link" %></td>

@@ -53,8 +53,10 @@ module DispatchPolicy
     end
 
     def sweep!
-      Repository.sweep_stale_inflight!(cutoff_seconds: DispatchPolicy.config.inflight_stale_after)
-      Repository.sweep_inactive_partitions!(cutoff_seconds: DispatchPolicy.config.partition_inactive_after)
+      cfg = DispatchPolicy.config
+      Repository.sweep_stale_inflight!(cutoff_seconds: cfg.inflight_stale_after)
+      Repository.sweep_inactive_partitions!(cutoff_seconds: cfg.partition_inactive_after)
+      Repository.sweep_old_tick_samples!(cutoff_seconds: cfg.metrics_retention)
     rescue StandardError => e
       DispatchPolicy.config.logger&.error("[dispatch_policy] sweep error: #{e.class}: #{e.message}")
     end

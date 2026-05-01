@@ -26,6 +26,7 @@ class CreateDispatchPolicyTables < ActiveRecord::Migration[7.1]
       t.string   :queue_name
       t.string   :status,             null: false, default: "active"
       t.integer  :pending_count,      null: false, default: 0
+      t.bigint   :total_admitted,     null: false, default: 0
       t.jsonb    :context,            null: false, default: {}
       t.datetime :context_updated_at
       t.datetime :last_enqueued_at
@@ -57,5 +58,24 @@ class CreateDispatchPolicyTables < ActiveRecord::Migration[7.1]
               name: "idx_dp_inflight_partition"
     add_index :dispatch_policy_inflight_jobs, :heartbeat_at,
               name: "idx_dp_inflight_heartbeat"
+
+    create_table :dispatch_policy_tick_samples do |t|
+      t.string   :policy_name,        null: false
+      t.datetime :sampled_at,         null: false, default: -> { "now()" }
+      t.integer  :duration_ms,        null: false, default: 0
+      t.integer  :partitions_seen,    null: false, default: 0
+      t.integer  :partitions_admitted, null: false, default: 0
+      t.integer  :partitions_denied,  null: false, default: 0
+      t.integer  :jobs_admitted,      null: false, default: 0
+      t.integer  :forward_failures,   null: false, default: 0
+      t.integer  :pending_total,      null: false, default: 0
+      t.integer  :inflight_total,     null: false, default: 0
+      t.jsonb    :denied_reasons,     null: false, default: {}
+    end
+    add_index :dispatch_policy_tick_samples, [:policy_name, :sampled_at],
+              name: "idx_dp_tick_samples_lookup",
+              order: { sampled_at: :desc }
+    add_index :dispatch_policy_tick_samples, :sampled_at,
+              name: "idx_dp_tick_samples_sweep"
   end
 end

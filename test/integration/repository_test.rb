@@ -5,6 +5,7 @@ require_relative "../../app/models/dispatch_policy/application_record"
 require_relative "../../app/models/dispatch_policy/staged_job"
 require_relative "../../app/models/dispatch_policy/partition"
 require_relative "../../app/models/dispatch_policy/inflight_job"
+require_relative "../../app/models/dispatch_policy/tick_sample"
 
 class RepositoryIntegrationTest < Minitest::Test
   def self.connect!
@@ -42,24 +43,33 @@ class RepositoryIntegrationTest < Minitest::Test
     end
   end
 
+  TABLES = %w[
+    dispatch_policy_staged_jobs
+    dispatch_policy_partitions
+    dispatch_policy_inflight_jobs
+    dispatch_policy_tick_samples
+  ].freeze
+
   def schema_present?
     conn = ActiveRecord::Base.connection
-    %w[dispatch_policy_staged_jobs dispatch_policy_partitions dispatch_policy_inflight_jobs].all? do |t|
-      conn.table_exists?(t)
-    end
+    return false unless TABLES.all? { |t| conn.table_exists?(t) }
+
+    # Detect schema drift (e.g. new column added in a migration update).
+    cols = conn.columns("dispatch_policy_partitions").map(&:name)
+    return false unless %w[total_admitted].all? { |c| cols.include?(c) }
+
+    true
   end
 
   def drop_partial_schema!
     conn = ActiveRecord::Base.connection
-    %w[dispatch_policy_staged_jobs dispatch_policy_partitions dispatch_policy_inflight_jobs].each do |t|
-      conn.execute("DROP TABLE IF EXISTS #{t} CASCADE")
-    end
+    TABLES.each { |t| conn.execute("DROP TABLE IF EXISTS #{t} CASCADE") }
   end
 
   def truncate_tables!
-    ActiveRecord::Base.connection.execute(<<~SQL)
-      TRUNCATE dispatch_policy_staged_jobs, dispatch_policy_partitions, dispatch_policy_inflight_jobs RESTART IDENTITY
-    SQL
+    ActiveRecord::Base.connection.execute(
+      "TRUNCATE #{TABLES.join(", ")} RESTART IDENTITY"
+    )
   end
 
   def test_stage_creates_staged_and_partition_rows
@@ -211,6 +221,84 @@ class RepositoryIntegrationTest < Minitest::Test
 
     DispatchPolicy::Repository.delete_inflight!(active_job_id: "abc")
     assert_equal 1, DispatchPolicy::Repository.count_inflight(policy_name: "p", partition_key: "concurrency=acct:1")
+  end
+
+  def test_total_admitted_increments_on_claim
+    DispatchPolicy::Repository.stage!(
+      policy_name: "p", partition_key: "k", queue_name: nil,
+      job_class: "J", job_data: { "job_id" => "j1", "job_class" => "J", "arguments" => [] },
+      context: {}, priority: 0
+    )
+    DispatchPolicy::Repository.stage!(
+      policy_name: "p", partition_key: "k", queue_name: nil,
+      job_class: "J", job_data: { "job_id" => "j2", "job_class" => "J", "arguments" => [] },
+      context: {}, priority: 0
+    )
+    DispatchPolicy::Repository.claim_staged_jobs!(
+      policy_name: "p", partition_key: "k", limit: 2,
+      gate_state_patch: {}, retry_after: nil
+    )
+    assert_equal 2, DispatchPolicy::Partition.first.total_admitted
+  end
+
+  def test_record_tick_sample_and_summary
+    DispatchPolicy::Repository.record_tick_sample!(
+      policy_name: "p", duration_ms: 30, partitions_seen: 5,
+      partitions_admitted: 3, partitions_denied: 2,
+      jobs_admitted: 12, forward_failures: 1,
+      pending_total: 100, inflight_total: 4,
+      denied_reasons: { "throttle_empty" => 2 }
+    )
+    DispatchPolicy::Repository.record_tick_sample!(
+      policy_name: "p", duration_ms: 40, partitions_seen: 6,
+      partitions_admitted: 4, partitions_denied: 2,
+      jobs_admitted: 8, forward_failures: 0,
+      pending_total: 80, inflight_total: 4,
+      denied_reasons: { "concurrency_full" => 1, "throttle_empty" => 1 }
+    )
+
+    summary = DispatchPolicy::Repository.tick_summary(policy_name: "p", since: Time.current - 60)
+    assert_equal 20, summary[:jobs_admitted]
+    assert_equal 11, summary[:partitions_seen]
+    assert_equal 1,  summary[:forward_failures]
+    assert_equal 2,  summary[:ticks]
+
+    reasons = DispatchPolicy::Repository.denied_reasons_summary(policy_name: "p", since: Time.current - 60)
+    assert_equal 3, reasons["throttle_empty"]
+    assert_equal 1, reasons["concurrency_full"]
+  end
+
+  def test_partition_round_trip_stats
+    # Three partitions: one never checked, one checked 10s ago, one checked 1s ago
+    DispatchPolicy::Repository.stage!(
+      policy_name: "p", partition_key: "k1", queue_name: nil,
+      job_class: "J", job_data: { "job_id" => "1", "job_class" => "J", "arguments" => [] },
+      context: {}, priority: 0
+    )
+    DispatchPolicy::Repository.stage!(
+      policy_name: "p", partition_key: "k2", queue_name: nil,
+      job_class: "J", job_data: { "job_id" => "2", "job_class" => "J", "arguments" => [] },
+      context: {}, priority: 0
+    )
+    DispatchPolicy::Partition.where(partition_key: "k1").update_all(last_checked_at: 10.seconds.ago)
+    DispatchPolicy::Partition.where(partition_key: "k2").update_all(last_checked_at: 1.second.ago)
+
+    stats = DispatchPolicy::Repository.partition_round_trip_stats(policy_name: "p")
+    assert_equal 2, stats[:active_partitions]
+    assert_in_delta 10.0, stats[:oldest_age_seconds], 1.5
+  end
+
+  def test_sweep_old_tick_samples
+    DispatchPolicy::Repository.record_tick_sample!(
+      policy_name: "p", duration_ms: 0, partitions_seen: 0, partitions_admitted: 0,
+      partitions_denied: 0, jobs_admitted: 0, forward_failures: 0,
+      pending_total: 0, inflight_total: 0, denied_reasons: {}
+    )
+    DispatchPolicy::TickSample.update_all(sampled_at: 2.days.ago)
+
+    DispatchPolicy::Repository.sweep_old_tick_samples!(cutoff_seconds: 24 * 60 * 60)
+
+    assert_equal 0, DispatchPolicy::TickSample.count
   end
 
   def test_concurrent_claim_partitions_uses_skip_locked

@@ -13,6 +13,7 @@ module DispatchPolicy
     STAGED_TABLE      = "dispatch_policy_staged_jobs"
     PARTITIONS_TABLE  = "dispatch_policy_partitions"
     INFLIGHT_TABLE    = "dispatch_policy_inflight_jobs"
+    SAMPLES_TABLE     = "dispatch_policy_tick_samples"
 
     module_function
 
@@ -203,6 +204,7 @@ module DispatchPolicy
         <<~SQL.squish,
           UPDATE #{PARTITIONS_TABLE}
           SET pending_count    = GREATEST(pending_count - $3, 0),
+              total_admitted   = total_admitted + $3,
               last_admit_at    = CASE WHEN $3 > 0 THEN now() ELSE last_admit_at END,
               gate_state       = gate_state || $4::jsonb,
               next_eligible_at = #{next_eligible_sql},
@@ -325,6 +327,159 @@ module DispatchPolicy
     # reasonable inflight job — concurrency state lives in inflight_jobs
     # and is independent of partition rows, so a recreated partition will
     # re-observe the live in-flight count via the concurrency gate.
+    # ----- metrics --------------------------------------------------------------
+
+    # Records one row per Tick.run with admission and timing aggregates so the
+    # operator UI can display rates over time without sampling on the read
+    # path.
+    def record_tick_sample!(policy_name:, duration_ms:, partitions_seen:, partitions_admitted:,
+                            partitions_denied:, jobs_admitted:, forward_failures:,
+                            pending_total:, inflight_total:, denied_reasons:)
+      connection.exec_query(
+        <<~SQL.squish,
+          INSERT INTO #{SAMPLES_TABLE}
+            (policy_name, sampled_at, duration_ms, partitions_seen, partitions_admitted,
+             partitions_denied, jobs_admitted, forward_failures, pending_total,
+             inflight_total, denied_reasons)
+          VALUES ($1, now(), $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb)
+        SQL
+        "record_tick_sample",
+        [policy_name, duration_ms.to_i, partitions_seen.to_i, partitions_admitted.to_i,
+         partitions_denied.to_i, jobs_admitted.to_i, forward_failures.to_i,
+         pending_total.to_i, inflight_total.to_i, JSON.dump(denied_reasons || {})]
+      )
+    end
+
+    # Aggregate counters since `since` (a Time). If `policy_name` is nil,
+    # aggregates across all policies. Returns a Hash with summary keys.
+    def tick_summary(policy_name: nil, since:)
+      where_sql, params = sample_filter(policy_name, since)
+      result = connection.exec_query(
+        <<~SQL.squish,
+          SELECT
+            COALESCE(SUM(jobs_admitted), 0)::int        AS jobs_admitted,
+            COALESCE(SUM(partitions_seen), 0)::int       AS partitions_seen,
+            COALESCE(SUM(partitions_admitted), 0)::int   AS partitions_admitted,
+            COALESCE(SUM(partitions_denied), 0)::int     AS partitions_denied,
+            COALESCE(SUM(forward_failures), 0)::int      AS forward_failures,
+            COUNT(*)::int                                AS ticks,
+            COALESCE(AVG(duration_ms), 0)::int           AS avg_duration_ms,
+            COALESCE(MAX(duration_ms), 0)::int           AS max_duration_ms,
+            MAX(sampled_at)                              AS last_sampled_at
+          FROM #{SAMPLES_TABLE}
+          #{where_sql}
+        SQL
+        "tick_summary",
+        params
+      )
+      row = result.first || {}
+      {
+        jobs_admitted:       row["jobs_admitted"].to_i,
+        partitions_seen:     row["partitions_seen"].to_i,
+        partitions_admitted: row["partitions_admitted"].to_i,
+        partitions_denied:   row["partitions_denied"].to_i,
+        forward_failures:    row["forward_failures"].to_i,
+        ticks:               row["ticks"].to_i,
+        avg_duration_ms:     row["avg_duration_ms"].to_i,
+        max_duration_ms:     row["max_duration_ms"].to_i,
+        last_sampled_at:     row["last_sampled_at"]
+      }
+    end
+
+    # Aggregate denied_reasons jsonb across samples in window: returns
+    # { "throttle" => 12, "concurrency_full" => 3, ... }
+    def denied_reasons_summary(policy_name: nil, since:)
+      where_sql, params = sample_filter(policy_name, since)
+      result = connection.exec_query(
+        <<~SQL.squish,
+          SELECT key, SUM(value::int)::int AS total
+          FROM #{SAMPLES_TABLE},
+               LATERAL jsonb_each_text(denied_reasons)
+          #{where_sql}
+          GROUP BY key
+          ORDER BY total DESC
+        SQL
+        "denied_reasons_summary",
+        params
+      )
+      result.to_a.each_with_object({}) { |r, h| h[r["key"]] = r["total"].to_i }
+    end
+
+    # Returns time-bucketed series for sparklines. `bucket_seconds` is the
+    # bucket width. Each row: { bucket_at:, jobs_admitted:, ... }.
+    def tick_samples_buckets(policy_name: nil, since:, bucket_seconds: 60)
+      where_sql, params = sample_filter(policy_name, since)
+      bucket_param_idx = params.size + 1
+      params << bucket_seconds.to_i
+
+      result = connection.exec_query(
+        <<~SQL.squish,
+          SELECT
+            date_bin(($#{bucket_param_idx} || ' seconds')::interval, sampled_at, TIMESTAMP '2000-01-01') AS bucket_at,
+            COALESCE(SUM(jobs_admitted), 0)::int AS jobs_admitted,
+            COALESCE(SUM(forward_failures), 0)::int AS forward_failures,
+            COUNT(*)::int AS ticks
+          FROM #{SAMPLES_TABLE}
+          #{where_sql}
+          GROUP BY bucket_at
+          ORDER BY bucket_at ASC
+        SQL
+        "tick_samples_buckets",
+        params
+      )
+      result.to_a.map do |r|
+        { bucket_at: r["bucket_at"], jobs_admitted: r["jobs_admitted"].to_i,
+          forward_failures: r["forward_failures"].to_i, ticks: r["ticks"].to_i }
+      end
+    end
+
+    # Round-trip statistics across active partitions: how stale is the most-
+    # stale partition the tick has yet to revisit? P50/P95/oldest ages help
+    # decide if partition_batch_size needs to grow or ticks need sharding.
+    def partition_round_trip_stats(policy_name: nil)
+      filter_sql = "WHERE p.status = 'active' AND p.pending_count > 0"
+      params     = []
+      if policy_name
+        filter_sql += " AND p.policy_name = $1"
+        params << policy_name
+      end
+
+      result = connection.exec_query(
+        <<~SQL.squish,
+          SELECT
+            COUNT(*)::int AS active_partitions,
+            COUNT(*) FILTER (WHERE p.last_checked_at IS NULL)::int AS never_checked,
+            COUNT(*) FILTER (WHERE p.next_eligible_at IS NOT NULL AND p.next_eligible_at > now())::int AS in_backoff,
+            EXTRACT(EPOCH FROM (now() - MIN(p.last_checked_at)))::float AS oldest_age_seconds,
+            EXTRACT(EPOCH FROM (now() - PERCENTILE_DISC(0.5) WITHIN GROUP (ORDER BY p.last_checked_at)))::float AS p50_age_seconds,
+            EXTRACT(EPOCH FROM (now() - PERCENTILE_DISC(0.95) WITHIN GROUP (ORDER BY p.last_checked_at)))::float AS p95_age_seconds
+          FROM #{PARTITIONS_TABLE} p
+          #{filter_sql}
+        SQL
+        "partition_round_trip_stats",
+        params
+      )
+      row = result.first || {}
+      {
+        active_partitions:  row["active_partitions"].to_i,
+        never_checked:      row["never_checked"].to_i,
+        in_backoff:         row["in_backoff"].to_i,
+        oldest_age_seconds: row["oldest_age_seconds"]&.to_f,
+        p50_age_seconds:    row["p50_age_seconds"]&.to_f,
+        p95_age_seconds:    row["p95_age_seconds"]&.to_f
+      }
+    end
+
+    def sweep_old_tick_samples!(cutoff_seconds:)
+      connection.exec_query(
+        "DELETE FROM #{SAMPLES_TABLE} WHERE sampled_at < now() - ($1 || ' seconds')::interval",
+        "sweep_old_tick_samples",
+        [cutoff_seconds.to_i]
+      )
+    end
+
+    # ----------------------------------------------------------------------------
+
     def sweep_inactive_partitions!(cutoff_seconds:)
       connection.exec_query(
         <<~SQL.squish,
@@ -370,6 +525,16 @@ module DispatchPolicy
         rescue JSON::ParserError
           {}
         end
+      end
+    end
+
+    def sample_filter(policy_name, since)
+      params = [since]
+      if policy_name
+        params << policy_name
+        ["WHERE sampled_at >= $1 AND policy_name = $2", params]
+      else
+        ["WHERE sampled_at >= $1", params]
       end
     end
 

@@ -39,7 +39,10 @@ module DispatchPolicy
           missing      = 1.0 - tokens
           retry_after  = missing / refill_rate
           patch        = { "tokens" => tokens, "refilled_at" => now }
-          return Decision.new(allowed: 0, retry_after: retry_after, gate_state_patch: { "throttle" => patch })
+          return Decision.new(allowed: 0,
+                              retry_after: retry_after,
+                              gate_state_patch: { "throttle" => patch },
+                              reason: "throttle_empty")
         end
 
         allowed = [whole, admit_budget].min

@@ -4,18 +4,25 @@
   <code><%= @partition.partition_key %></code>
 </h1>
 
+<% in_backoff = @partition.next_eligible_at && @partition.next_eligible_at > Time.current %>
+<% age_seconds = @partition.last_checked_at && (Time.current - @partition.last_checked_at) %>
+
 <section class="dp-stats">
   <div class="dp-stat"><span class="dp-stat-label">Policy</span><span class="dp-stat-value"><%= @partition.policy_name %></span></div>
-  <div class="dp-stat"><span class="dp-stat-label">Status</span><span class="dp-stat-value <%= @partition.paused? ? "dp-warn" : "" %>"><%= @partition.status %></span></div>
+  <div class="dp-stat"><span class="dp-stat-label">Status</span><span class="dp-stat-value <%= "dp-warn" if @partition.paused? %>"><%= @partition.status %></span></div>
   <div class="dp-stat"><span class="dp-stat-label">Pending</span><span class="dp-stat-value"><%= format_count(@partition.pending_count) %></span></div>
+  <div class="dp-stat"><span class="dp-stat-label">Lifetime admitted</span><span class="dp-stat-value"><%= format_count(@partition.total_admitted) %></span></div>
+  <div class="dp-stat"><span class="dp-stat-label">Round-trip age</span><span class="dp-stat-value"><%= age_seconds ? format_duration_seconds(age_seconds) : "never" %></span></div>
+  <div class="dp-stat"><span class="dp-stat-label">Backoff</span><span class="dp-stat-value <%= "dp-warn" if in_backoff %>"><%= in_backoff ? "until #{format_time(@partition.next_eligible_at)}" : "—" %></span></div>
 </section>
 
 <section class="dp-section">
   <h2>Timing</h2>
   <ul class="dp-list">
-    <li>Next eligible: <%= format_time(@partition.next_eligible_at) %></li>
+    <li>Last checked: <%= format_time(@partition.last_checked_at) %></li>
     <li>Last admit: <%= format_time(@partition.last_admit_at) %></li>
     <li>Last enqueued: <%= format_time(@partition.last_enqueued_at) %></li>
+    <li>Next eligible: <%= format_time(@partition.next_eligible_at) %></li>
     <li>Context updated: <%= format_time(@partition.context_updated_at) %></li>
   </ul>
 </section>
