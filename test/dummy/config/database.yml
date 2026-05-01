@@ -1,0 +1,15 @@
+default: &default
+  adapter: postgresql
+  encoding: unicode
+  pool: <%= ENV.fetch("DB_POOL", 5) %>
+  host: <%= ENV.fetch("DB_HOST", "localhost") %>
+  username: <%= ENV.fetch("DB_USER", ENV["USER"]) %>
+  password: <%= ENV.fetch("DB_PASS", "") %>
+
+development:
+  <<: *default
+  database: <%= ENV.fetch("DB_NAME", "dispatch_policy_dummy") %>
+
+test:
+  <<: *default
+  database: <%= ENV.fetch("DB_NAME", "dispatch_policy_test") %>

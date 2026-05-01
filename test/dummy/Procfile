@@ -1,0 +1,3 @@
+web:    bin/rails server -p ${PORT:-3000}
+worker: bin/rails dispatch_policy:dummy_worker
+tick:   bin/rails dispatch_policy:dummy_tick

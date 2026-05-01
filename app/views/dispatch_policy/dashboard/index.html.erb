@@ -1,0 +1,35 @@
+<turbo-frame id="dp_dashboard" target="_top" refresh="morph">
+  <section class="dp-stats">
+    <div class="dp-stat"><span class="dp-stat-label">Staged</span><span class="dp-stat-value"><%= format_count(@totals[:staged]) %></span></div>
+    <div class="dp-stat"><span class="dp-stat-label">Partitions</span><span class="dp-stat-value"><%= format_count(@totals[:partitions]) %></span></div>
+    <div class="dp-stat"><span class="dp-stat-label">Active</span><span class="dp-stat-value"><%= format_count(@totals[:active_parts]) %></span></div>
+    <div class="dp-stat"><span class="dp-stat-label">Paused</span><span class="dp-stat-value dp-warn"><%= format_count(@totals[:paused_parts]) %></span></div>
+    <div class="dp-stat"><span class="dp-stat-label">In flight</span><span class="dp-stat-value"><%= format_count(@totals[:in_flight]) %></span></div>
+  </section>
+
+  <section class="dp-section">
+    <h2>Policies</h2>
+    <% if @policies.empty? %>
+      <p class="dp-empty">No policies have produced staged jobs yet.</p>
+    <% else %>
+      <table class="dp-table">
+        <thead>
+          <tr><th>Name</th><th class="dp-num">Pending</th><th class="dp-num">In flight</th><th>Last admit</th><th></th></tr>
+        </thead>
+        <tbody>
+          <% @policies.each do |p| %>
+            <tr>
+              <td><%= link_to p[:name], policy_path(p[:name]), class: "dp-link" %></td>
+              <td class="dp-num"><%= format_count(p[:pending]) %></td>
+              <td class="dp-num"><%= format_count(p[:in_flight]) %></td>
+              <td><%= format_time(p[:last_admit_at]) %></td>
+              <td><%= link_to "Partitions →", partitions_path(policy: p[:name]), class: "dp-link" %></td>
+            </tr>
+          <% end %>
+        </tbody>
+      </table>
+    <% end %>
+  </section>
+</turbo-frame>
+
+<meta http-equiv="refresh" content="3">

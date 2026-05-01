@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# Helper to start the dummy app under either adapter.
+#
+# Usage:
+#   bin/dummy good_job        # boot dummy with good_job adapter
+#   bin/dummy solid_queue     # boot dummy with solid_queue adapter
+#   bin/dummy setup good_job  # create DB, run migrations
+#   bin/dummy console         # rails console with current adapter
+#
+set -e
+
+cmd="${1:-help}"
+case "$cmd" in
+  good_job|solid_queue)
+    export DUMMY_ADAPTER="$cmd"
+    cd "$(dirname "$0")/../test/dummy"
+    if ! command -v foreman >/dev/null 2>&1; then
+      echo "foreman not installed. Run: gem install foreman" >&2
+      exit 1
+    fi
+    exec foreman start
+    ;;
+  setup)
+    export DUMMY_ADAPTER="${2:-good_job}"
+    cd "$(dirname "$0")/../test/dummy"
+    bin/rails db:drop db:create
+    bin/rails db:migrate
+    case "$DUMMY_ADAPTER" in
+      good_job)
+        bin/rails g good_job:install
+        bin/rails db:migrate
+        ;;
+      solid_queue)
+        bin/rails g solid_queue:install
+        bin/rails db:migrate
+        ;;
+    esac
+    ;;
+  console|c)
+    export DUMMY_ADAPTER="${2:-good_job}"
+    cd "$(dirname "$0")/../test/dummy"
+    exec bin/rails console
+    ;;
+  *)
+    cat <<USAGE
+bin/dummy good_job          # start dummy app with good_job (web + worker + tick)
+bin/dummy solid_queue       # start dummy app with solid_queue
+bin/dummy setup good_job    # create DB & run migrations for good_job adapter
+bin/dummy setup solid_queue # create DB & run migrations for solid_queue adapter
+bin/dummy console [adapter] # rails console
+USAGE
+    ;;
+esac

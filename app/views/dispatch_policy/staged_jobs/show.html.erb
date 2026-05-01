@@ -1,0 +1,31 @@
+<h1>Staged job #<%= @job.id %></h1>
+
+<section class="dp-stats">
+  <div class="dp-stat"><span class="dp-stat-label">Policy</span><span class="dp-stat-value"><%= @job.policy_name %></span></div>
+  <div class="dp-stat"><span class="dp-stat-label">Class</span><span class="dp-stat-value"><code><%= @job.job_class %></code></span></div>
+  <div class="dp-stat"><span class="dp-stat-label">Queue</span><span class="dp-stat-value"><%= @job.queue_name || "—" %></span></div>
+  <div class="dp-stat"><span class="dp-stat-label">Priority</span><span class="dp-stat-value"><%= @job.priority %></span></div>
+</section>
+
+<section class="dp-section">
+  <h2>Partition</h2>
+  <p><code><%= @job.partition_key %></code></p>
+</section>
+
+<section class="dp-section">
+  <h2>Timing</h2>
+  <ul class="dp-list">
+    <li>Enqueued: <%= format_time(@job.enqueued_at) %></li>
+    <li>Scheduled: <%= format_time(@job.scheduled_at) %></li>
+  </ul>
+</section>
+
+<section class="dp-section">
+  <h2>Context snapshot</h2>
+  <pre class="dp-json"><%= JSON.pretty_generate(@job.context || {}) %></pre>
+</section>
+
+<section class="dp-section">
+  <h2>ActiveJob payload</h2>
+  <pre class="dp-json"><%= JSON.pretty_generate(@job.job_data || {}) %></pre>
+</section>

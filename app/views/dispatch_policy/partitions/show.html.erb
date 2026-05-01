@@ -1,0 +1,61 @@
+<h1>
+  <%= link_to "← all partitions", partitions_path(policy: @partition.policy_name), class: "dp-link" %>
+  /
+  <code><%= @partition.partition_key %></code>
+</h1>
+
+<section class="dp-stats">
+  <div class="dp-stat"><span class="dp-stat-label">Policy</span><span class="dp-stat-value"><%= @partition.policy_name %></span></div>
+  <div class="dp-stat"><span class="dp-stat-label">Status</span><span class="dp-stat-value <%= @partition.paused? ? "dp-warn" : "" %>"><%= @partition.status %></span></div>
+  <div class="dp-stat"><span class="dp-stat-label">Pending</span><span class="dp-stat-value"><%= format_count(@partition.pending_count) %></span></div>
+  <div class="dp-stat"><span class="dp-stat-label">In flight</span><span class="dp-stat-value"><%= format_count(@partition.in_flight_count) %></span></div>
+</section>
+
+<section class="dp-section">
+  <h2>Timing</h2>
+  <ul class="dp-list">
+    <li>Next eligible: <%= format_time(@partition.next_eligible_at) %></li>
+    <li>Last admit: <%= format_time(@partition.last_admit_at) %></li>
+    <li>Last enqueued: <%= format_time(@partition.last_enqueued_at) %></li>
+    <li>Context updated: <%= format_time(@partition.context_updated_at) %></li>
+  </ul>
+</section>
+
+<section class="dp-section">
+  <h2>Context (refreshed on each enqueue)</h2>
+  <pre class="dp-json"><%= JSON.pretty_generate(@partition.context || {}) %></pre>
+</section>
+
+<section class="dp-section">
+  <h2>Gate state</h2>
+  <pre class="dp-json"><%= JSON.pretty_generate(@partition.gate_state || {}) %></pre>
+</section>
+
+<section class="dp-section">
+  <h2>Recent staged jobs (max 50)</h2>
+  <% if @recent_jobs.any? %>
+    <table class="dp-table">
+      <thead><tr><th>id</th><th>Job class</th><th>Scheduled</th><th>Enqueued</th><th></th></tr></thead>
+      <tbody>
+        <% @recent_jobs.each do |j| %>
+          <tr>
+            <td><%= j.id %></td>
+            <td><code><%= j.job_class %></code></td>
+            <td><%= format_time(j.scheduled_at) %></td>
+            <td><%= format_time(j.enqueued_at) %></td>
+            <td><%= link_to "inspect", staged_job_path(j), class: "dp-link" %></td>
+          </tr>
+        <% end %>
+      </tbody>
+    </table>
+  <% else %>
+    <p class="dp-empty">No staged jobs in this partition.</p>
+  <% end %>
+</section>
+
+<section class="dp-section">
+  <h2>Actions</h2>
+  <%= button_to "Force admit 1",  admit_partition_path(@partition, count: 1),   class: "dp-btn", method: :post, form: { class: "dp-form-inline" } %>
+  <%= button_to "Force admit 10", admit_partition_path(@partition, count: 10),  class: "dp-btn", method: :post, form: { class: "dp-form-inline" } %>
+  <%= button_to "Clear partition", clear_partition_path(@partition), class: "dp-btn dp-btn-warn", method: :post, form: { class: "dp-form-inline", data: { turbo_confirm: "Delete all staged jobs in this partition?" } } %>
+</section>

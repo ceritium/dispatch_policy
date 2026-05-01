@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <title>dispatch_policy</title>
+    <%= csrf_meta_tags %>
+    <style><%= DispatchPolicy::Engine.root.join("app/assets/stylesheets/dispatch_policy/application.css").read.html_safe %></style>
+    <script src="https://cdn.jsdelivr.net/npm/@hotwired/turbo@8.0.4/dist/turbo.es2017-umd.min.js" defer></script>
+  </head>
+  <body data-turbo="true">
+    <header class="dp-header">
+      <div class="dp-brand">
+        <%= link_to "dispatch_policy", root_path, class: "dp-logo" %>
+      </div>
+      <nav class="dp-nav">
+        <%= link_to "Dashboard",  root_path %>
+        <%= link_to "Policies",   policies_path %>
+        <%= link_to "Partitions", partitions_path %>
+      </nav>
+    </header>
+    <% if flash[:notice] %><div class="dp-flash dp-flash-ok"><%= flash[:notice] %></div><% end %>
+    <% if flash[:alert]  %><div class="dp-flash dp-flash-err"><%= flash[:alert]  %></div><% end %>
+    <main class="dp-main">
+      <%= yield %>
+    </main>
+    <footer class="dp-footer">
+      <span>dispatch_policy v<%= DispatchPolicy::VERSION %></span>
+      <span>now: <%= Time.current.utc.strftime("%Y-%m-%d %H:%M:%S UTC") %></span>
+    </footer>
+  </body>
+</html>
