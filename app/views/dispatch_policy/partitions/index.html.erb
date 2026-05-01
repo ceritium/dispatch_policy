@@ -1,3 +1,4 @@
+<% content_for :auto_refresh_seconds, "5" %>
 <h1>Partitions<% if @policy %> · <code><%= @policy %></code><% end %></h1>
 
 <%= form_with url: partitions_path, method: :get, local: true, class: "dp-search-form" do |f| %>
@@ -24,5 +25,3 @@
 <% else %>
   <p class="dp-empty">No partitions match.</p>
 <% end %>
-
-<meta http-equiv="refresh" content="5">

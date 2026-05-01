@@ -1,4 +1,4 @@
-<turbo-frame id="dp_dashboard" target="_top" refresh="morph">
+<% content_for :auto_refresh_seconds, "5" %>
   <section class="dp-stats">
     <div class="dp-stat"><span class="dp-stat-label">Staged</span><span class="dp-stat-value"><%= format_count(@totals[:staged]) %></span></div>
     <div class="dp-stat"><span class="dp-stat-label">Partitions</span><span class="dp-stat-value"><%= format_count(@totals[:partitions]) %></span></div>
@@ -96,6 +96,3 @@
       </table>
     <% end %>
   </section>
-</turbo-frame>
-
-<meta http-equiv="refresh" content="3">
