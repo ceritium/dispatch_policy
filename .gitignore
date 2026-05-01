@@ -13,6 +13,8 @@ Gemfile.lock
 test/dummy/log/*
 test/dummy/tmp/*
 test/dummy/db/*.sqlite3*
+test/dummy/db/migrate/
+test/dummy/db/schema.rb
 test/dummy/storage/
 test/dummy/.bundle/
 !test/dummy/log/.keep
