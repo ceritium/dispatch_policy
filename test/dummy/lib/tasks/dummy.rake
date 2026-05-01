@@ -15,9 +15,9 @@ namespace :dispatch_policy do
 
   desc "Run the dispatch tick loop in-process (long-running; foreman-friendly)"
   task dummy_tick: :environment do
-    # Eager-load the predefined jobs so their `dispatch_policy` macros register
-    # in DispatchPolicy.registry before the tick loop starts looking for them.
-    %w[SlowExternalApiJob BulkAccountJob MixedJob PerformInJob RetryFlakyJob].each(&:constantize)
+    # Eager-load every dispatch_policy-using job so their macros register in
+    # DispatchPolicy.registry before the tick loop starts looking for them.
+    Rails.application.eager_load!
 
     Rails.logger.info("[dummy] starting in-process tick loop (policies: #{DispatchPolicy.registry.names.inspect})")
 
