@@ -2,7 +2,9 @@
 
 module DispatchPolicy
   class PoliciesController < ApplicationController
-    before_action :find_policy, only: %i[show pause resume]
+    before_action :find_policy, only: %i[show pause resume drain]
+
+    DRAIN_MAX_PER_REQUEST = 10_000
 
     def index
       registry_names = DispatchPolicy.registry.names
@@ -58,6 +60,31 @@ module DispatchPolicy
     def resume
       Partition.for_policy(@policy_name).update_all(status: "active", updated_at: Time.current)
       redirect_to policy_path(@policy_name), notice: "Policy resumed."
+    end
+
+    # Force-admits every staged job across every partition of the policy,
+    # bypassing all gates. Walks partitions in pending-DESC order so the
+    # busiest ones drain first. Bounded at DRAIN_MAX_PER_REQUEST per click.
+    def drain
+      drained = 0
+      Partition.for_policy(@policy_name)
+               .where("pending_count > 0")
+               .order(pending_count: :desc, id: :asc)
+               .limit(500)
+               .each do |partition|
+        break if drained >= DRAIN_MAX_PER_REQUEST
+
+        batch, _ = PartitionsController.drain_partition!(partition)
+        drained += batch
+      end
+
+      remaining = Partition.for_policy(@policy_name).sum(:pending_count)
+      notice = if remaining.positive?
+        "Drained #{drained} job(s) across this policy; #{remaining} still pending — click drain again to continue."
+      else
+        "Drained #{drained} job(s); policy fully drained."
+      end
+      redirect_to policy_path(@policy_name), notice: notice
     end
 
     private

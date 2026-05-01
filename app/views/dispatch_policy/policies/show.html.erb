@@ -137,6 +137,17 @@
 </section>
 
 <section class="dp-section">
-  <%= button_to "Pause all partitions",  pause_policy_path(@policy_name),  class: "dp-btn", method: :post, form: { class: "dp-form-inline" } %>
+  <h2>Actions</h2>
+  <%= button_to "Pause all partitions",  pause_policy_path(@policy_name),  class: "dp-btn",         method: :post, form: { class: "dp-form-inline" } %>
   <%= button_to "Resume all partitions", resume_policy_path(@policy_name), class: "dp-btn dp-btn-ok", method: :post, form: { class: "dp-form-inline" } %>
+  <%= button_to "Drain policy",          drain_policy_path(@policy_name),
+                class:  "dp-btn dp-btn-warn",
+                method: :post,
+                form: { class: "dp-form-inline",
+                        onsubmit: "return confirm('Force-admit every staged job across every partition of this policy, bypassing all gates?');" } %>
+  <p class="dp-hint">
+    <strong>Pause</strong> stops admission but keeps staging — the queue keeps filling, in-flight jobs finish.
+    <strong>Drain</strong> empties the staging table by force-admitting every job (bypassing gates).
+    Capped at 10,000 jobs per click — click again for more.
+  </p>
 </section>
