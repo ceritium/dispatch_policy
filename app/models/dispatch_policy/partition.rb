@@ -5,6 +5,7 @@ module DispatchPolicy
     self.table_name = "dispatch_policy_partitions"
 
     scope :for_policy, ->(name) { where(policy_name: name) }
+    scope :for_shard,  ->(s)    { s ? where(shard: s) : all }
     scope :active,     -> { where(status: "active") }
     scope :paused,     -> { where(status: "paused") }
     scope :pending,    -> { where("pending_count > 0") }

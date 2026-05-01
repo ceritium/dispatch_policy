@@ -9,12 +9,13 @@ module DispatchPolicy
   class Tick
     Result = Struct.new(:partitions_seen, :jobs_admitted, keyword_init: true)
 
-    def self.run(policy_name:)
-      new(policy_name).call
+    def self.run(policy_name:, shard: nil)
+      new(policy_name, shard: shard).call
     end
 
-    def initialize(policy_name)
+    def initialize(policy_name, shard: nil)
       @policy_name = policy_name
+      @shard       = shard
       @policy      = DispatchPolicy.registry.fetch(policy_name) || raise(InvalidPolicy, "unknown policy #{policy_name.inspect}")
       @config      = DispatchPolicy.config
     end
@@ -30,6 +31,7 @@ module DispatchPolicy
 
       partitions = Repository.claim_partitions(
         policy_name: @policy_name,
+        shard:       @shard,
         limit:       @config.partition_batch_size
       )
 

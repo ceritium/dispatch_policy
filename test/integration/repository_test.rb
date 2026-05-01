@@ -56,7 +56,7 @@ class RepositoryIntegrationTest < Minitest::Test
 
     # Detect schema drift (e.g. new column added in a migration update).
     cols = conn.columns("dispatch_policy_partitions").map(&:name)
-    return false unless %w[total_admitted].all? { |c| cols.include?(c) }
+    return false unless %w[total_admitted shard].all? { |c| cols.include?(c) }
 
     true
   end
@@ -315,6 +315,52 @@ class RepositoryIntegrationTest < Minitest::Test
     DispatchPolicy::Repository.sweep_old_tick_samples!(cutoff_seconds: 24 * 60 * 60)
 
     assert_equal 0, DispatchPolicy::TickSample.count
+  end
+
+  def test_partitions_default_shard_when_not_specified
+    DispatchPolicy::Repository.stage!(
+      policy_name: "p", partition_key: "k", queue_name: nil,
+      job_class: "J", job_data: { "job_id" => "1", "job_class" => "J", "arguments" => [] },
+      context: {}, priority: 0
+    )
+    assert_equal "default", DispatchPolicy::Partition.first.shard
+  end
+
+  def test_claim_partitions_filters_by_shard
+    DispatchPolicy::Repository.stage!(
+      policy_name: "p", partition_key: "k1", queue_name: nil, shard: "shard-a",
+      job_class: "J", job_data: { "job_id" => "1", "job_class" => "J", "arguments" => [] },
+      context: {}, priority: 0
+    )
+    DispatchPolicy::Repository.stage!(
+      policy_name: "p", partition_key: "k2", queue_name: nil, shard: "shard-b",
+      job_class: "J", job_data: { "job_id" => "2", "job_class" => "J", "arguments" => [] },
+      context: {}, priority: 0
+    )
+
+    rows_a = DispatchPolicy::Repository.claim_partitions(policy_name: "p", shard: "shard-a", limit: 10)
+    assert_equal ["k1"], rows_a.map { |r| r["partition_key"] }
+
+    rows_b = DispatchPolicy::Repository.claim_partitions(policy_name: "p", shard: "shard-b", limit: 10)
+    assert_equal ["k2"], rows_b.map { |r| r["partition_key"] }
+
+    rows_all = DispatchPolicy::Repository.claim_partitions(policy_name: "p", limit: 10)
+    assert_equal %w[k1 k2].sort, rows_all.map { |r| r["partition_key"] }.sort
+  end
+
+  def test_shard_is_pinned_on_first_write
+    DispatchPolicy::Repository.stage!(
+      policy_name: "p", partition_key: "k", queue_name: nil, shard: "shard-a",
+      job_class: "J", job_data: { "job_id" => "1", "job_class" => "J", "arguments" => [] },
+      context: {}, priority: 0
+    )
+    DispatchPolicy::Repository.stage!(
+      policy_name: "p", partition_key: "k", queue_name: nil, shard: "shard-b",
+      job_class: "J", job_data: { "job_id" => "2", "job_class" => "J", "arguments" => [] },
+      context: {}, priority: 0
+    )
+    assert_equal "shard-a", DispatchPolicy::Partition.first.shard,
+                 "shard must be sticky to the first writer to avoid bouncing partitions across tick workers"
   end
 
   def test_concurrent_claim_partitions_uses_skip_locked

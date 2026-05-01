@@ -35,15 +35,17 @@ module DispatchPolicy
         return block.call
       end
 
-      ctx           = policy.build_context(job.arguments)
-      partition_key = policy.partition_key_for(ctx)
-      payload       = Serializer.serialize(job)
       queue_name    = job.queue_name&.to_s || policy.queue_name
+      ctx           = policy.build_context(job.arguments, queue_name: queue_name)
+      partition_key = policy.partition_key_for(ctx)
+      shard         = policy.shard_for(ctx)
+      payload       = Serializer.serialize(job)
 
       Repository.stage!(
         policy_name:   policy.name,
         partition_key: partition_key,
         queue_name:    queue_name,
+        shard:         shard,
         job_class:     job.class.name,
         job_data:      payload,
         context:       ctx.to_jsonb,
@@ -92,15 +94,18 @@ module DispatchPolicy
           policy = DispatchPolicy.registry.fetch(job.class.dispatch_policy_name)
           next unless policy
 
-          ctx           = policy.build_context(job.arguments)
+          queue_name    = job.queue_name&.to_s || policy.queue_name
+          ctx           = policy.build_context(job.arguments, queue_name: queue_name)
           partition_key = policy.partition_key_for(ctx)
+          shard         = policy.shard_for(ctx)
           payload       = Serializer.serialize(job)
           job.successfully_enqueued = true
 
           {
             policy_name:   policy.name,
             partition_key: partition_key,
-            queue_name:    job.queue_name&.to_s || policy.queue_name,
+            queue_name:    queue_name,
+            shard:         shard,
             job_class:     job.class.name,
             job_data:      payload,
             context:       ctx.to_jsonb,

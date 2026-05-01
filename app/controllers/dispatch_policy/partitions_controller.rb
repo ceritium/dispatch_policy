@@ -7,14 +7,20 @@ module DispatchPolicy
     def index
       scope = Partition.all
       scope = scope.for_policy(params[:policy]) if params[:policy].present?
+      scope = scope.for_shard(params[:shard])   if params[:shard].present?
       if (q = params[:q]).present?
         scope = scope.where("partition_key ILIKE ?", "%#{q}%")
       end
       scope = scope.order(Arel.sql("pending_count DESC, last_admit_at DESC NULLS LAST"))
 
       @policy     = params[:policy]
+      @shard      = params[:shard]
       @query      = params[:q]
       @partitions = scope.limit(200)
+
+      shards_scope = Partition.all
+      shards_scope = shards_scope.for_policy(params[:policy]) if params[:policy].present?
+      @shards      = shards_scope.distinct.pluck(:shard).sort
     end
 
     def show

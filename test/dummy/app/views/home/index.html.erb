@@ -70,6 +70,24 @@
   <p style="font-size:12px;color:#6b7280;">Bucket fills instantly so the limiter is your worker pool: tick should saturate <code>admission_batch_size</code> per partition.</p>
 </div>
 
+<h2>Sharding (shard_by)</h2>
+
+<div class="card">
+  <h3 style="margin:6px 0;">ShardedJob (account_id → 4 shards, queue = shard)</h3>
+  <%= form_with url: enqueue_many_path(job: "sharded"), method: :post, local: true do %>
+    <label>account_id</label> <input name="attrs[account_id]" value="acct-A"><br>
+    <label>max</label>        <input name="attrs[max]"        value="5"  size="6"><br>
+    <label>count</label>      <input name="count"             value="80" size="6"><br>
+    <button>Flood with ShardedJob</button>
+  <% end %>
+  <p style="font-size:12px;color:#6b7280;">
+    The job routes itself to <code>shard-N</code> (queue = shard). Launch
+    <code>4.times { |i| DispatchTickLoopJob.perform_later("sharded", "shard-#{i}") }</code>
+    in <code>bin/rails console</code> to enable parallel admission across shards.
+    Watch <code>/dispatch_policy/partitions?policy=sharded</code> with the shard filter.
+  </p>
+</div>
+
 <h2>Bulk enqueue (perform_all_later)</h2>
 
 <div class="card">

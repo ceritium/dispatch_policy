@@ -45,7 +45,10 @@ class JobExtensionTest < Minitest::Test
     assert_equal "testpolicy", row[:policy_name]
     assert_equal "throttle=hello", row[:partition_key]
     assert_equal "JobExtensionTestJob", row[:job_class]
-    assert_equal({"key" => "hello"}, row[:context])
+    # Context is enriched with the job's queue_name so shard_by/gates can use it.
+    assert_equal "hello",   row[:context]["key"]
+    assert_equal "default", row[:context]["queue_name"]
+    assert_equal "default", row[:shard]
   end
 
   def test_bypass_block_does_not_stage
