@@ -30,6 +30,7 @@ module DispatchPolicy
   class PolicyAlreadyRegistered < Error; end
   class UnknownGate < Error; end
   class InvalidPolicy < Error; end
+  class EnqueueFailed < Error; end
 
   # Adapters whose enqueue runs against ActiveRecord::Base.connection (so
   # the adapter INSERT can join the admission TX) or whose semantics make

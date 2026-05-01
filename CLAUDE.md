@@ -19,7 +19,7 @@ Ver `README.md` para la API y los ejemplos.
 v0.1 (en master). Todo el flujo principal está implementado y testeado.
 Lo pendiente está en `ideas.md` con su porqué.
 
-61 tests / 136 assertions. `bundle exec rake test` desde la raíz.
+63 tests / 145 assertions. `bundle exec rake test` desde la raíz.
 
 ## Arquitectura — 4 tablas
 
