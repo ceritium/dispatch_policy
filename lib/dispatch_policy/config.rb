@@ -13,7 +13,8 @@ module DispatchPolicy
                   :logger,
                   :clock,
                   :sweep_every_ticks,
-                  :metrics_retention
+                  :metrics_retention,
+                  :database_role
 
     def initialize
       @tick_max_duration         = 25
@@ -28,6 +29,9 @@ module DispatchPolicy
       @clock                     = -> { Time.now.utc }
       @sweep_every_ticks         = 50
       @metrics_retention         = 24 * 60 * 60
+      # AR role for the admission TX. nil = default connection. Set to
+      # e.g. :queue when the host runs solid_queue on a separate DB.
+      @database_role             = nil
     end
 
     def now

@@ -31,6 +31,13 @@ module DispatchPolicy
   class UnknownGate < Error; end
   class InvalidPolicy < Error; end
 
+  # Adapters whose enqueue runs against ActiveRecord::Base.connection (so
+  # the adapter INSERT can join the admission TX) or whose semantics make
+  # atomicity moot (test/inline). Substring match against the adapter
+  # class name keeps the check resilient to ActiveJob's wrapper renames.
+  PG_BACKED_ADAPTER_HINTS = %w[GoodJob SolidQueue].freeze
+  EXEMPT_ADAPTER_HINTS    = %w[Test Inline Async].freeze
+
   module_function
 
   def configure
@@ -51,6 +58,27 @@ module DispatchPolicy
 
   def reset_registry!
     @registry = Registry.new
+  end
+
+  # Logs a warning if the configured ActiveJob adapter is not one of the
+  # PG-backed ones the gem can guarantee atomic admission for. We do NOT
+  # raise: a host may use a custom PG-backed adapter we don't recognize,
+  # or may have accepted the trade-off knowingly. The warning is enough
+  # to surface the issue at boot.
+  def warn_unsupported_adapter
+    return unless defined?(::ActiveJob::Base)
+    adapter = ::ActiveJob::Base.queue_adapter
+    return unless adapter
+
+    klass_name = adapter.class.name.to_s
+    return if (PG_BACKED_ADAPTER_HINTS + EXEMPT_ADAPTER_HINTS).any? { |hint| klass_name.include?(hint) }
+
+    config.logger&.warn(
+      "[dispatch_policy] active_job adapter is #{klass_name}; atomic admission requires " \
+      "a PG-backed adapter that shares ActiveRecord::Base's connection (good_job, solid_queue). " \
+      "If the worker process crashes between admission COMMIT and adapter enqueue, the job is lost. " \
+      "Set DispatchPolicy.config.database_role if you use a separate DB role for queueing."
+    )
   end
 end
 

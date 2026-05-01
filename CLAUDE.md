@@ -19,7 +19,7 @@ Ver `README.md` para la API y los ejemplos.
 v0.1 (en master). Todo el flujo principal está implementado y testeado.
 Lo pendiente está en `ideas.md` con su porqué.
 
-61 tests / 137 assertions. `bundle exec rake test` desde la raíz.
+61 tests / 136 assertions. `bundle exec rake test` desde la raíz.
 
 ## Arquitectura — 4 tablas
 
@@ -41,9 +41,11 @@ dispatch_policy_tick_samples     una fila por Tick.run para métricas
    refrescado y shard pinned-on-first-write).
 2. Un `DispatchTickLoopJob` corre `TickLoop.run(policy_name:, shard:)`.
 3. Cada Tick: `Repository.claim_partitions` → para cada partición,
-   `Pipeline.call(ctx, partition)` → `Repository.claim_staged_jobs!`
-   (DELETE … RETURNING) → pre-INSERT en `inflight_jobs` →
-   `Forwarder.dispatch` (re-enqueue al adapter con `Bypass.with`).
+   `Pipeline.call(ctx, partition)` → **una sola TX** que hace
+   `Repository.claim_staged_jobs!` (DELETE … RETURNING) +
+   pre-INSERT en `inflight_jobs` + `Forwarder.dispatch` (re-enqueue
+   al adapter con `Bypass.with`). El adapter PG-backed comparte la
+   conexión, así que su INSERT entra en la misma TX.
 4. El worker del adapter ejecuta el job: `InflightTracker.track`
    (around_perform) hace INSERT idempotente en `inflight_jobs`,
    spawn un thread de heartbeat, en `ensure` lo cancela y DELETE.
@@ -61,17 +63,34 @@ dispatch_policy_tick_samples     una fila por Tick.run para métricas
 - **`shard_by` debe ser ≥ tan grueso como el `partition_by` del
   throttle más restrictivo.** Si no, el bucket se duplica entre
   shards y el rate efectivo es `rate × N_shards`.
-- **`Forwarder.dispatch` recibe `preinserted_inflight_ids`**: si el
-  enqueue al adapter falla, además de `unclaim!` borra la fila
-  inflight pre-insertada para que el cupo de concurrency no se
-  sobre-cuente hasta el sweep.
+- **`Forwarder.dispatch` corre dentro de la TX de admisión.** El
+  adapter (good_job / solid_queue) usa
+  `ActiveRecord::Base.connection`, así que su INSERT en `good_jobs`
+  / `solid_queue_jobs` participa en la misma transacción que el
+  DELETE de `staged_jobs` y el INSERT de `inflight_jobs`. Cualquier
+  excepción (deserialize, adapter, network) revierte todo
+  atómicamente — no hay ventana de pérdida entre el commit de
+  admisión y el enqueue al adapter. **No reintroduzcas `unclaim!`
+  ni `preinserted_inflight_ids`**: el rollback hace ese trabajo.
+  Si soportas un adapter no-PG en el futuro, antes piensa cómo
+  garantizar at-least-once sin esta invariante.
+- **Adapter no-PG = warning al boot, no hard-fail.** El railtie
+  llama a `DispatchPolicy.warn_unsupported_adapter` en
+  `after_initialize`. Si el host usa Sidekiq/Resque, se loguea un
+  warning explicando que la atomicidad se pierde. Es deliberado:
+  un adapter PG-backed custom (no detectado) puede seguir
+  funcionando, y queremos no romper su deploy.
+- **`config.database_role`**: para Rails multi-DB (p.ej.
+  solid_queue con DB separada), define el role contra el que se
+  abre la TX de admisión. `Repository.with_connection` envuelve la
+  TX en `connected_to(role:)` cuando está fijado. Las tablas de
+  staging y la del adapter deben estar en la misma DB para que la
+  atomicidad funcione.
 - **Todos los jobs admitidos crean una fila en `inflight_jobs`**,
   tengan o no gate de concurrency. La key cambia: con concurrency,
   la key del gate (coarse, agrega cross-staged-partition); sin
   concurrency, la `partition_key` del staged. La UI cuenta por
   `policy_name` y siempre da un valor real.
-- **`unclaim!` preserva `enqueued_at`** vía
-  `COALESCE($n, now())` para mantener orden FIFO si el forward falla.
 - **`claim_staged_jobs!(limit: 0, retry_after:)` SÍ persiste**
   `next_eligible_at` y `gate_state` aunque no admita filas. Sin
   esto, los gates "deny + retry_after" no producían backoff

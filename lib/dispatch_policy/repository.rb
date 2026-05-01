@@ -21,6 +21,21 @@ module DispatchPolicy
       ActiveRecord::Base.connection
     end
 
+    # Wraps `block` in `connected_to(role: …)` when DispatchPolicy.config
+    # .database_role is set. Used by Tick to ensure the admission TX is
+    # opened against the same DB role that good_job / solid_queue uses,
+    # critical for multi-DB Rails setups (e.g. solid_queue on a separate
+    # `:queue` DB) where atomicity only holds when the staging TX and the
+    # adapter INSERT share a connection.
+    def with_connection
+      role = DispatchPolicy.config.database_role
+      if role && ActiveRecord::Base.respond_to?(:connected_to)
+        ActiveRecord::Base.connected_to(role: role) { yield }
+      else
+        yield
+      end
+    end
+
     # ----- staging (write path) ------------------------------------------------
 
     # Insert one staged_job row + UPSERT its partition. The partition's
@@ -232,52 +247,6 @@ module DispatchPolicy
         "record_partition_evaluation",
         [policy_name, partition_key, admitted, gate_state_json, *next_eligible_params]
       )
-    end
-
-    # Reinsert staged rows after a failed forward (compensation). The original
-    # `enqueued_at` is preserved so re-claimed jobs keep their FIFO position.
-    def unclaim!(rows)
-      return if rows.empty?
-
-      values_sql = []
-      params     = []
-      rows.each_with_index do |row, idx|
-        base = idx * 9
-        values_sql << "($#{base + 1}, $#{base + 2}, $#{base + 3}, $#{base + 4}, $#{base + 5}::jsonb, $#{base + 6}::jsonb, $#{base + 7}, $#{base + 8}, COALESCE($#{base + 9}, now()))"
-        params.push(
-          row["policy_name"],
-          row["partition_key"],
-          row["queue_name"],
-          row["job_class"],
-          JSON.dump(row["job_data"]),
-          JSON.dump(row["context"] || {}),
-          row["scheduled_at"],
-          row["priority"] || 0,
-          row["enqueued_at"]
-        )
-      end
-      connection.exec_query(
-        <<~SQL.squish,
-          INSERT INTO #{STAGED_TABLE}
-            (policy_name, partition_key, queue_name, job_class, job_data, context, scheduled_at, priority, enqueued_at)
-          VALUES #{values_sql.join(", ")}
-        SQL
-        "unclaim",
-        params
-      )
-      grouped = rows.group_by { |r| [r["policy_name"], r["partition_key"]] }
-      grouped.each do |(policy_name, partition_key), group|
-        connection.exec_query(
-          <<~SQL.squish,
-            UPDATE #{PARTITIONS_TABLE}
-            SET pending_count = pending_count + $3,
-                updated_at    = now()
-            WHERE policy_name = $1 AND partition_key = $2
-          SQL
-          "unclaim_bump_partition",
-          [policy_name, partition_key, group.size]
-        )
-      end
     end
 
     # ----- inflight tracking ---------------------------------------------------
