@@ -66,3 +66,221 @@ Las relaciones que deberían cumplirse:
 de heartbeat que no se refrescaba durante el perform (el sweeper de
 5min mataba inflight rows de jobs legítimamente largos). Una vez ese
 está corregido, esto es afinación de defaults y monitoring.
+
+## Atomic admission: mover `Forwarder.dispatch` dentro de la TX
+
+**Síntoma.** Hay una ventana de pérdida de jobs entre el `COMMIT` de
+`claim_staged_jobs!` y la finalización de `Forwarder.dispatch`. Hoy en
+`tick.rb:79-117`:
+
+1. TX abre, `DELETE … RETURNING` de `staged_jobs` + pre-INSERT en
+   `inflight_jobs`.
+2. **COMMIT** — la fila ya no está en staging.
+3. Fuera de TX, `Forwarder.dispatch` deserializa y hace `job.enqueue`.
+
+Si el proceso muere (kill -9, OOM, deploy) entre #2 y #3:
+
+- `staged_jobs`: borrado.
+- `inflight_jobs`: presente. Se barrerá por `heartbeat_at` stale en
+  ~5min, pero eso solo libera cupo de concurrency, no recupera el job.
+- Adapter real: nunca recibió nada.
+- `unclaim!` no corre — solo se invoca en el `rescue` de
+  `Forwarder.dispatch`, que requiere proceso vivo.
+
+→ **Job perdido silenciosamente.** Mismo bug que arregla el PR 18
+(`f1a8ed68`) en `ceritium/dispatch_policy`.
+
+**Solución.** Meter `job.enqueue` dentro de la misma TX de PG. Funciona
+porque good_job / solid_queue usan la misma conexión que la gema, así
+que el `INSERT` en `good_jobs` o `solid_queue_jobs` participa de la
+misma transacción que el `DELETE FROM staged_jobs`. Si el adapter
+falla, la TX revierte y la fila staged sigue ahí — at-least-once real.
+
+**Cambios concretos.**
+
+1. En `tick.rb` `admit_partition`, mover la llamada a
+   `Forwarder.dispatch` **dentro** del bloque `transaction(requires_new: true)`,
+   después de `Repository.insert_inflight!`. Si `dispatch` lanza, la
+   TX revierte automáticamente (y `unclaim!` ya no hace falta como
+   compensación, deja de existir).
+2. `Forwarder.dispatch` cambia de "loop con rescue per-row" a "todo o
+   nada": una excepción en cualquier `job.enqueue` aborta la TX
+   entera. Per-row failures no son tolerables — si un job no se puede
+   serializar/encolar, queremos saberlo y reintentar el batch.
+   Alternativa: separar el batch fallido en dos mitades y reintentar
+   (binary search del job problemático). Probablemente overkill.
+3. Boot guard que rechace adapters no-PG (Sidekiq, Resque, async,
+   inline en producción) con mensaje claro: "dispatch_policy requires
+   a PG-backed ActiveJob adapter for atomic admission. Got
+   ActiveJob::QueueAdapters::SidekiqAdapter." Documentar en README.
+4. Soportar `database_role` config (Rails multi-DB con DB separada
+   para queues, p.ej. solid_queue con su propia DB) — el `transaction`
+   debe abrirse contra la conexión que comparten staging y la tabla
+   del adapter.
+5. Eliminar `Repository.unclaim!` y la lógica de
+   `preinserted_inflight_ids` en `Forwarder.dispatch` (ya no son
+   necesarias, la TX revierte todo junto).
+
+**Por qué se aplaza.** Es un cambio mayor: rompe el contrato actual
+("funciona con cualquier ActiveJob adapter") a cambio de la garantía
+de no-pérdida. Hay que validar contra los dos adapters soportados,
+añadir el boot guard, actualizar README + CLAUDE.md, y probablemente
+un test de integración que mate el proceso entre commit y enqueue
+para verificar que la TX revierte. Va junto con el bulk handoff
+(siguiente sección) porque ambos tocan el mismo path.
+
+## Bulk handoff: `ActiveJob.perform_all_later` en `Forwarder.dispatch`
+
+**Síntoma.** Hoy `Forwarder.dispatch` (`forwarder.rb:23-44`) itera
+`rows.each` y llama `job.enqueue` per-row. Con `admission_batch_size = 100`
+y un adapter PG-backed, son 100 round-trips a Postgres por tick por
+partición. El PR 18 (`7ea259ae`) en upstream lo bulkifica a una sola
+llamada `ActiveJob.perform_all_later(jobs)`, que con good_job /
+solid_queue produce un único `INSERT … VALUES (…), (…), …`.
+
+**Solución.** Reemplazar el bucle por:
+
+```ruby
+jobs = rows.map { |row| Serializer.deserialize(row["job_data"]) }
+Bypass.with { ActiveJob.perform_all_later(jobs) }
+```
+
+Con tres detalles a resolver:
+
+**1. `wait_until` per-job no se soporta en bulk.** Hay que separar
+filas con `scheduled_at` no nulo y mantenerlas en el path 1-a-1
+(`job.set(wait_until:).enqueue`). Estructura:
+
+```ruby
+immediate, scheduled = rows.partition { |r| r["scheduled_at"].nil? }
+bulk_dispatch(immediate) if immediate.any?
+scheduled.each { |row| single_dispatch(row) }
+```
+
+En la práctica `scheduled_at` es la minoría — `perform_in / set(wait:)`
+se usa puntualmente.
+
+**2. Error handling per-row cambia.** Tras `perform_all_later`, cada
+`ActiveJob` instance tiene `successfully_enqueued?` (Rails 7.1+). Hay
+que mapear `job → row` (por `job.job_id` ↔ `row.dig("job_data",
+"job_id")`) para saber cuáles fallaron, y hacer `unclaim!` +
+`delete_inflight!` solo de esos. Si la llamada entera lanza excepción
+(p.ej. PG connection drop), `unclaim!` todas las filas del batch.
+
+Si esto se hace **junto con** la migración a TX-atomic (sección
+anterior), el error handling se simplifica: cualquier fallo aborta
+la TX → no hay `unclaim!` que mantener. `successfully_enqueued?` solo
+hace falta si dejamos el path fuera de TX.
+
+**3. Bypass + callbacks bajo `enqueue_all`.** Cuando el adapter
+implementa `enqueue_all` nativamente (good_job y solid_queue **sí**
+lo hacen), Rails se salta los callbacks `around_enqueue` por completo
+— `Bypass.active?` ni se consulta, pero tampoco hace falta porque la
+callback no corre. Para adapters sin `enqueue_all` nativo, Rails
+hace fallback a un loop interno que sí dispara callbacks, y ahí
+`Bypass.active?` sigue siendo necesaria. Mantener `Bypass.with`
+envolviendo la llamada cubre ambos casos.
+
+**Test que añadir.** Encolar N jobs vía `Forwarder.dispatch` con
+adapter good_job (y otro con solid_queue), assertar:
+(a) cero filas nuevas en `staged_jobs` (no hay re-stage),
+(b) N filas nuevas en `good_jobs` / `solid_queue_jobs`,
+(c) un único `INSERT` por adapter (capturable con `ActiveSupport::Notifications`
+escuchando `sql.active_record`).
+
+**Por qué se aplaza.** Es perf, no correctness. Y conviene hacerlo
+en el mismo cambio que mover a TX-atomic, porque ambos tocan
+`Forwarder.dispatch` y el contrato de error handling cambia en los
+dos. Si los hiciéramos en orden inverso (bulk primero, TX después)
+estaríamos reescribiendo el rescue dos veces.
+
+## Bulk `record_partition_evaluation!`: N UPDATEs → 1 UPDATE con VALUES
+
+**Síntoma.** En `tick.rb` `admit_partition`, tras evaluar gates y
+admitir/denegar, llamamos a `Repository.record_partition_evaluation!`
+(o equivalente) **una vez por partición**. Con
+`partition_batch_size = 50` son 50 statements por tick. El PR 18
+upstream lo bulkifica en un único `UPDATE … FROM (VALUES …)`.
+
+**Solución.** Acumular los cambios de cada partición en un array y
+emitir un solo statement al final del tick:
+
+```sql
+UPDATE dispatch_policy_partitions p
+SET    total_admitted   = p.total_admitted + v.delta,
+       last_admit_at    = v.last_admit,
+       next_eligible_at = v.next_eligible,
+       gate_state       = p.gate_state || v.gate_state_patch::jsonb,
+       updated_at       = now()
+FROM   (VALUES (1, 5, now(), NULL, '{}'::jsonb),
+               (2, 0, NULL, '...'::timestamptz, '{"throttle":{...}}'::jsonb),
+               …) AS v(id, delta, last_admit, next_eligible, gate_state_patch)
+WHERE  p.id = v.id;
+```
+
+Probablemente más limpio: **dos statements bulk separados**, uno por
+rama (admit vs deny), cada uno con su VALUES list. Evita tener que
+pasar NULLs por columnas que esa fila no quiere tocar.
+
+**Por qué es correctness-safe.**
+
+- Cada fila del VALUES es un update independiente (no hay agregación
+  cross-partición), así que un único statement produce el mismo
+  estado final que N statements secuenciales.
+- Las filas de `partitions` ya están bloqueadas por el
+  `FOR UPDATE SKIP LOCKED` previo de `claim_partitions` dentro de la
+  misma TX. El bulk UPDATE las re-toca bajo los mismos locks.
+- Atomicidad equivalente: estamos dentro de una transacción Rails;
+  hoy un fallo en la fila #25 revierte 1-24 porque no ha commiteado;
+  en bulk el fallo aborta el statement completo. Mismo efecto.
+
+**Las dos zonas frágiles.**
+
+- **JSONB merge de `gate_state`.** Hay que usar `||` (concat top-level)
+  como hoy. Test: una partición con
+  `gate_state = {"throttle":{...},"foo":"bar"}` debe conservar `foo`
+  tras la admisión. Fácil meter un bug si se sustituye por
+  `jsonb_set` con path equivocado.
+- **Tipos en la VALUES table.** Construirla con
+  `ActiveRecord::Base.connection.quote` o vía bind params, no por
+  interpolación. Un `Time` mal casteado o un Hash sin serializar
+  rompe silenciosamente.
+
+**Test que añadir.** Comparar estado final de N particiones tras
+`record_partition_evaluation!` vía loop vs vía bulk. Con varias
+combinaciones: admits, denies, mezcla, gate_state con claves
+preexistentes que NO debe perder.
+
+**Por qué se aplaza.** Es perf, no correctness. Y conviene hacerlo
+junto al move-into-TX y al bulk handoff (las tres tocan
+`Tick#admit_partition` y `Forwarder.dispatch`); reescribir tres veces
+el mismo código sería derroche.
+
+## Auto-refresh: evitar Turbo.visit apilados cuando la página va lenta
+
+**Síntoma.** En `app/views/layouts/dispatch_policy/application.html.erb`
+el `setTimeout` dispara `Turbo.visit(href, { action: "replace" })`
+cada N segundos. Si la respuesta tarda más que el siguiente ciclo
+(DB lenta, query pesada en /partitions), un nuevo timer puede
+programarse encima — al volver `turbo:load` rearma `restart()` que
+limpia el timer anterior, pero entre el dispatch del visit y el
+`turbo:load` puede haber otro timer corriendo. El PR 18 upstream
+(`517df4d8`) añadió un guard "skip if Turbo visit in flight".
+
+**Solución.** Flag in-flight:
+
+```js
+var visiting = false;
+document.addEventListener("turbo:visit",  function () { visiting = true;  });
+document.addEventListener("turbo:load",   function () { visiting = false; });
+document.addEventListener("turbo:render", function () { visiting = false; });
+
+// dentro de setTimeout:
+if (visiting) { restart(); return; }   // reprograma sin disparar
+Turbo.visit(window.location.href, { action: "replace" });
+```
+
+**Por qué se aplaza.** Bajo carga normal en local no se nota, y
+empíricamente nadie ha reportado refresh stuck. Apuntado para no
+olvidarlo cuando alguien tenga un /partitions con 100k+ filas y la
+query pase de los 2s.
