@@ -1,0 +1,56 @@
+<h1>Policy <code><%= @policy_name %></code></h1>
+
+<section class="dp-stats">
+  <div class="dp-stat"><span class="dp-stat-label">Partitions</span><span class="dp-stat-value"><%= format_count(@totals[:partitions]) %></span></div>
+  <div class="dp-stat"><span class="dp-stat-label">Pending</span><span class="dp-stat-value"><%= format_count(@totals[:pending]) %></span></div>
+  <div class="dp-stat"><span class="dp-stat-label">In flight</span><span class="dp-stat-value"><%= format_count(@totals[:in_flight]) %></span></div>
+</section>
+
+<section class="dp-section">
+  <h2>Gates</h2>
+  <% if @policy_object %>
+    <ul class="dp-list">
+      <% @policy_object.gates.each do |gate| %>
+        <li><strong><%= gate.name %></strong> (<%= gate.class.name.demodulize %>)</li>
+      <% end %>
+    </ul>
+    <p>Retry strategy: <code><%= @policy_object.retry_strategy %></code></p>
+  <% else %>
+    <p class="dp-empty">Policy <code><%= @policy_name %></code> is not registered in this process.</p>
+  <% end %>
+</section>
+
+<section class="dp-section">
+  <h2>Top partitions</h2>
+  <% if @partitions.any? %>
+    <table class="dp-table">
+      <thead>
+        <tr>
+          <th>Partition key</th><th>Status</th>
+          <th class="dp-num">Pending</th><th class="dp-num">In flight</th>
+          <th>Next eligible</th><th>Last admit</th><th></th>
+        </tr>
+      </thead>
+      <tbody>
+        <% @partitions.each do |p| %>
+          <tr>
+            <td><%= link_to p.partition_key, partition_path(p), class: "dp-link" %></td>
+            <td><%= p.status %></td>
+            <td class="dp-num"><%= format_count(p.pending_count) %></td>
+            <td class="dp-num"><%= format_count(p.in_flight_count) %></td>
+            <td><%= format_time(p.next_eligible_at) %></td>
+            <td><%= format_time(p.last_admit_at) %></td>
+            <td><%= link_to "→", partition_path(p), class: "dp-link" %></td>
+          </tr>
+        <% end %>
+      </tbody>
+    </table>
+  <% else %>
+    <p class="dp-empty">No partitions for this policy yet.</p>
+  <% end %>
+</section>
+
+<section class="dp-section">
+  <%= button_to "Pause all partitions",  pause_policy_path(@policy_name),  class: "dp-btn", method: :post, form: { class: "dp-form-inline" } %>
+  <%= button_to "Resume all partitions", resume_policy_path(@policy_name), class: "dp-btn dp-btn-ok", method: :post, form: { class: "dp-form-inline" } %>
+</section>

@@ -1,0 +1,30 @@
+<h1>Policies</h1>
+
+<% if @rows.empty? %>
+  <p class="dp-empty">No policies registered or observed.</p>
+<% else %>
+  <table class="dp-table">
+    <thead>
+      <tr>
+        <th>Name</th><th class="dp-num">Pending</th><th class="dp-num">In flight</th>
+        <th class="dp-num">Partitions</th><th class="dp-num">Paused</th><th>Registered</th><th></th>
+      </tr>
+    </thead>
+    <tbody>
+      <% @rows.each do |row| %>
+        <tr>
+          <td><%= link_to row[:name], policy_path(row[:name]), class: "dp-link" %></td>
+          <td class="dp-num"><%= format_count(row[:pending]) %></td>
+          <td class="dp-num"><%= format_count(row[:in_flight]) %></td>
+          <td class="dp-num"><%= format_count(row[:partitions]) %></td>
+          <td class="dp-num"><%= row[:paused_count].positive? ? content_tag(:span, format_count(row[:paused_count]), class: "dp-warn") : 0 %></td>
+          <td><%= row[:registered] ? "yes" : content_tag(:span, "no (orphan)", class: "dp-warn") %></td>
+          <td>
+            <%= button_to "Pause",  pause_policy_path(row[:name]),  class: "dp-btn", method: :post, form: { class: "dp-form-inline" } %>
+            <%= button_to "Resume", resume_policy_path(row[:name]), class: "dp-btn dp-btn-ok", method: :post, form: { class: "dp-form-inline" } %>
+          </td>
+        </tr>
+      <% end %>
+    </tbody>
+  </table>
+<% end %>

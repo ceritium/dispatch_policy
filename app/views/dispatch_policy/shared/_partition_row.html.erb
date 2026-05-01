@@ -1,0 +1,10 @@
+<tr id="partition_<%= partition.id %>" class="<%= "dp-row-paused" if partition.paused? %>">
+  <td><%= link_to partition.policy_name, policy_path(partition.policy_name), class: "dp-link" %></td>
+  <td><%= link_to partition.partition_key, partition_path(partition), class: "dp-link" %></td>
+  <td><%= partition.status %></td>
+  <td class="dp-num"><%= format_count(partition.pending_count) %></td>
+  <td class="dp-num"><%= format_count(partition.in_flight_count) %></td>
+  <td><%= format_time(partition.next_eligible_at) %></td>
+  <td><%= format_time(partition.last_admit_at) %></td>
+  <td><%= format_time(partition.last_enqueued_at) %></td>
+</tr>

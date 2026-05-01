@@ -1,0 +1,11 @@
+# frozen_string_literal: true
+
+DispatchPolicy.configure do |c|
+  c.tick_max_duration         = 25      # seconds — total time the tick job stays admitting
+  c.partition_batch_size      = 50      # partitions claimed per tick iteration
+  c.admission_batch_size      = 100     # max jobs admitted per partition per iteration
+  c.idle_pause                = 0.5     # seconds slept when no admissions happened
+  c.partition_inactive_after  = 24 * 60 * 60 # GC partitions idle this long
+  c.inflight_stale_after      = 5 * 60      # GC inflight rows whose worker stopped heartbeating
+  c.sweep_every_ticks         = 50          # how often to run the sweepers
+end

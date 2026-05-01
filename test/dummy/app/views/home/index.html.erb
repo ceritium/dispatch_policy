@@ -1,0 +1,79 @@
+<h1>dispatch_policy dummy <small style="font-size:13px;color:#6b7280;">(<%= @adapter %>)</small></h1>
+
+<p>
+  <a href="/dispatch_policy">→ open dispatch_policy dashboard</a>
+  <% if @adapter == "good_job" %> · <a href="/good_job">→ good_job dashboard</a><% end %>
+</p>
+
+<h2>Single enqueue</h2>
+
+<div class="card">
+  <h3 style="margin:6px 0;">SlowExternalApiJob (throttle by endpoint)</h3>
+  <%= form_with url: enqueue_path(job: "slow_external_api"), method: :post, local: true do %>
+    <label>endpoint_id</label> <input name="attrs[endpoint_id]" value="ep-1"><br>
+    <label>rate</label>        <input name="attrs[rate]"        value="6" size="6">
+    <label>per (s)</label>     <input name="attrs[per]"         value="60" size="6"><br>
+    <button>Enqueue 1</button>
+  <% end %>
+</div>
+
+<div class="card">
+  <h3 style="margin:6px 0;">BulkAccountJob (concurrency by account)</h3>
+  <%= form_with url: enqueue_path(job: "bulk_account"), method: :post, local: true do %>
+    <label>account_id</label> <input name="attrs[account_id]" value="acct-1"><br>
+    <label>max_per_account</label> <input name="attrs[max]" value="3" size="6"><br>
+    <button>Enqueue 1</button>
+  <% end %>
+</div>
+
+<div class="card">
+  <h3 style="margin:6px 0;">MixedJob (throttle + concurrency)</h3>
+  <%= form_with url: enqueue_path(job: "mixed"), method: :post, local: true do %>
+    <label>endpoint_id</label> <input name="attrs[endpoint_id]" value="ep-1"><br>
+    <label>account_id</label>  <input name="attrs[account_id]"  value="acct-1"><br>
+    <label>rate</label> <input name="attrs[rate]" value="10" size="6">
+    <label>max</label>  <input name="attrs[max]"  value="2"  size="6"><br>
+    <button>Enqueue 1</button>
+  <% end %>
+</div>
+
+<div class="card">
+  <h3 style="margin:6px 0;">PerformInJob (with delay)</h3>
+  <%= form_with url: enqueue_path(job: "perform_in"), method: :post, local: true do %>
+    <label>key</label>      <input name="attrs[key]" value="k1"><br>
+    <label>delay (s)</label> <input name="delay" value="10" size="6"><br>
+    <button>Enqueue 1</button>
+  <% end %>
+</div>
+
+<h2>Bulk enqueue (perform_all_later)</h2>
+
+<div class="card">
+  <%= form_with url: enqueue_many_path(job: "slow_external_api"), method: :post, local: true do %>
+    <label>endpoint_id</label> <input name="attrs[endpoint_id]" value="ep-1"><br>
+    <label>rate</label>        <input name="attrs[rate]"        value="6"  size="6">
+    <label>per (s)</label>     <input name="attrs[per]"         value="60" size="6"><br>
+    <label>count</label>       <input name="count"              value="100" size="6"><br>
+    <button>Enqueue many SlowExternalApiJob</button>
+  <% end %>
+</div>
+
+<div class="card">
+  <%= form_with url: enqueue_many_path(job: "mixed"), method: :post, local: true do %>
+    <label>endpoint_id</label> <input name="attrs[endpoint_id]" value="ep-1"><br>
+    <label>account_id</label>  <input name="attrs[account_id]"  value="acct-1"><br>
+    <label>rate</label> <input name="attrs[rate]" value="10" size="6">
+    <label>max</label>  <input name="attrs[max]"  value="2"  size="6"><br>
+    <label>count</label> <input name="count" value="50" size="6"><br>
+    <button>Enqueue many MixedJob</button>
+  <% end %>
+</div>
+
+<div class="card">
+  <%= form_with url: enqueue_many_path(job: "retry_flaky"), method: :post, local: true do %>
+    <label>key</label>       <input name="attrs[key]"       value="k1"><br>
+    <label>fail_rate</label> <input name="attrs[fail_rate]" value="0.7" size="6"><br>
+    <label>count</label>     <input name="count"            value="20"  size="6"><br>
+    <button>Enqueue many RetryFlakyJob</button>
+  <% end %>
+</div>

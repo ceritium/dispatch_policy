@@ -1,0 +1,28 @@
+<h1>Partitions<% if @policy %> · <code><%= @policy %></code><% end %></h1>
+
+<%= form_with url: partitions_path, method: :get, local: true, class: "dp-search-form" do |f| %>
+  <%= f.hidden_field :policy, value: @policy if @policy %>
+  <%= f.text_field :q, value: @query, placeholder: "search partition_key…", class: "dp-input" %>
+  <%= f.submit "Search", class: "dp-btn" %>
+<% end %>
+
+<% if @partitions.any? %>
+  <table class="dp-table">
+    <thead>
+      <tr>
+        <th>Policy</th><th>Partition key</th><th>Status</th>
+        <th class="dp-num">Pending</th><th class="dp-num">In flight</th>
+        <th>Next eligible</th><th>Last admit</th><th>Last enq</th>
+      </tr>
+    </thead>
+    <tbody>
+      <% @partitions.each do |p| %>
+        <%= render "shared/partition_row", partition: p %>
+      <% end %>
+    </tbody>
+  </table>
+<% else %>
+  <p class="dp-empty">No partitions match.</p>
+<% end %>
+
+<meta http-equiv="refresh" content="5">
