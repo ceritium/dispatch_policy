@@ -160,6 +160,26 @@ class RepositoryIntegrationTest < Minitest::Test
     assert_equal 1, DispatchPolicy::Partition.first.pending_count
   end
 
+  def test_unclaim_preserves_enqueued_at
+    DispatchPolicy::Repository.stage!(
+      policy_name: "p", partition_key: "k", queue_name: nil,
+      job_class: "J", job_data: { "job_id" => "j", "job_class" => "J", "arguments" => [] },
+      context: {}, priority: 0
+    )
+    original_enqueued_at = DispatchPolicy::StagedJob.first.enqueued_at
+
+    rows = DispatchPolicy::Repository.claim_staged_jobs!(
+      policy_name: "p", partition_key: "k", limit: 1,
+      gate_state_patch: {}, retry_after: nil
+    )
+    sleep 0.05  # ensure now() would differ
+    DispatchPolicy::Repository.unclaim!(rows)
+
+    reinserted = DispatchPolicy::StagedJob.first
+    assert_in_delta original_enqueued_at.to_f, reinserted.enqueued_at.to_f, 0.01,
+                    "unclaim! must preserve original enqueued_at to keep FIFO ordering"
+  end
+
   def test_inflight_count_round_trip
     DispatchPolicy::Repository.insert_inflight!([
       { policy_name: "p", partition_key: "concurrency=acct:1", active_job_id: "abc" },

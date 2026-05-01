@@ -192,15 +192,16 @@ module DispatchPolicy
       rows.map { |r| normalize_staged(r) }
     end
 
-    # Reinsert staged rows after a failed forward (compensation).
+    # Reinsert staged rows after a failed forward (compensation). The original
+    # `enqueued_at` is preserved so re-claimed jobs keep their FIFO position.
     def unclaim!(rows)
       return if rows.empty?
 
       values_sql = []
       params     = []
       rows.each_with_index do |row, idx|
-        base = idx * 8
-        values_sql << "($#{base + 1}, $#{base + 2}, $#{base + 3}, $#{base + 4}, $#{base + 5}::jsonb, $#{base + 6}::jsonb, $#{base + 7}, $#{base + 8})"
+        base = idx * 9
+        values_sql << "($#{base + 1}, $#{base + 2}, $#{base + 3}, $#{base + 4}, $#{base + 5}::jsonb, $#{base + 6}::jsonb, $#{base + 7}, $#{base + 8}, COALESCE($#{base + 9}, now()))"
         params.push(
           row["policy_name"],
           row["partition_key"],
@@ -209,13 +210,14 @@ module DispatchPolicy
           JSON.dump(row["job_data"]),
           JSON.dump(row["context"] || {}),
           row["scheduled_at"],
-          row["priority"] || 0
+          row["priority"] || 0,
+          row["enqueued_at"]
         )
       end
       connection.exec_query(
         <<~SQL.squish,
           INSERT INTO #{STAGED_TABLE}
-            (policy_name, partition_key, queue_name, job_class, job_data, context, scheduled_at, priority)
+            (policy_name, partition_key, queue_name, job_class, job_data, context, scheduled_at, priority, enqueued_at)
           VALUES #{values_sql.join(", ")}
         SQL
         "unclaim",

@@ -15,6 +15,7 @@ module DispatchPolicy
         super(partition_by: partition_by)
         @rate_proc = rate.respond_to?(:call) ? rate : ->(_ctx) { rate }
         @per       = duration_seconds(per)
+        raise ArgumentError, "throttle :per must be > 0 (got #{@per})" unless @per.positive?
       end
 
       def name

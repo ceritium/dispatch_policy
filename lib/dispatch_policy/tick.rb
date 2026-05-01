@@ -51,6 +51,8 @@ module DispatchPolicy
       max_budget = @policy.admission_batch_size || @config.admission_batch_size
       result  = pipe.call(ctx, partition, max_budget)
 
+      preinserted_ids = []
+
       claimed_rows =
         ActiveRecord::Base.transaction(requires_new: true) do
           rows = Repository.claim_staged_jobs!(
@@ -64,14 +66,18 @@ module DispatchPolicy
           if rows.any?
             concurrency_gate = @policy.gates.find { |g| g.name == :concurrency }
             if concurrency_gate
-              inflight_rows = rows.map do |row|
+              inflight_rows = rows.filter_map do |row|
+                ajid = row.dig("job_data", "job_id")
+                next unless ajid
+
+                preinserted_ids << ajid
                 {
                   policy_name:   @policy_name,
                   partition_key: concurrency_gate.inflight_partition_key(@policy_name, Context.wrap(row["context"])),
-                  active_job_id: row["job_data"]["job_id"]
+                  active_job_id: ajid
                 }
               end
-              Repository.insert_inflight!(inflight_rows)
+              Repository.insert_inflight!(inflight_rows) if inflight_rows.any?
             end
           end
 
@@ -80,7 +86,7 @@ module DispatchPolicy
 
       return 0 if claimed_rows.empty?
 
-      failures = Forwarder.dispatch(claimed_rows)
+      failures = Forwarder.dispatch(claimed_rows, preinserted_inflight_ids: preinserted_ids)
       claimed_rows.size - failures.size
     end
   end
