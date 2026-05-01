@@ -1,12 +1,33 @@
-<h1>Partitions<% if @policy %> · <code><%= @policy %></code><% end %><% if @shard %> · shard <code><%= @shard %></code><% end %></h1>
+<h1>
+  Partitions<% if @policy %> · <code><%= @policy %></code><% end %><% if @shard %> · shard <code><%= @shard %></code><% end %>
+  <small style="font-weight:400; color:#6b7280; font-size:14px;">
+    <%= format_count(@total) %> match<%= @total == 1 ? "" : "es" %>
+  </small>
+</h1>
 
 <%= form_with url: partitions_path, method: :get, local: true, class: "dp-search-form" do |f| %>
-  <%= f.hidden_field :policy, value: @policy if @policy %>
-  <% if @shards.any? %>
+  <%= f.hidden_field :policy, value: @policy if @policy.present? %>
+  <% if @shards.size > 1 %>
     <%= f.select :shard, [["all shards", ""]] + @shards.map { |s| [s, s] }, { selected: @shard }, class: "dp-input" %>
+  <% elsif @shards.size == 1 %>
+    <%= f.hidden_field :shard, value: @shard if @shard.present? %>
   <% end %>
   <%= f.text_field :q, value: @query, placeholder: "search partition_key…", class: "dp-input" %>
-  <%= f.submit "Search", class: "dp-btn" %>
+  <%= f.select :sort,
+        [
+          ["sort: pending desc",       "pending"],
+          ["sort: lifetime admitted",  "admitted"],
+          ["sort: stalest (round-trip)", "stale"],
+          ["sort: recent admit",       "recent"],
+          ["sort: partition key",      "key"]
+        ],
+        { selected: @sort },
+        class: "dp-input" %>
+  <label style="font-size:12.5px; margin: 0 6px;">
+    <%= f.check_box :only_pending, { checked: @only_pending }, "1", "0" %>
+    only pending&gt;0
+  </label>
+  <%= f.submit "Apply", class: "dp-btn" %>
 <% end %>
 
 <% if @partitions.any? %>
@@ -14,7 +35,7 @@
     <thead>
       <tr>
         <th>Policy</th><th>Shard</th><th>Queue</th><th>Partition key</th><th>Status</th>
-        <th class="dp-num">Pending</th><th class="dp-num">In flight</th>
+        <th class="dp-num">Pending</th><th class="dp-num">Lifetime</th>
         <th>Next eligible</th><th>Last admit</th><th>Last enq</th>
       </tr>
     </thead>
@@ -24,6 +45,30 @@
       <% end %>
     </tbody>
   </table>
+
+  <div class="dp-pagination">
+    <span class="dp-pagination-info">
+      Showing <%= format_count((@page - 1) * @page_size + 1) %>–<%= format_count([@page * @page_size, @total].min) %>
+      of <%= format_count(@total) %>
+      &nbsp;·&nbsp; page <%= @page %> / <%= @last_page %>
+    </span>
+    <span class="dp-pagination-nav">
+      <% if @page > 1 %>
+        <%= link_to "« first",   partitions_path(pagination_params(page: 1)),         class: "dp-btn" %>
+        <%= link_to "‹ prev",    partitions_path(pagination_params(page: @page - 1)), class: "dp-btn" %>
+      <% else %>
+        <span class="dp-btn dp-btn-disabled">« first</span>
+        <span class="dp-btn dp-btn-disabled">‹ prev</span>
+      <% end %>
+      <% if @page < @last_page %>
+        <%= link_to "next ›",    partitions_path(pagination_params(page: @page + 1)), class: "dp-btn" %>
+        <%= link_to "last »",    partitions_path(pagination_params(page: @last_page)), class: "dp-btn" %>
+      <% else %>
+        <span class="dp-btn dp-btn-disabled">next ›</span>
+        <span class="dp-btn dp-btn-disabled">last »</span>
+      <% end %>
+    </span>
+  </div>
 <% else %>
   <p class="dp-empty">No partitions match.</p>
 <% end %>
