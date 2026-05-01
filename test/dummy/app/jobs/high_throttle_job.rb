@@ -26,7 +26,7 @@ class HighThrottleJob < ApplicationJob
   end
 
   def perform(attrs = {})
-    sleep(Float(ENV.fetch("HIGH_THROTTLE_SLEEP", "1")))
+    sleep(Float(ENV.fetch("HIGH_THROTTLE_SLEEP", "0.01")))
     Rails.logger.info("[HighThrottleJob] endpoint=#{attrs['endpoint']} seq=#{attrs['seq']} ran at #{Time.current.iso8601}")
   end
 end
