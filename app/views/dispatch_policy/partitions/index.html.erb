@@ -14,13 +14,7 @@
   <% end %>
   <%= f.text_field :q, value: @query, placeholder: "search partition_key…", class: "dp-input" %>
   <%= f.select :sort,
-        [
-          ["sort: pending desc",       "pending"],
-          ["sort: lifetime admitted",  "admitted"],
-          ["sort: stalest (round-trip)", "stale"],
-          ["sort: recent admit",       "recent"],
-          ["sort: partition key",      "key"]
-        ],
+        DispatchPolicy::CursorPagination::SORTS.map { |k, defn| ["sort: #{defn[:label]}", k] },
         { selected: @sort },
         class: "dp-input" %>
   <label style="font-size:12.5px; margin: 0 6px;">
@@ -48,24 +42,19 @@
 
   <div class="dp-pagination">
     <span class="dp-pagination-info">
-      Showing <%= format_count((@page - 1) * @page_size + 1) %>–<%= format_count([@page * @page_size, @total].min) %>
-      of <%= format_count(@total) %>
-      &nbsp;·&nbsp; page <%= @page %> / <%= @last_page %>
+      <%= format_count(@partitions.size) %> shown
+      <% if @cursor %> · paged via cursor — use the browser back button to go back <% end %>
     </span>
     <span class="dp-pagination-nav">
-      <% if @page > 1 %>
-        <%= link_to "« first",   partitions_path(pagination_params(page: 1)),         class: "dp-btn" %>
-        <%= link_to "‹ prev",    partitions_path(pagination_params(page: @page - 1)), class: "dp-btn" %>
+      <% if @cursor %>
+        <%= link_to "« first", partitions_path(pagination_params(cursor: nil)), class: "dp-btn" %>
       <% else %>
         <span class="dp-btn dp-btn-disabled">« first</span>
-        <span class="dp-btn dp-btn-disabled">‹ prev</span>
       <% end %>
-      <% if @page < @last_page %>
-        <%= link_to "next ›",    partitions_path(pagination_params(page: @page + 1)), class: "dp-btn" %>
-        <%= link_to "last »",    partitions_path(pagination_params(page: @last_page)), class: "dp-btn" %>
+      <% if @next_cursor %>
+        <%= link_to "next ›",  partitions_path(pagination_params(cursor: @next_cursor)), class: "dp-btn" %>
       <% else %>
         <span class="dp-btn dp-btn-disabled">next ›</span>
-        <span class="dp-btn dp-btn-disabled">last »</span>
       <% end %>
     </span>
   </div>

@@ -324,6 +324,39 @@ class RepositoryIntegrationTest < Minitest::Test
     assert_equal 0, DispatchPolicy::TickSample.count
   end
 
+  def test_cursor_pagination_walks_full_dataset_without_dups
+    20.times do |i|
+      DispatchPolicy::Repository.stage!(
+        policy_name: "p", partition_key: "k#{i.to_s.rjust(2, '0')}", queue_name: nil,
+        job_class: "J", job_data: { "job_id" => i.to_s, "job_class" => "J", "arguments" => [] },
+        context: {}, priority: 0
+      )
+    end
+    DispatchPolicy::Partition.find_each { |p| p.update!(pending_count: rand(0..5)) }
+
+    seen = []
+    cursor = nil
+    page_size = 7
+    100.times do
+      scope = DispatchPolicy::Partition.all
+      paginated = DispatchPolicy::CursorPagination.apply(scope, "pending", cursor)
+      sort_def = DispatchPolicy::CursorPagination.sort_for("pending")
+      rows = paginated.order(Arel.sql(sort_def[:sql_order])).limit(page_size + 1).to_a
+      page = rows.first(page_size)
+      seen.concat(page.map(&:id))
+
+      break unless rows.size > page_size
+
+      v, id  = DispatchPolicy::CursorPagination.extract(page.last, "pending")
+      cursor = DispatchPolicy::CursorPagination.decode(
+        DispatchPolicy::CursorPagination.encode(v, id)
+      )
+    end
+
+    assert_equal 20, seen.size, "must walk every row"
+    assert_equal seen.uniq, seen, "must not repeat rows across cursor pages"
+  end
+
   def test_partitions_default_shard_when_not_specified
     DispatchPolicy::Repository.stage!(
       policy_name: "p", partition_key: "k", queue_name: nil,
