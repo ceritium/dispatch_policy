@@ -187,34 +187,30 @@ module DispatchPolicy
     # RETURNING) and update the partition's counters / gate_state /
     # next_eligible_at in the same transaction.
     #
-    # When `limit <= 0` we do NOT claim rows but we DO persist the gate_state
-    # patch and next_eligible_at — this is critical when a gate denies
-    # admission (e.g. concurrency-full): without this, next_eligible_at would
-    # stay NULL and the next tick would re-evaluate immediately, hammering
-    # `count_inflight` every iteration.
+    # `limit` MUST be positive: the deny path (no rows to admit) goes
+    # through `bulk_record_partition_denies!` instead, which collapses
+    # many partitions into a single UPDATE…FROM(VALUES…) at the end of
+    # the tick.
     def claim_staged_jobs!(policy_name:, partition_key:, limit:, gate_state_patch:, retry_after:)
-      rows =
-        if limit.positive?
-          sql_select = <<~SQL.squish
-            WITH claimed AS (
-              SELECT id FROM #{STAGED_TABLE}
-              WHERE policy_name = $1 AND partition_key = $2
-                AND (scheduled_at IS NULL OR scheduled_at <= now())
-              ORDER BY priority DESC, scheduled_at NULLS FIRST, id
-              LIMIT $3
-              FOR UPDATE SKIP LOCKED
-            )
-            DELETE FROM #{STAGED_TABLE} s
-            USING claimed
-            WHERE s.id = claimed.id
-            RETURNING s.*
-          SQL
-          connection.exec_query(sql_select, "claim_staged_jobs", [policy_name, partition_key, limit]).to_a
-        else
-          []
-        end
+      raise ArgumentError, "claim_staged_jobs! requires limit > 0" unless limit.positive?
 
-      record_partition_evaluation!(
+      sql_select = <<~SQL.squish
+        WITH claimed AS (
+          SELECT id FROM #{STAGED_TABLE}
+          WHERE policy_name = $1 AND partition_key = $2
+            AND (scheduled_at IS NULL OR scheduled_at <= now())
+          ORDER BY priority DESC, scheduled_at NULLS FIRST, id
+          LIMIT $3
+          FOR UPDATE SKIP LOCKED
+        )
+        DELETE FROM #{STAGED_TABLE} s
+        USING claimed
+        WHERE s.id = claimed.id
+        RETURNING s.*
+      SQL
+      rows = connection.exec_query(sql_select, "claim_staged_jobs", [policy_name, partition_key, limit]).to_a
+
+      record_partition_admit!(
         policy_name:      policy_name,
         partition_key:    partition_key,
         admitted:         rows.size,
@@ -225,11 +221,11 @@ module DispatchPolicy
       rows.map { |r| normalize_staged(r) }
     end
 
-    # Persist the result of evaluating gates for a partition: decrement
-    # pending_count, merge the gate_state_patch, and set next_eligible_at
-    # from retry_after. Always called after claim_staged_jobs! whether or
-    # not any rows were admitted.
-    def record_partition_evaluation!(policy_name:, partition_key:, admitted:, gate_state_patch:, retry_after:)
+    # Per-partition admit-state UPDATE. Runs inside the per-partition
+    # admission TX alongside the DELETE, so pending_count / total_admitted
+    # / gate_state changes commit atomically with the claim and the
+    # adapter handoff. For the deny case use `bulk_record_partition_denies!`.
+    def record_partition_admit!(policy_name:, partition_key:, admitted:, gate_state_patch:, retry_after:)
       next_eligible_sql, next_eligible_params = next_eligible_clause(retry_after)
       gate_state_json = JSON.dump(gate_state_patch || {})
 
@@ -244,8 +240,55 @@ module DispatchPolicy
               updated_at       = now()
           WHERE policy_name = $1 AND partition_key = $2
         SQL
-        "record_partition_evaluation",
+        "record_partition_admit",
         [policy_name, partition_key, admitted, gate_state_json, *next_eligible_params]
+      )
+    end
+
+    # Bulk-update many partitions whose pipeline this tick decided to deny.
+    # One UPDATE…FROM(VALUES…) instead of one UPDATE per partition, which
+    # cuts a tick with `partition_batch_size = 50` from ~50 round-trips on
+    # the deny path to one. The deny path doesn't touch pending_count or
+    # total_admitted (admitted = 0 makes them no-ops in the per-row
+    # UPDATE), so we only write gate_state and next_eligible_at here.
+    #
+    # Each entry: { policy_name:, partition_key:, gate_state_patch:, retry_after: }.
+    # Independent per row — the join via FROM(VALUES…) makes the bulk
+    # statement equivalent to N sequential UPDATEs in correctness terms;
+    # the row-level locks held by `claim_partitions` (FOR UPDATE SKIP
+    # LOCKED, last_checked_at bumped) keep concurrent ticks away from the
+    # same partitions while we batch.
+    def bulk_record_partition_denies!(entries)
+      return if entries.empty?
+
+      values_sql = []
+      params     = []
+      entries.each_with_index do |e, idx|
+        base = idx * 4
+        values_sql << "($#{base + 1}::text, $#{base + 2}::text, $#{base + 3}::jsonb, $#{base + 4}::numeric)"
+        params.push(
+          e[:policy_name],
+          e[:partition_key],
+          JSON.dump(e[:gate_state_patch] || {}),
+          e[:retry_after].nil? ? nil : e[:retry_after].to_f.round(3)
+        )
+      end
+
+      connection.exec_query(
+        <<~SQL.squish,
+          UPDATE #{PARTITIONS_TABLE} p
+          SET gate_state       = p.gate_state || v.gate_state_patch,
+              next_eligible_at = CASE
+                WHEN v.retry_after_secs IS NULL THEN NULL
+                ELSE now() + (v.retry_after_secs || ' seconds')::interval
+              END,
+              updated_at       = now()
+          FROM (VALUES #{values_sql.join(", ")})
+            AS v(policy_name, partition_key, gate_state_patch, retry_after_secs)
+          WHERE p.policy_name = v.policy_name AND p.partition_key = v.partition_key
+        SQL
+        "bulk_record_partition_denies",
+        params
       )
     end
 

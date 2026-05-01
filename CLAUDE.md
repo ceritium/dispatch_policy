@@ -19,7 +19,7 @@ Ver `README.md` para la API y los ejemplos.
 v0.1 (en master). Todo el flujo principal está implementado y testeado.
 Lo pendiente está en `ideas.md` con su porqué.
 
-63 tests / 145 assertions. `bundle exec rake test` desde la raíz.
+65 tests / 149 assertions. `bundle exec rake test` desde la raíz.
 
 ## Arquitectura — 4 tablas
 
@@ -91,10 +91,16 @@ dispatch_policy_tick_samples     una fila por Tick.run para métricas
   la key del gate (coarse, agrega cross-staged-partition); sin
   concurrency, la `partition_key` del staged. La UI cuenta por
   `policy_name` y siempre da un valor real.
-- **`claim_staged_jobs!(limit: 0, retry_after:)` SÍ persiste**
-  `next_eligible_at` y `gate_state` aunque no admita filas. Sin
-  esto, los gates "deny + retry_after" no producían backoff
-  efectivo y el tick reentraba en bucle.
+- **`claim_staged_jobs!` requiere `limit > 0`** (ahora es la
+  vía solo-admit). El path de deny puro va por
+  `Repository.bulk_record_partition_denies!`: el Tick acumula
+  todos los deny del lote y los flushea en un único
+  `UPDATE…FROM(VALUES…)` al final, en vez de N statements per
+  partición. La equivalencia per-fila (sin agregación
+  cross-partición) preserva la corrección. Lo crítico es no
+  perder el `gate_state || patch` (jsonb merge) — un test de
+  integración bloquea el caso "el patch sobreescribe claves
+  pre-existentes".
 
 ## Cosas que romper rompe la UI
 

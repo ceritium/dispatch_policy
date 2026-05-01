@@ -35,9 +35,11 @@ module DispatchPolicy
         limit:       @config.partition_batch_size
       )
 
+      pending_denies = []
+
       partitions.each do |partition|
         partitions_seen += 1
-        outcome = admit_partition(partition)
+        outcome = admit_partition(partition, pending_denies)
 
         jobs_admitted    += outcome[:admitted]
         forward_failures += outcome[:failures]
@@ -49,6 +51,8 @@ module DispatchPolicy
           outcome[:reasons].each { |r| denied_reasons[r] += 1 }
         end
       end
+
+      flush_denies!(pending_denies) if pending_denies.any?
 
       duration_ms = monotonic_now_ms - started_at
 
@@ -67,11 +71,24 @@ module DispatchPolicy
 
     private
 
-    def admit_partition(partition)
+    def admit_partition(partition, pending_denies)
       ctx        = Context.wrap(partition["context"])
       pipe       = Pipeline.new(@policy)
       max_budget = @policy.admission_batch_size || @config.admission_batch_size
       result     = pipe.call(ctx, partition, max_budget)
+
+      # Pure-deny path (gate said no capacity for this partition this tick).
+      # Defer the partition state UPDATE to the bulk flush at the end of
+      # the tick instead of issuing a per-partition statement now.
+      if result.admit_count.zero?
+        pending_denies << {
+          policy_name:      @policy_name,
+          partition_key:    partition["partition_key"],
+          gate_state_patch: result.gate_state_patch,
+          retry_after:      result.retry_after
+        }
+        return { admitted: 0, failures: 0, reasons: deduce_reasons(result) }
+      end
 
       admitted = 0
       Repository.with_connection do
@@ -84,9 +101,10 @@ module DispatchPolicy
             retry_after:      result.retry_after
           )
 
-          # Deny path: the partition's gate_state / next_eligible_at have
-          # already been persisted by claim_staged_jobs!; commit to lock in
-          # the backoff and exit cleanly.
+          # `claim_staged_jobs!` always runs `record_partition_admit!` so
+          # the partition's counters and gate_state commit even when the
+          # actual DELETE returned zero rows (e.g. all staged rows are
+          # scheduled in the future, or another tick raced us to them).
           next if rows.empty?
 
           # Pre-insert an inflight row per admitted job so the concurrency
@@ -122,7 +140,7 @@ module DispatchPolicy
       end
 
       if admitted.zero?
-        { admitted: 0, failures: 0, reasons: deduce_reasons(result) }
+        { admitted: 0, failures: 0, reasons: ["no_rows_claimed"] }
       else
         { admitted: admitted, failures: 0, reasons: [] }
       end
@@ -132,6 +150,14 @@ module DispatchPolicy
         "#{e.class}: #{e.message}"
       )
       { admitted: 0, failures: 1, reasons: ["forward_failed"] }
+    end
+
+    def flush_denies!(entries)
+      Repository.with_connection { Repository.bulk_record_partition_denies!(entries) }
+    rescue StandardError => e
+      DispatchPolicy.config.logger&.error(
+        "[dispatch_policy] bulk_record_partition_denies failed: #{e.class}: #{e.message}"
+      )
     end
 
     # When admit_count was 0, the Pipeline's `reasons` array contains entries

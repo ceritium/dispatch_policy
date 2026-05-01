@@ -152,26 +152,61 @@ class RepositoryIntegrationTest < Minitest::Test
     assert_equal({ "throttle" => { "tokens" => 1.0 } }, partition.gate_state)
   end
 
-  def test_claim_staged_jobs_with_zero_limit_still_records_evaluation
+  def test_claim_staged_jobs_rejects_non_positive_limit
+    assert_raises(ArgumentError) do
+      DispatchPolicy::Repository.claim_staged_jobs!(
+        policy_name: "p", partition_key: "k", limit: 0,
+        gate_state_patch: {}, retry_after: nil
+      )
+    end
+  end
+
+  def test_bulk_record_partition_denies_updates_gate_state_and_backoff
+    # Pre-create two partitions with an existing gate_state key that must
+    # survive the bulk UPDATE — proving `||` jsonb merge (not replacement).
     DispatchPolicy::Repository.stage!(
-      policy_name: "p", partition_key: "k", queue_name: nil,
-      job_class: "J", job_data: { "job_id" => "j", "job_class" => "J", "arguments" => [] },
+      policy_name: "p", partition_key: "a", queue_name: nil,
+      job_class: "J", job_data: { "job_id" => "1", "job_class" => "J", "arguments" => [] },
       context: {}, priority: 0
     )
-
-    rows = DispatchPolicy::Repository.claim_staged_jobs!(
-      policy_name: "p", partition_key: "k", limit: 0,
-      gate_state_patch: { "throttle" => { "tokens" => 0.4 } },
-      retry_after: 5.0
+    DispatchPolicy::Repository.stage!(
+      policy_name: "p", partition_key: "b", queue_name: nil,
+      job_class: "J", job_data: { "job_id" => "2", "job_class" => "J", "arguments" => [] },
+      context: {}, priority: 0
+    )
+    ActiveRecord::Base.connection.execute(
+      "UPDATE dispatch_policy_partitions SET gate_state = '{\"foo\":\"keep-me\"}'::jsonb"
     )
 
-    assert_empty rows
-    partition = DispatchPolicy::Partition.first
-    assert_equal 1, partition.pending_count, "no rows admitted, pending_count must be unchanged"
-    refute_nil partition.next_eligible_at,
-               "concurrency-full / throttle-denied evaluations must still set next_eligible_at"
-    assert_in_delta 5.0, partition.next_eligible_at - Time.current, 1.0
-    assert_equal({ "throttle" => { "tokens" => 0.4 } }, partition.gate_state)
+    DispatchPolicy::Repository.bulk_record_partition_denies!([
+      { policy_name: "p", partition_key: "a",
+        gate_state_patch: { "throttle" => { "tokens" => 0.1 } }, retry_after: 5.0 },
+      { policy_name: "p", partition_key: "b",
+        gate_state_patch: { "concurrency" => { "full" => true } }, retry_after: nil }
+    ])
+
+    partitions = DispatchPolicy::Partition.order(:partition_key).to_a
+    a, b = partitions
+
+    # Per-partition gate_state was merged with its patch via jsonb ||,
+    # not replaced; pending_count stayed put (deny doesn't decrement);
+    # next_eligible_at was set when retry_after was given, NULL otherwise.
+    assert_equal "keep-me", a.gate_state["foo"], "|| merge must keep pre-existing keys"
+    assert_equal({ "tokens" => 0.1 }, a.gate_state["throttle"])
+    assert_in_delta 5.0, a.next_eligible_at - Time.current, 1.0
+
+    assert_equal "keep-me", b.gate_state["foo"]
+    assert_equal({ "full" => true }, b.gate_state["concurrency"])
+    assert_nil b.next_eligible_at, "retry_after: nil must clear next_eligible_at"
+
+    assert_equal 1, a.pending_count
+    assert_equal 1, b.pending_count
+  end
+
+  def test_bulk_record_partition_denies_no_op_on_empty
+    DispatchPolicy::Repository.bulk_record_partition_denies!([])
+    # Just doesn't raise.
+    assert true
   end
 
   def test_inflight_count_round_trip
