@@ -2,7 +2,10 @@
 
 module DispatchPolicy
   class PartitionsController < ApplicationController
-    before_action :find_partition, only: %i[show clear admit]
+    before_action :find_partition, only: %i[show drain admit]
+
+    DRAIN_MAX_PER_REQUEST = 10_000
+    DRAIN_BATCH_SIZE      = 200
 
     def index
       scope = Partition.all
@@ -31,14 +34,6 @@ module DispatchPolicy
       @inflight = InflightJob.where(policy_name: @partition.policy_name).limit(50)
     end
 
-    def clear
-      DispatchPolicy::ApplicationRecord.transaction do
-        StagedJob.for_partition(@partition.policy_name, @partition.partition_key).delete_all
-        @partition.update!(pending_count: 0)
-      end
-      redirect_to partition_path(@partition), notice: "Partition cleared."
-    end
-
     def admit
       count = Integer(params[:count] || 1)
       rows = Repository.claim_staged_jobs!(
@@ -50,6 +45,40 @@ module DispatchPolicy
       )
       forwarded = rows.size - Forwarder.dispatch(rows).size
       redirect_to partition_path(@partition), notice: "Forwarded #{forwarded} job(s)."
+    end
+
+    # Empties the partition by force-admitting every staged job through the
+    # forwarder, bypassing all gates. Bounded at DRAIN_MAX_PER_REQUEST so a
+    # huge backlog can't time the controller out — the operator clicks again
+    # for the next batch.
+    def drain
+      drained, remaining = self.class.drain_partition!(@partition)
+      notice = if remaining.positive?
+        "Drained #{drained} job(s); #{remaining} still pending — click drain again to continue."
+      else
+        "Drained #{drained} job(s); partition empty."
+      end
+      redirect_to partition_path(@partition), notice: notice
+    end
+
+    def self.drain_partition!(partition)
+      drained = 0
+      while drained < DRAIN_MAX_PER_REQUEST
+        batch_limit = [DRAIN_BATCH_SIZE, DRAIN_MAX_PER_REQUEST - drained].min
+        rows = Repository.claim_staged_jobs!(
+          policy_name:      partition.policy_name,
+          partition_key:    partition.partition_key,
+          limit:            batch_limit,
+          gate_state_patch: {},
+          retry_after:      nil
+        )
+        break if rows.empty?
+
+        Forwarder.dispatch(rows)
+        drained += rows.size
+      end
+      remaining = partition.class.where(id: partition.id).pick(:pending_count) || 0
+      [drained, remaining]
     end
 
     private

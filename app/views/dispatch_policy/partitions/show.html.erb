@@ -65,5 +65,13 @@
   <h2>Actions</h2>
   <%= button_to "Force admit 1",  admit_partition_path(@partition, count: 1),   class: "dp-btn", method: :post, form: { class: "dp-form-inline" } %>
   <%= button_to "Force admit 10", admit_partition_path(@partition, count: 10),  class: "dp-btn", method: :post, form: { class: "dp-form-inline" } %>
-  <%= button_to "Clear partition", clear_partition_path(@partition), class: "dp-btn dp-btn-warn", method: :post, form: { class: "dp-form-inline", data: { turbo_confirm: "Delete all staged jobs in this partition?" } } %>
+  <%= button_to "Drain partition", drain_partition_path(@partition),
+                class:  "dp-btn dp-btn-warn",
+                method: :post,
+                form: { class: "dp-form-inline",
+                        onsubmit: "return confirm('Force-admit every staged job in this partition, bypassing all gates? This sends them to the real adapter immediately.');" } %>
+  <p class="dp-hint">
+    <strong>Drain</strong> empties the partition by sending every staged job to the real adapter without consulting throttle/concurrency gates.
+    Capped at 10,000 jobs per click — click again for more.
+  </p>
 </section>

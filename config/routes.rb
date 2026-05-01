@@ -7,12 +7,13 @@ DispatchPolicy::Engine.routes.draw do
     member do
       post :pause
       post :resume
+      post :drain
     end
   end
 
   resources :partitions, only: %i[index show] do
     member do
-      post :clear
+      post :drain
       post :admit
     end
   end
