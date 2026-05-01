@@ -1,28 +1,42 @@
 # frozen_string_literal: true
 
+# Run one of these per (policy, shard) pair to parallelise admission.
+# When called without arguments, processes every registered policy across
+# every shard from a single worker — fine for small deployments.
+#
+#   DispatchTickLoopJob.perform_later                # all policies, all shards
+#   DispatchTickLoopJob.perform_later("events")      # one policy, all shards
+#   DispatchTickLoopJob.perform_later("events", "shard-1")  # one policy, one shard
+#
+# When a shard argument is provided, the job is also enqueued onto a queue
+# named after the shard so the same worker pool can run both the tick loop
+# and the admitted jobs (assuming the policy's shard_by returns the queue
+# name your jobs use).
 class DispatchTickLoopJob < ApplicationJob
-  queue_as :dispatch_loop
+  queue_as { arguments[1].presence || :dispatch_loop }
 <% if good_job? -%>
 
   include GoodJob::ActiveJobExtensions::Concurrency
   good_job_control_concurrency_with(
     total_limit: 1,
-    key: -> { "dispatch_tick_loop:#{arguments.first || 'all'}" }
+    key: -> { "dispatch_tick_loop:#{arguments[0] || 'all'}:#{arguments[1] || 'all'}" }
   )
 <% elsif solid_queue? -%>
 
-  limits_concurrency to: 1, key: -> { "dispatch_tick_loop:#{arguments.first || 'all'}" }
+  limits_concurrency to: 1,
+    key: -> { "dispatch_tick_loop:#{arguments[0] || 'all'}:#{arguments[1] || 'all'}" }
 <% end -%>
 
-  def perform(policy_name = nil)
+  def perform(policy_name = nil, shard = nil)
     deadline = Time.current + DispatchPolicy.config.tick_max_duration
 
     DispatchPolicy::TickLoop.run(
       policy_name: policy_name,
+      shard:       shard,
       stop_when:   -> { adapter_shutting_down? || Time.current >= deadline }
     )
 
-    self.class.set(wait: 1.second).perform_later(policy_name)
+    self.class.set(wait: 1.second).perform_later(policy_name, shard)
   end
 
   private

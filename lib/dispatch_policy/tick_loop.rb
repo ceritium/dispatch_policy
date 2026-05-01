@@ -9,7 +9,9 @@ module DispatchPolicy
   module TickLoop
     module_function
 
-    def run(policy_name: nil, stop_when: -> { false })
+    # @param policy_name [String, nil] limit to one policy. nil = all registered.
+    # @param shard [String, nil] limit to one shard. nil = all shards.
+    def run(policy_name: nil, shard: nil, stop_when: -> { false })
       config       = DispatchPolicy.config
       logger       = config.logger
       iteration    = 0
@@ -28,10 +30,10 @@ module DispatchPolicy
           break if stop_when.call
 
           begin
-            result = Tick.run(policy_name: name)
+            result = Tick.run(policy_name: name, shard: shard)
             admitted += result.jobs_admitted
           rescue StandardError => e
-            logger&.error("[dispatch_policy] tick error policy=#{name} #{e.class}: #{e.message}\n#{e.backtrace.first(10).join("\n")}")
+            logger&.error("[dispatch_policy] tick error policy=#{name} shard=#{shard.inspect} #{e.class}: #{e.message}\n#{e.backtrace.first(10).join("\n")}")
           end
         end
 

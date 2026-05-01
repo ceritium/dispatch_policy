@@ -24,6 +24,7 @@ class CreateDispatchPolicyTables < ActiveRecord::Migration[7.1]
       t.string   :policy_name,        null: false
       t.string   :partition_key,      null: false
       t.string   :queue_name
+      t.string   :shard,              null: false, default: "default"
       t.string   :status,             null: false, default: "active"
       t.integer  :pending_count,      null: false, default: 0
       t.bigint   :total_admitted,     null: false, default: 0
@@ -41,7 +42,7 @@ class CreateDispatchPolicyTables < ActiveRecord::Migration[7.1]
               unique: true,
               name:   "idx_dp_partitions_lookup"
     add_index :dispatch_policy_partitions,
-              [:policy_name, :status, :next_eligible_at, :last_checked_at],
+              [:policy_name, :shard, :status, :next_eligible_at, :last_checked_at],
               name:  "idx_dp_partitions_tick_order",
               order: { next_eligible_at: "ASC NULLS FIRST", last_checked_at: "ASC NULLS FIRST" }
 

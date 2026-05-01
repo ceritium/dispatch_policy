@@ -65,4 +65,31 @@ class PolicyDSLTest < Minitest::Test
       DispatchPolicy::PolicyDSL.build("p")
     end
   end
+
+  def test_default_shard_when_no_shard_by_declared
+    policy = DispatchPolicy::PolicyDSL.build("p") do
+      gate :throttle, rate: 1, per: 60, partition_by: ->(_c) { "k" }
+    end
+    ctx = policy.build_context([])
+    assert_equal "default", policy.shard_for(ctx)
+  end
+
+  def test_shard_by_proc_can_use_queue_name_from_enriched_context
+    policy = DispatchPolicy::PolicyDSL.build("p") do
+      gate :throttle, rate: 1, per: 60, partition_by: ->(_c) { "k" }
+      shard_by ->(c) { c[:queue_name] }
+    end
+
+    ctx = policy.build_context([], queue_name: "payments")
+    assert_equal "payments", ctx[:queue_name]
+    assert_equal "payments", policy.shard_for(ctx)
+  end
+
+  def test_shard_by_falls_back_to_default_when_proc_returns_nil
+    policy = DispatchPolicy::PolicyDSL.build("p") do
+      gate :throttle, rate: 1, per: 60, partition_by: ->(_c) { "k" }
+      shard_by ->(_c) { nil }
+    end
+    assert_equal "default", policy.shard_for(policy.build_context([]))
+  end
 end

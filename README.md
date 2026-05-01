@@ -160,6 +160,62 @@ For long-running retry storms where you want to favour throughput over
 fairness, use `retry_strategy :bypass` to send retries straight to the
 adapter.
 
+## Sharding a single policy across worker pools
+
+`shard_by` lets you split a single policy's partitions across N tick
+loops, so admission scales horizontally. The shard is just a routing
+label on each partition row; gate semantics are unchanged.
+
+```ruby
+class EventsJob < ApplicationJob
+  # The job's queue is derived from the account so shard == queue.
+  queue_as do
+    attrs = arguments.first || {}
+    "events-shard-#{attrs["account_id"].to_s.hash.abs % 4}"
+  end
+
+  dispatch_policy :events do
+    context ->(args) { { account_id: args.first["account_id"] } }
+    shard_by ->(ctx) { ctx[:queue_name] }     # use the queue itself
+
+    gate :concurrency,
+         max:          50,
+         partition_by: ->(c) { "acct:#{c[:account_id]}" }
+  end
+end
+```
+
+Operator deploys one `DispatchTickLoopJob` per shard:
+
+```ruby
+4.times { |i| DispatchTickLoopJob.perform_later("events", "events-shard-#{i}") }
+```
+
+The generated `DispatchTickLoopJob` template uses `queue_as { arguments[1] }`
+so the tick job is enqueued onto the same queue it monitors. Workers
+listening on `events-shard-*` queues run both the tick loops and the
+admitted jobs from one pool per shard.
+
+The gem's automatic context enrichment puts `:queue_name` into the ctx
+hash so `shard_by` can use it directly without your `context` proc
+having to know about it.
+
+### Backward compatibility
+
+`shard_by` is opt-in. Without it every partition lives on the
+`"default"` shard and `DispatchTickLoopJob.perform_later("events")`
+(no shard argument) processes every partition — exactly like before.
+
+### Don't shard finer than your throttle
+
+A throttle bucket lives on the partition row. If two partitions sharing
+the same `partition_by` for `:throttle` end up on different shards, each
+shard runs its own bucket and the effective rate becomes
+`rate × shards`. As a rule, `shard_by` should be at least as coarse as
+the most restrictive `partition_by` of any rate-limiting gate. The
+canonical safe choice is `shard_by ->(c) { c[:queue_name] }` plus a
+`queue_as` that's a function of the throttle's partition_by.
+
 ## The tick loop
 
 `DispatchPolicy::TickLoop.run(policy_name:, stop_when:)` claims partitions

@@ -35,7 +35,8 @@ module DispatchPolicy
     # @param context       [Hash]
     # @param scheduled_at  [Time, nil]
     # @param priority      [Integer]
-    def stage!(policy_name:, partition_key:, queue_name:, job_class:, job_data:, context:, scheduled_at: nil, priority: 0)
+    def stage!(policy_name:, partition_key:, queue_name:, job_class:, job_data:, context:,
+               shard: Policy::DEFAULT_SHARD, scheduled_at: nil, priority: 0)
       connection.transaction(requires_new: true) do
         connection.exec_query(
           <<~SQL.squish,
@@ -50,6 +51,7 @@ module DispatchPolicy
           policy_name:   policy_name,
           partition_key: partition_key,
           queue_name:    queue_name,
+          shard:         shard,
           context:       context,
           delta_pending: 1
         )
@@ -95,6 +97,7 @@ module DispatchPolicy
             policy_name:   policy_name,
             partition_key: partition_key,
             queue_name:    group.first[:queue_name],
+            shard:         group.first[:shard] || Policy::DEFAULT_SHARD,
             context:       group.last[:context] || {},
             delta_pending: group.size
           )
@@ -103,23 +106,25 @@ module DispatchPolicy
       rows.size
     end
 
-    def upsert_partition!(policy_name:, partition_key:, queue_name:, context:, delta_pending:)
+    def upsert_partition!(policy_name:, partition_key:, queue_name:, context:, delta_pending:,
+                          shard: Policy::DEFAULT_SHARD)
       connection.exec_query(
         <<~SQL.squish,
           INSERT INTO #{PARTITIONS_TABLE}
-            (policy_name, partition_key, queue_name, context, context_updated_at,
+            (policy_name, partition_key, queue_name, shard, context, context_updated_at,
              pending_count, last_enqueued_at, status, gate_state, created_at, updated_at)
-          VALUES ($1, $2, $3, $4::jsonb, now(), $5, now(), 'active', '{}'::jsonb, now(), now())
+          VALUES ($1, $2, $3, $4, $5::jsonb, now(), $6, now(), 'active', '{}'::jsonb, now(), now())
           ON CONFLICT (policy_name, partition_key) DO UPDATE SET
             context             = EXCLUDED.context,
             context_updated_at  = EXCLUDED.context_updated_at,
             queue_name          = COALESCE(EXCLUDED.queue_name, #{PARTITIONS_TABLE}.queue_name),
+            shard               = #{PARTITIONS_TABLE}.shard,
             pending_count       = #{PARTITIONS_TABLE}.pending_count + EXCLUDED.pending_count,
             last_enqueued_at    = EXCLUDED.last_enqueued_at,
             updated_at          = now()
         SQL
         "upsert_partition",
-        [policy_name, partition_key, queue_name, JSON.dump(context), delta_pending]
+        [policy_name, partition_key, queue_name, shard, JSON.dump(context), delta_pending]
       )
     end
 
@@ -128,7 +133,19 @@ module DispatchPolicy
     # Lock + return up to `limit` partitions ready to be evaluated by the tick.
     # Each row's last_checked_at is bumped to now() so the next tick fairly
     # picks others. Locked rows are released when the transaction commits.
-    def claim_partitions(policy_name:, limit:)
+    #
+    # When `shard` is non-nil, only partitions on that shard are claimed —
+    # this lets several tick processes work on the same policy in parallel,
+    # one per shard.
+    def claim_partitions(policy_name:, limit:, shard: nil)
+      params      = [policy_name]
+      shard_sql   = ""
+      if shard
+        params    << shard
+        shard_sql = " AND shard = $#{params.size}"
+      end
+      params << limit
+
       sql = <<~SQL.squish
         WITH candidates AS (
           SELECT id FROM #{PARTITIONS_TABLE}
@@ -136,8 +153,9 @@ module DispatchPolicy
             AND status = 'active'
             AND pending_count > 0
             AND (next_eligible_at IS NULL OR next_eligible_at <= now())
+            #{shard_sql}
           ORDER BY last_checked_at NULLS FIRST, id
-          LIMIT $2
+          LIMIT $#{params.size}
           FOR UPDATE SKIP LOCKED
         )
         UPDATE #{PARTITIONS_TABLE} p
@@ -146,7 +164,7 @@ module DispatchPolicy
         WHERE p.id = candidates.id
         RETURNING p.*
       SQL
-      result = connection.exec_query(sql, "claim_partitions", [policy_name, limit])
+      result = connection.exec_query(sql, "claim_partitions", params)
       result.to_a.map { |row| normalize_partition(row) }
     end
 

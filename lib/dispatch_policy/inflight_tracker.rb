@@ -26,7 +26,7 @@ module DispatchPolicy
         return yield
       end
 
-      ctx              = policy.build_context(job.arguments)
+      ctx              = policy.build_context(job.arguments, queue_name: job.queue_name&.to_s)
       concurrency_gate = policy.gates.find { |g| g.name == :concurrency }
 
       if concurrency_gate

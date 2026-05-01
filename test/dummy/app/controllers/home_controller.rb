@@ -8,7 +8,8 @@ class HomeController < ApplicationController
     "perform_in"        => PerformInJob,
     "retry_flaky"       => RetryFlakyJob,
     "high_concurrency"  => HighConcurrencyJob,
-    "high_throttle"     => HighThrottleJob
+    "high_throttle"     => HighThrottleJob,
+    "sharded"           => ShardedJob
   }.freeze
 
   def index

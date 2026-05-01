@@ -20,6 +20,7 @@ module DispatchPolicy
       @retry_strategy       = :restage
       @queue_name           = nil
       @admission_batch_size = nil
+      @shard_by_proc        = nil
     end
 
     def context(callable = nil, &block)
@@ -43,6 +44,24 @@ module DispatchPolicy
       @admission_batch_size = Integer(size)
     end
 
+    # Routes a partition to a specific shard. The proc receives the
+    # enriched Context (which includes :queue_name from the job) and
+    # returns a string. Tick loops can be scoped per-shard so multiple
+    # workers can process a single policy in parallel.
+    #
+    #   shard_by ->(ctx) { ctx[:queue_name] }                   # shard = job's queue
+    #   shard_by ->(ctx) { "shard-#{ctx[:account_id].hash % 4}" } # explicit hash
+    #
+    # IMPORTANT: shard_by must be CONSISTENT with the gate's
+    # `partition_by` of any rate/concurrency budget you want to enforce
+    # globally. A throttle gate's bucket lives on the partition row, so
+    # if two staged_partitions sharing the same throttle key end up on
+    # different shards, each shard runs its own bucket and the effective
+    # rate becomes rate × N_shards.
+    def shard_by(callable = nil, &block)
+      @shard_by_proc = callable || block
+    end
+
     def to_policy
       Policy.new(
         name:                 @name,
@@ -50,7 +69,8 @@ module DispatchPolicy
         gates:                @gates,
         retry_strategy:       @retry_strategy,
         queue_name:           @queue_name,
-        admission_batch_size: @admission_batch_size
+        admission_batch_size: @admission_batch_size,
+        shard_by_proc:        @shard_by_proc
       )
     end
   end
