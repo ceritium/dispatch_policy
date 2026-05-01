@@ -149,29 +149,53 @@ module DispatchPolicy
       result.to_a.map { |row| normalize_partition(row) }
     end
 
-    # Atomically claim N staged rows for a partition (DELETE … RETURNING) and
-    # update partition counters and gate_state in the same transaction.
-    # Returns the deleted rows as Hashes (including job_class, job_data, …).
+    # Atomically claim up to `limit` staged rows for a partition (DELETE …
+    # RETURNING) and update the partition's counters / gate_state /
+    # next_eligible_at in the same transaction.
+    #
+    # When `limit <= 0` we do NOT claim rows but we DO persist the gate_state
+    # patch and next_eligible_at — this is critical when a gate denies
+    # admission (e.g. concurrency-full): without this, next_eligible_at would
+    # stay NULL and the next tick would re-evaluate immediately, hammering
+    # `count_inflight` every iteration.
     def claim_staged_jobs!(policy_name:, partition_key:, limit:, gate_state_patch:, retry_after:)
-      return [] if limit <= 0
+      rows =
+        if limit.positive?
+          sql_select = <<~SQL.squish
+            WITH claimed AS (
+              SELECT id FROM #{STAGED_TABLE}
+              WHERE policy_name = $1 AND partition_key = $2
+                AND (scheduled_at IS NULL OR scheduled_at <= now())
+              ORDER BY priority DESC, scheduled_at NULLS FIRST, id
+              LIMIT $3
+              FOR UPDATE SKIP LOCKED
+            )
+            DELETE FROM #{STAGED_TABLE} s
+            USING claimed
+            WHERE s.id = claimed.id
+            RETURNING s.*
+          SQL
+          connection.exec_query(sql_select, "claim_staged_jobs", [policy_name, partition_key, limit]).to_a
+        else
+          []
+        end
 
-      sql_select = <<~SQL.squish
-        WITH claimed AS (
-          SELECT id FROM #{STAGED_TABLE}
-          WHERE policy_name = $1 AND partition_key = $2
-            AND (scheduled_at IS NULL OR scheduled_at <= now())
-          ORDER BY priority DESC, scheduled_at NULLS FIRST, id
-          LIMIT $3
-          FOR UPDATE SKIP LOCKED
-        )
-        DELETE FROM #{STAGED_TABLE} s
-        USING claimed
-        WHERE s.id = claimed.id
-        RETURNING s.*
-      SQL
-      rows = connection.exec_query(sql_select, "claim_staged_jobs", [policy_name, partition_key, limit]).to_a
-      count = rows.size
+      record_partition_evaluation!(
+        policy_name:      policy_name,
+        partition_key:    partition_key,
+        admitted:         rows.size,
+        gate_state_patch: gate_state_patch,
+        retry_after:      retry_after
+      )
 
+      rows.map { |r| normalize_staged(r) }
+    end
+
+    # Persist the result of evaluating gates for a partition: decrement
+    # pending_count, merge the gate_state_patch, and set next_eligible_at
+    # from retry_after. Always called after claim_staged_jobs! whether or
+    # not any rows were admitted.
+    def record_partition_evaluation!(policy_name:, partition_key:, admitted:, gate_state_patch:, retry_after:)
       next_eligible_sql, next_eligible_params = next_eligible_clause(retry_after)
       gate_state_json = JSON.dump(gate_state_patch || {})
 
@@ -185,11 +209,9 @@ module DispatchPolicy
               updated_at       = now()
           WHERE policy_name = $1 AND partition_key = $2
         SQL
-        "update_partition_after_admit",
-        [policy_name, partition_key, count, gate_state_json, *next_eligible_params]
+        "record_partition_evaluation",
+        [policy_name, partition_key, admitted, gate_state_json, *next_eligible_params]
       )
-
-      rows.map { |r| normalize_staged(r) }
     end
 
     # Reinsert staged rows after a failed forward (compensation). The original
