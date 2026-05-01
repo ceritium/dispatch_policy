@@ -19,7 +19,7 @@ module DispatchPolicy
           admitted_count: scope.admitted.count,
           completed_24h:  scope.completed.where(completed_at: 24.hours.ago..).count,
           partitions:     partitions.count,
-          ready_partitions: partitions.where(ready: true).where("pending_count > 0").count
+          ready_partitions: partitions.where("pending_count > 0").count
         }
       end.sort_by { |p| -p[:pending_count] }
 
@@ -46,7 +46,7 @@ module DispatchPolicy
 
       @partition_search = params[:q].to_s.strip
       @partition_page   = [ params[:page].to_i, 1 ].max
-      @partition_sort   = %w[partition pending in_flight tokens last_admitted_at status].include?(params[:sort]) ? params[:sort] : "pending"
+      @partition_sort   = %w[partition pending in_flight tokens last_checked_at status].include?(params[:sort]) ? params[:sort] : "pending"
       @partition_dir    = params[:dir] == "asc" ? "asc" : "desc"
 
       list = build_partition_list(@policy_name)
@@ -88,29 +88,27 @@ module DispatchPolicy
       now = Time.current
 
       PolicyPartition.where(policy_name: policy_name)
-        .order(Arel.sql("(pending_count > 0) DESC, last_admitted_at NULLS FIRST"))
+        .order(Arel.sql("(pending_count > 0) DESC, last_checked_at NULLS FIRST"))
         .limit(cap)
         .pluck(:partition_key, :pending_count, :in_flight, :concurrency_max,
                :tokens, :throttle_rate, :throttle_burst, :refilled_at,
-               :ready, :blocked_until, :last_admitted_at)
-        .map do |pk, pending, inflight, cmax, tok, rate, burst, refilled, ready, blocked_until, last|
+               :last_checked_at)
+        .map do |pk, pending, inflight, cmax, tok, rate, burst, refilled, last|
+          eff_tokens = rate ? effective_tokens(tok, rate, burst, refilled, now) : nil
           status =
             if pending.zero? && inflight.zero?              then "idle"
-            elsif ready                                      then "ready"
-            elsif cmax && inflight >= cmax                   then "concurrency_blocked"
-            elsif rate && (effective_tokens(tok, rate, burst, refilled, now) < 1)
-                                                              then "throttle_blocked"
-            else                                                  "blocked"
+            elsif cmax && inflight >= cmax                  then "concurrency_blocked"
+            elsif rate && eff_tokens < 1                    then "throttle_blocked"
+            else                                                "ready"
             end
           {
-            partition_key:    pk,
-            pending:          pending,
-            in_flight:        inflight,
-            tokens:           tok && tok.to_f.round(2),
-            burst:            burst,
-            status:           status,
-            blocked_until:    blocked_until,
-            last_admitted_at: last
+            partition_key:   pk,
+            pending:         pending,
+            in_flight:       inflight,
+            tokens:          eff_tokens && eff_tokens.round(2),
+            burst:           burst,
+            status:          status,
+            last_checked_at: last
           }
         end
     end
@@ -129,7 +127,7 @@ module DispatchPolicy
         when "pending"          then ->(r) { r[:pending] }
         when "in_flight"        then ->(r) { r[:in_flight] }
         when "tokens"           then ->(r) { r[:tokens] || -1 }
-        when "last_admitted_at" then ->(r) { r[:last_admitted_at]&.to_f || 0 }
+        when "last_checked_at"  then ->(r) { r[:last_checked_at]&.to_f || 0 }
         when "status"           then ->(r) { r[:status] }
         else                          ->(r) { r[:pending] }
         end

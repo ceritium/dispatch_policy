@@ -43,15 +43,17 @@ module DispatchPolicy
         # of trying to cram a numeric into a datetime column.
         started_at = event.time.is_a?(Numeric) ? Time.at(event.time) : event.time
         buffer << {
-          policy_name:   event.payload[:policy_name],
-          started_at:    started_at,
-          duration_ms:   event.duration.round(3),
-          admitted:      event.payload[:admitted].to_i,
-          partitions:    event.payload[:partitions].to_i,
-          declined:      event.payload[:declined] == true,
-          error_class:   ex&.class&.name,
-          error_message: ex && ex.message.to_s[0, 500],
-          created_at:    started_at
+          policy_name:       event.payload[:policy_name],
+          started_at:        started_at,
+          duration_ms:       event.duration.round(3),
+          admitted:          event.payload[:admitted].to_i,
+          partitions:        event.payload[:partitions].to_i,
+          active_partitions: event.payload[:active_partitions].to_i,
+          cursor_lag_ms:     event.payload[:cursor_lag_ms]&.round(3),
+          declined:          event.payload[:declined] == true,
+          error_class:       ex&.class&.name,
+          error_message:     ex && ex.message.to_s[0, 500],
+          created_at:        started_at
         }
         flush_samples!(buffer) if buffer.size >= SAMPLE_FLUSH_BATCH
       end

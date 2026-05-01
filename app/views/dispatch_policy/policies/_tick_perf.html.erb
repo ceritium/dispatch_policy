@@ -43,11 +43,14 @@
           <th>Policy</th>
           <th class="text-end">Ticks</th>
           <th class="text-end">Admitted</th>
-          <th class="text-end">Partitions</th>
+          <th class="text-end">Visited</th>
+          <th class="text-end">Active</th>
           <th class="text-end">p50</th>
           <th class="text-end">p95</th>
-          <th class="text-end">p99</th>
           <th class="text-end">max</th>
+          <th class="text-end">Cursor lag p50</th>
+          <th class="text-end">Cursor lag p95</th>
+          <th class="text-end">Cursor lag max</th>
           <th class="text-end">Err</th>
           <th class="text-end">Decl</th>
         </tr>
@@ -65,10 +68,13 @@
             <td class="text-end"><%= row[:ticks] %></td>
             <td class="text-end"><%= row[:admitted] %></td>
             <td class="text-end"><%= row[:partitions] %></td>
+            <td class="text-end"><%= row[:active_partitions_max] || 0 %></td>
             <td class="text-end"><%= fmt_ms.call(row[:p50_ms]) %></td>
             <td class="text-end"><%= fmt_ms.call(row[:p95_ms]) %></td>
-            <td class="text-end"><%= fmt_ms.call(row[:p99_ms]) %></td>
             <td class="text-end"><%= fmt_ms.call(row[:max_ms]) %></td>
+            <td class="text-end"><%= fmt_ms.call(row[:cursor_lag_p50_ms]) %></td>
+            <td class="text-end"><%= fmt_ms.call(row[:cursor_lag_p95_ms]) %></td>
+            <td class="text-end"><%= fmt_ms.call(row[:cursor_lag_max_ms]) %></td>
             <td class="text-end <%= 'stale' if row[:errored].positive? %>"><%= row[:errored] %></td>
             <td class="text-end <%= 'stale' if row[:declined].positive? %>"><%= row[:declined] %></td>
           </tr>

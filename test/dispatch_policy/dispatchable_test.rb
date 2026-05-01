@@ -30,14 +30,13 @@ module DispatchPolicy
       assert_not_nil staged.reload.completed_at
     end
 
-    test "around_perform marks ready=true once partition unblocks" do
-      # max=1, two pending. First admit → cap. perform → release → ready again.
+    test "around_perform releases in_flight so the cursor admits next time" do
+      # max=1, two pending. First admit → cap. perform → release → next tick admits.
       2.times { WorkerJob.perform_later("a") }
       Dispatch.run(policy_name: WorkerJob.resolved_dispatch_policy.name)
       part = PolicyPartition.find_by(partition_key: "a")
-      assert part.ready == false || part.in_flight >= 1
-      # actually after admit with pending_count > 0 still and concurrency cap reached, ready=false
-      assert_equal false, part.ready
+      assert_equal 1, part.in_flight
+      assert_equal 1, part.pending_count
 
       staged = StagedJob.admitted.last
       job = ActiveJob::Base.deserialize(staged.arguments)
@@ -46,9 +45,11 @@ module DispatchPolicy
       job.perform_now
 
       part.reload
-      assert part.ready
       assert_equal 0, part.in_flight
       assert_equal 1, part.pending_count
+
+      Dispatch.run(policy_name: WorkerJob.resolved_dispatch_policy.name)
+      assert_equal 1, part.reload.in_flight, "next tick should re-admit now that there's headroom"
     end
   end
 end

@@ -49,12 +49,18 @@ class CreateDispatchPolicyTables < ActiveRecord::Migration[7.1]
     end
 
     # The dispatcher's source of truth. One row per (policy,
-    # partition). All gate state — concurrency, throttle bucket,
-    # demand, fairness — lives here. The partial idx_partitions_ready
-    # IS the ready queue: an admissible partition is one that's in
-    # the index. The dispatch query picks from this index in LRU
-    # order, LATERALs into staged_jobs for the actual payload, and
-    # never even sees a partition that isn't admissible.
+    # partition) holds demand + gate state + the LRU cursor.
+    #
+    # The dispatch loop is a circular cursor over partitions ordered
+    # by `last_checked_at ASC NULLS FIRST`: every tick visits up to
+    # batch_size partitions (the most-stale ones), evaluates gate
+    # state inline, admits up to the gate cap, and bumps
+    # `last_checked_at = NOW()` for ALL visited — admitted or not.
+    #
+    # Gate-blocked partitions occupy slots in the rotation but cost
+    # nothing to evaluate (a few CASE expressions over numeric
+    # columns). With N partitions and batch_size=B, every partition
+    # is re-checked every ceil(N/B) ticks regardless of state.
     create_table :dispatch_policy_partitions, primary_key: %i[policy_name partition_key] do |t|
       t.string   :policy_name,      null: false
       t.string   :partition_key,    null: false
@@ -72,30 +78,21 @@ class CreateDispatchPolicyTables < ActiveRecord::Migration[7.1]
       t.integer  :throttle_burst
       t.datetime :refilled_at
 
-      # ready = "this partition can admit at least one job right now".
-      # Maintained at every write; the partial index below depends on it.
-      t.boolean  :ready,            null: false, default: true
-      t.datetime :blocked_until
-
-      # Fairness
-      t.datetime :last_admitted_at
+      # Cursor: when this partition was last visited by the dispatcher.
+      # Rotates the queue circularly via ASC NULLS FIRST: a never-
+      # checked partition (NULL) goes to the front; a just-checked one
+      # goes to the back.
+      t.datetime :last_checked_at
 
       t.timestamps
     end
 
-    # The ready queue. Sub-millisecond scan to find the next N
-    # admissible partitions in LRU order, regardless of total partition
-    # count. NULLS FIRST = "never admitted, give it a turn".
+    # The cursor index. Sub-millisecond scan to fetch the next
+    # batch_size partitions in oldest-checked-first order, no matter
+    # how many partitions the policy has accumulated.
     add_index :dispatch_policy_partitions,
-      %i[policy_name last_admitted_at],
-      where: "pending_count > 0 AND ready = TRUE",
-      name:  "idx_dp_partitions_ready"
-
-    # Cheap unblock sweep — partitions whose blocked_until has passed
-    # (typically throttle waiting on a token refill).
-    add_index :dispatch_policy_partitions,
-      %i[policy_name blocked_until],
-      where: "ready = FALSE AND blocked_until IS NOT NULL",
-      name:  "idx_dp_partitions_unblock"
+      %i[policy_name last_checked_at],
+      where: "pending_count > 0",
+      name:  "idx_dp_partitions_cursor"
   end
 end

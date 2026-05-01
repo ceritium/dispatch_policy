@@ -75,7 +75,7 @@
           <%= sort_link.call("Pending",   "pending",   align_end: true) %>
           <%= sort_link.call("In-flight", "in_flight", align_end: true) %>
           <%= sort_link.call("Tokens",    "tokens",    align_end: true) %>
-          <%= sort_link.call("Last admitted", "last_admitted_at") %>
+          <%= sort_link.call("Last checked", "last_checked_at") %>
         </tr>
       </thead>
       <tbody>
@@ -91,9 +91,6 @@
                  else                            klass, label = "info", row[:status]
                  end %>
               <span class="slo-pill <%= klass %>"><%= label %></span>
-              <% if row[:blocked_until] && row[:blocked_until] > Time.current %>
-                <span class="muted" style="font-size: 0.75em;">unblocks in <%= ((row[:blocked_until] - Time.current) * 1000).to_i %>ms</span>
-              <% end %>
             </td>
             <td class="text-end"><%= row[:pending] %></td>
             <td class="text-end"><%= row[:in_flight] %></td>
@@ -105,8 +102,8 @@
               <% end %>
             </td>
             <td>
-              <% if row[:last_admitted_at] %>
-                <span title="<%= row[:last_admitted_at] %>"><%= time_ago_in_words(row[:last_admitted_at]) %> ago</span>
+              <% if row[:last_checked_at] %>
+                <span title="<%= row[:last_checked_at] %>"><%= time_ago_in_words(row[:last_checked_at]) %> ago</span>
               <% else %>
                 <span class="muted">never</span>
               <% end %>

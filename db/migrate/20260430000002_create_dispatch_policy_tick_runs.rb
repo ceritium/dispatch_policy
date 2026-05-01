@@ -19,6 +19,13 @@ class CreateDispatchPolicyTickRuns < ActiveRecord::Migration[7.1]
       t.string   :error_message
       t.datetime :created_at,   null: false
 
+      # Cursor health. cursor_lag_ms = NOW() - oldest last_checked_at
+      # among visited partitions, i.e. how long the most-stale
+      # partition had been waiting since its last turn. The avg /
+      # p95 over time is the dispatcher cycle time.
+      t.float    :cursor_lag_ms
+      t.integer  :active_partitions, null: false, default: 0   # active = pending_count>0 at the start of the tick
+
       # Inline so the indexes are part of the empty CREATE TABLE —
       # safe without concurrent ADD INDEX (the table has no rows).
       t.index :started_at,

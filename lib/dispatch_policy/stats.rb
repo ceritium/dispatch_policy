@@ -15,40 +15,50 @@ module DispatchPolicy
 
       rows = PolicyPartition.where(policy_name: policy_name).pluck(
         :pending_count, :in_flight, :concurrency_max,
-        :tokens, :throttle_rate, :throttle_burst, :refilled_at,
-        :ready, :blocked_until, :last_admitted_at
+        :tokens, :throttle_rate, :throttle_burst, :refilled_at
       )
 
-      pending  = rows.sum { |r| r[0].to_i }
-      inflight = rows.sum { |r| r[1].to_i }
+      pending    = rows.sum { |r| r[0].to_i }
+      inflight   = rows.sum { |r| r[1].to_i }
       partitions = rows.size
 
       buckets = Hash.new(0)
-      rows.each do |pc, inf, cmax, tok, rate, _burst, refilled, ready, blocked_until, _last|
+      rows.each do |pc, inf, cmax, tok, rate, burst, refilled|
         if pc.zero? && inf.zero?
           buckets[:idle] += 1
           next
         end
-        if ready
-          buckets[:ready] += 1
-        elsif cmax && inf >= cmax
+
+        # Compute admissibility on the fly from the columns. Same
+        # logic the dispatcher uses, just expressed in Ruby.
+        concurrency_block = cmax && inf >= cmax
+        throttle_block =
+          if rate
+            elapsed   = [ (now - refilled).to_f, 0 ].max
+            effective = [ burst.to_f, tok.to_f + elapsed * rate.to_f ].min
+            effective < 1
+          else
+            false
+          end
+
+        if concurrency_block
           buckets[:concurrency_blocked] += 1
-        elsif rate
+        elsif throttle_block
           buckets[:throttle_blocked] += 1
         else
-          buckets[:other] += 1
+          buckets[:ready] += 1
         end
       end
 
       {
-        policy_name:           policy_name,
-        pending:               pending,
-        in_flight:             inflight,
-        partition_count:       partitions,
-        ready_partitions:      buckets[:ready],
-        concurrency_blocked:   buckets[:concurrency_blocked],
-        throttle_blocked:      buckets[:throttle_blocked],
-        idle_partitions:       buckets[:idle]
+        policy_name:         policy_name,
+        pending:             pending,
+        in_flight:           inflight,
+        partition_count:     partitions,
+        ready_partitions:    buckets[:ready],
+        concurrency_blocked: buckets[:concurrency_blocked],
+        throttle_blocked:    buckets[:throttle_blocked],
+        idle_partitions:     buckets[:idle]
       }
     end
 
@@ -159,7 +169,7 @@ module DispatchPolicy
       scope = TickRun.where("started_at > ?", window.seconds.ago)
       scope = scope.where(policy_name: policy_name) if policy_name
 
-      rows = scope.pluck(:policy_name, :duration_ms, :admitted, :partitions, :declined, :error_class)
+      rows = scope.pluck(:policy_name, :duration_ms, :admitted, :partitions, :declined, :error_class, :active_partitions, :cursor_lag_ms)
       overall = aggregate_tick_rows(rows)
       per_policy = rows.group_by { |r| r[0] }.transform_values { |g| aggregate_tick_rows(g) }
 
@@ -171,16 +181,21 @@ module DispatchPolicy
       return blank_tick_summary(ticks) if ticks.zero?
 
       durations = rows.map { |r| r[1].to_f }.sort
+      lags      = rows.map { |r| r[7] }.compact.map(&:to_f).sort
       {
-        ticks:      ticks,
-        admitted:   rows.sum { |r| r[2].to_i },
-        partitions: rows.sum { |r| r[3].to_i },
-        p50_ms:     percentile(durations, 0.5),
-        p95_ms:     percentile(durations, 0.95),
-        p99_ms:     percentile(durations, 0.99),
-        max_ms:     durations.last.round(2),
-        errored:    rows.count { |r| r[5].present? },
-        declined:   rows.count { |r| r[4] }
+        ticks:                ticks,
+        admitted:             rows.sum { |r| r[2].to_i },
+        partitions:           rows.sum { |r| r[3].to_i },
+        p50_ms:               percentile(durations, 0.5),
+        p95_ms:               percentile(durations, 0.95),
+        p99_ms:               percentile(durations, 0.99),
+        max_ms:               durations.last.round(2),
+        errored:              rows.count { |r| r[5].present? },
+        declined:             rows.count { |r| r[4] },
+        active_partitions_max: rows.map { |r| r[6].to_i }.max,
+        cursor_lag_p50_ms:    lags.empty? ? nil : percentile(lags, 0.5),
+        cursor_lag_p95_ms:    lags.empty? ? nil : percentile(lags, 0.95),
+        cursor_lag_max_ms:    lags.empty? ? nil : lags.last.round(2)
       }
     end
     private_class_method :aggregate_tick_rows
@@ -189,7 +204,9 @@ module DispatchPolicy
       {
         ticks: ticks, admitted: 0, partitions: 0,
         p50_ms: nil, p95_ms: nil, p99_ms: nil, max_ms: nil,
-        errored: 0, declined: 0
+        errored: 0, declined: 0,
+        active_partitions_max: 0,
+        cursor_lag_p50_ms: nil, cursor_lag_p95_ms: nil, cursor_lag_max_ms: nil
       }
     end
     private_class_method :blank_tick_summary

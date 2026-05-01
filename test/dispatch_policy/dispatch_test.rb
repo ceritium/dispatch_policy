@@ -41,7 +41,7 @@ module DispatchPolicy
       part = PolicyPartition.find_by(policy_name: CappedJob.resolved_dispatch_policy.name, partition_key: "a")
       assert_equal 1, part.pending_count
       assert_equal 1, part.concurrency_max
-      assert       part.ready
+      assert_nil   part.last_checked_at, "fresh row goes to the front of the cursor"
     end
 
     # ─── Concurrency cap ────────────────────────────────────────
@@ -69,7 +69,7 @@ module DispatchPolicy
       assert_equal 1, grouped["acct-b"]
     end
 
-    test "ready queue excludes at-cap partitions" do
+    test "cursor visits gate-blocked partitions but admits zero" do
       # 5 partitions, all at cap=1.
       5.times { |i| CappedJob.perform_later("p#{i}") }
       Dispatch.run(policy_name: CappedJob.resolved_dispatch_policy.name)
@@ -77,10 +77,16 @@ module DispatchPolicy
 
       # Stage more demand on the same blocked partitions.
       5.times { |i| CappedJob.perform_later("p#{i}") }
+      pre_check = PolicyPartition.where(policy_name: CappedJob.resolved_dispatch_policy.name).pluck(:last_checked_at).compact
 
-      # No partition is ready — admit should be a no-op.
+      # No admissions, but the cursor should advance — every visited
+      # row's last_checked_at moves forward.
       admitted = Dispatch.run(policy_name: CappedJob.resolved_dispatch_policy.name)
       assert_equal 0, admitted
+
+      post_check = PolicyPartition.where(policy_name: CappedJob.resolved_dispatch_policy.name).pluck(:last_checked_at)
+      assert_operator post_check.compact.min, :>=, pre_check.min,
+        "cursor must advance on a no-admit visit"
     end
 
     # ─── Throttle ───────────────────────────────────────────────
@@ -115,6 +121,31 @@ module DispatchPolicy
     end
 
     # ─── Reap ───────────────────────────────────────────────────
+
+    # ─── Cursor lag ─────────────────────────────────────────────
+
+    test "Dispatch.run emits cursor_lag_ms + active_partitions" do
+      payloads = []
+      sub = ActiveSupport::Notifications.subscribe("tick.dispatch_policy") do |*args|
+        payloads << ActiveSupport::Notifications::Event.new(*args).payload.dup
+      end
+
+      begin
+        # Stage 5 partitions, age them, then run a tick.
+        5.times { |i| CappedJob.perform_later("acct-#{i}") }
+        PolicyPartition.where(policy_name: CappedJob.resolved_dispatch_policy.name)
+          .update_all(last_checked_at: 30.seconds.ago)
+
+        Dispatch.run(policy_name: CappedJob.resolved_dispatch_policy.name)
+      ensure
+        ActiveSupport::Notifications.unsubscribe(sub)
+      end
+
+      payload = payloads.last
+      assert_equal 5, payload[:active_partitions]
+      assert_in_delta 30_000, payload[:cursor_lag_ms], 5_000,
+        "cursor lag should reflect oldest partition's wait (~30s)"
+    end
 
     test "reap completes expired leases and decrements in_flight" do
       DispatchPolicy.config.lease_duration = 1

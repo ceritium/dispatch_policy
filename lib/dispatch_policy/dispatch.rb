@@ -6,21 +6,22 @@ module DispatchPolicy
   # Caught at the top of Dispatch.run to log and swallow after rollback.
   class EnqueueDeclined < StandardError; end
 
-  # Single admission pass:
+  # Cursor-based dispatcher.
   #
-  #   1. unblock_due!(policy)         — flip ready=TRUE on partitions whose
-  #                                     blocked_until has passed.
-  #   2. PolicyPartition.pluck_admissible — pick partitions in LRU order
-  #                                         with the slot count each can take.
-  #   3. CTE+LATERAL fetch over staged_jobs, one shot, bounded.
-  #   4. PolicyPartition.bulk_admit!  — decrement pending, increment in_flight,
-  #                                     drain throttle tokens, recompute ready.
-  #   5. ActiveJob.perform_all_later  — adapter handoff in same TX.
+  #   1. Pluck the next `batch_size` partitions in last_checked_at
+  #      ASC NULLS FIRST order — the most-stale-cursor first.
+  #   2. For each, compute slot capacity from gate state. Partitions
+  #      whose gates block them get slots = 0.
+  #   3. CTE+LATERAL fetch into staged_jobs for partitions with slots
+  #      > 0, bounded by batch_size.
+  #   4. Mark admitted, hand to the adapter (same TX), and bump
+  #      last_checked_at on EVERY visited partition (admitted or not)
+  #      so the cursor rotates past them next tick.
   #
-  # Anything fails → rollback unwinds admission, demand counters and
-  # adapter rows together. The dispatcher never fetches a job whose
-  # partition isn't admissible, so there's no filter step and no work
-  # wasted on rejected admissions.
+  # The "bump on every visit" is the key property: partitions
+  # gate-blocked don't stop the cursor, they just lose a turn. With
+  # N partitions and batch_size B, every partition is re-evaluated
+  # every ceil(N/B) ticks regardless of state.
   class Dispatch
     def self.run(policy_name: nil)
       return 0 unless DispatchPolicy.enabled?
@@ -29,8 +30,10 @@ module DispatchPolicy
         "tick.dispatch_policy",
         policy_name: policy_name
       ) do |payload|
-        admitted   = 0
-        partitions = 0
+        admitted          = 0
+        partitions        = 0
+        active_partitions = 0
+        cursor_lag_ms     = nil
 
         begin
           StagedJob.transaction do
@@ -38,40 +41,56 @@ module DispatchPolicy
               policy = lookup_policy(pname)
               next unless policy
 
-              PolicyPartition.unblock_due!(policy_name: pname)
+              cursor = PolicyPartition.pluck_cursor(pname, limit: policy.effective_batch_size)
+              next if cursor.empty?
 
-              admissible = PolicyPartition.pluck_admissible(
-                pname,
-                limit:      policy.effective_batch_size,
-                batch_size: policy.effective_batch_size
-              )
-              next if admissible.empty?
+              # Cursor lag = age of the oldest visited partition's
+              # last_checked_at. NULL means "never visited" → count
+              # as max lag for the current tick. Take the max across
+              # policies in the same tick.
+              oldest = cursor.first["last_checked_at"]
+              this_lag_ms =
+                if oldest.nil?
+                  0.0
+                else
+                  ((Time.current - oldest) * 1000.0).clamp(0, Float::INFINITY)
+                end
+              cursor_lag_ms = [ cursor_lag_ms || 0.0, this_lag_ms ].max
 
-              batch = fetch_batch(policy, admissible)
-              next if batch.empty?
+              # active_partitions = how many had pending demand at
+              # the start of this iteration. Bounded by batch_size
+              # in the cursor pluck; we count separately for accurate
+              # reporting independent of batch_size.
+              active_partitions += PolicyPartition
+                .where(policy_name: pname)
+                .where("pending_count > 0")
+                .count
 
-              partitions += admissible.size
-              admitted   += admit_and_enqueue!(policy, batch)
+              partitions += cursor.size
+              admitted   += dispatch_visited!(policy, cursor)
             end
           end
         rescue EnqueueDeclined => e
           Rails.logger&.warn("[DispatchPolicy] #{e.message} — transaction rolled back")
-          payload[:declined]   = true
-          payload[:admitted]   = 0
-          payload[:partitions] = partitions
+          payload[:declined]          = true
+          payload[:admitted]          = 0
+          payload[:partitions]        = partitions
+          payload[:active_partitions] = active_partitions
+          payload[:cursor_lag_ms]     = cursor_lag_ms
           return 0
         end
 
-        payload[:admitted]   = admitted
-        payload[:partitions] = partitions
+        payload[:admitted]          = admitted
+        payload[:partitions]        = partitions
+        payload[:active_partitions] = active_partitions
+        payload[:cursor_lag_ms]     = cursor_lag_ms
         admitted
       end
     end
 
-    # Lease recovery for workers that died mid-perform without
-    # releasing their in_flight counter. Bulk: one UPDATE on
-    # staged_jobs RETURNING (policy_name, partition_key) feeds a
-    # single bulk_decrement_in_flight call.
+    # Lease recovery for workers that died mid-perform. Bulk: one
+    # UPDATE on staged_jobs RETURNING (policy_name, partition_key)
+    # feeds a single bulk_decrement_in_flight call per policy.
     def self.reap
       ActiveSupport::Notifications.instrument("reap.dispatch_policy") do |payload|
         now = Time.current
@@ -105,13 +124,13 @@ module DispatchPolicy
       end
     end
 
-    # Called from around_perform after a job completes (or fails).
-    # Decrements in_flight + recomputes ready for the partition.
+    # Called from around_perform. Drops in_flight; the cursor will
+    # pick this partition up on its next turn and admit anything new
+    # the headroom allows.
     def self.release(policy_name:, partition_key:)
       PolicyPartition.release!(policy_name: policy_name, partition_key: partition_key)
     end
 
-    # Periodic-ish maintenance. Called from TickLoop boot.
     def self.purge_drained_partitions(ttl_seconds: nil)
       ttl = ttl_seconds || DispatchPolicy.config.partition_idle_ttl
       return if ttl.nil? || ttl <= 0
@@ -124,7 +143,7 @@ module DispatchPolicy
       return [ policy_name ] if policy_name
 
       PolicyPartition
-        .where("pending_count > 0 AND ready = TRUE")
+        .where("pending_count > 0")
         .distinct
         .pluck(:policy_name)
     end
@@ -140,10 +159,45 @@ module DispatchPolicy
       DispatchPolicy.registry[policy_name]
     end
 
+    # Process all visited partitions: admit what fits, bump cursor.
+    # Returns admitted count.
+    def self.dispatch_visited!(policy, cursor)
+      now        = Time.current
+      batch_size = policy.effective_batch_size
+
+      # Compute per-partition slots. Even gate-blocked ones go in
+      # `visits` with delta=0 so their last_checked_at advances.
+      visits     = {}
+      admissible = []
+      remaining  = batch_size
+      cursor.each do |row|
+        pk = row["partition_key"]
+        visits[pk] = 0
+        next if remaining <= 0
+        slots = PolicyPartition.slots_for(row, batch_size: remaining, now: now)
+        next if slots.zero?
+        admissible << { partition_key: pk, slots: slots }
+        remaining -= slots
+      end
+
+      batch = admissible.empty? ? [] : fetch_batch(policy, admissible)
+      admit_count = batch.empty? ? 0 : admit_and_enqueue!(policy, batch, now: now, visits: visits)
+
+      # Visit-only update: any partitions we plucked but didn't
+      # admit from get last_checked_at bumped here. The admit path
+      # already bumped its own subset via bulk_visit!.
+      remaining_visits = visits.select { |_, d| d.zero? }
+      PolicyPartition.bulk_visit!(
+        policy_name: policy.name,
+        visits:      remaining_visits,
+        now:         now
+      ) unless remaining_visits.empty?
+
+      admit_count
+    end
+
     # CTE + LATERAL: one query, one row per admissible partition's
-    # slot quota. PG plans this as a parameterised values-driven scan;
-    # complexity is O(admissible_count × log(staged_jobs)) per the
-    # idx_dp_staged_partition_order partial index.
+    # slot quota. PG plans this as a parameterised values-driven scan.
     def self.fetch_batch(policy, admissible)
       values_clause = ([ "(?, ?::int)" ] * admissible.size).join(", ")
       values_args   = admissible.flat_map { |row| [ row[:partition_key], row[:slots] ] }
@@ -169,12 +223,10 @@ module DispatchPolicy
       StagedJob.find_by_sql([ sql, *values_args, policy.name, policy.effective_batch_size ])
     end
 
-    def self.admit_and_enqueue!(policy, batch)
-      now           = Time.current
+    def self.admit_and_enqueue!(policy, batch, now:, visits:)
       lease_expires = now + policy.effective_lease_duration
 
       admit_rows  = []
-      counts      = Hash.new(0)
       pairs       = []
 
       batch.each do |staged|
@@ -184,7 +236,7 @@ module DispatchPolicy
         job._dispatch_admitted_at   = now
 
         admit_rows << [ staged.id, job.job_id ]
-        counts[staged.partition_key] += 1
+        visits[staged.partition_key] = (visits[staged.partition_key] || 0) + 1
         pairs << [ staged, job ]
       end
 
@@ -193,9 +245,12 @@ module DispatchPolicy
         admitted_at:      now,
         lease_expires_at: lease_expires
       )
-      PolicyPartition.bulk_admit!(
+      # Visit only the admitted partitions here; the no-admit ones
+      # are bumped separately so a single SQL handles each subset.
+      admitted_visits = visits.select { |_, d| d.positive? }
+      PolicyPartition.bulk_visit!(
         policy_name: policy.name,
-        counts:      counts,
+        visits:      admitted_visits,
         now:         now
       )
 
