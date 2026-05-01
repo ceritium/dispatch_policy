@@ -285,23 +285,30 @@ class RepositoryIntegrationTest < Minitest::Test
   end
 
   def test_partition_round_trip_stats
-    # Three partitions: one never checked, one checked 10s ago, one checked 1s ago
-    DispatchPolicy::Repository.stage!(
-      policy_name: "p", partition_key: "k1", queue_name: nil,
-      job_class: "J", job_data: { "job_id" => "1", "job_class" => "J", "arguments" => [] },
-      context: {}, priority: 0
-    )
-    DispatchPolicy::Repository.stage!(
-      policy_name: "p", partition_key: "k2", queue_name: nil,
-      job_class: "J", job_data: { "job_id" => "2", "job_class" => "J", "arguments" => [] },
-      context: {}, priority: 0
-    )
-    DispatchPolicy::Partition.where(partition_key: "k1").update_all(last_checked_at: 10.seconds.ago)
-    DispatchPolicy::Partition.where(partition_key: "k2").update_all(last_checked_at: 1.second.ago)
+    %w[k1 k2 k3 k4 k5].each do |k|
+      DispatchPolicy::Repository.stage!(
+        policy_name: "p", partition_key: k, queue_name: nil,
+        job_class: "J", job_data: { "job_id" => k, "job_class" => "J", "arguments" => [] },
+        context: {}, priority: 0
+      )
+    end
+
+    # Spread last_checked_at: 60s, 30s, 10s, 5s, 1s ago.
+    {"k1" => 60, "k2" => 30, "k3" => 10, "k4" => 5, "k5" => 1}.each do |key, ago|
+      DispatchPolicy::Partition.where(partition_key: key).update_all(last_checked_at: ago.seconds.ago)
+    end
 
     stats = DispatchPolicy::Repository.partition_round_trip_stats(policy_name: "p")
-    assert_equal 2, stats[:active_partitions]
-    assert_in_delta 10.0, stats[:oldest_age_seconds], 1.5
+    assert_equal 5, stats[:active_partitions]
+    assert_in_delta 60.0, stats[:oldest_age_seconds], 2.0
+
+    # P95 must be at least as old as P50 (regression guard against earlier
+    # SQL bug that inverted the percentile direction on timestamps).
+    assert stats[:p95_age_seconds] >= stats[:p50_age_seconds],
+           "P95 age (#{stats[:p95_age_seconds]}) must be >= P50 age (#{stats[:p50_age_seconds]})"
+
+    assert stats[:oldest_age_seconds] >= stats[:p95_age_seconds],
+           "oldest age (#{stats[:oldest_age_seconds]}) must be >= P95 (#{stats[:p95_age_seconds]})"
   end
 
   def test_sweep_old_tick_samples

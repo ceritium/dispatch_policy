@@ -464,6 +464,12 @@ module DispatchPolicy
         params << policy_name
       end
 
+      # For ages (now - last_checked_at) the percentile direction inverts:
+      # the 95th percentile of *age* corresponds to the 5th percentile of the
+      # *timestamp* (the oldest 5% of last_checked_at values). Computing the
+      # percentile directly on now()-last_checked_at would be cleaner but
+      # PostgreSQL's PERCENTILE_DISC needs an ordered set on a column, so we
+      # invert the percentile argument instead.
       result = connection.exec_query(
         <<~SQL.squish,
           SELECT
@@ -471,8 +477,8 @@ module DispatchPolicy
             COUNT(*) FILTER (WHERE p.last_checked_at IS NULL)::int AS never_checked,
             COUNT(*) FILTER (WHERE p.next_eligible_at IS NOT NULL AND p.next_eligible_at > now())::int AS in_backoff,
             EXTRACT(EPOCH FROM (now() - MIN(p.last_checked_at)))::float AS oldest_age_seconds,
-            EXTRACT(EPOCH FROM (now() - PERCENTILE_DISC(0.5) WITHIN GROUP (ORDER BY p.last_checked_at)))::float AS p50_age_seconds,
-            EXTRACT(EPOCH FROM (now() - PERCENTILE_DISC(0.95) WITHIN GROUP (ORDER BY p.last_checked_at)))::float AS p95_age_seconds
+            EXTRACT(EPOCH FROM (now() - PERCENTILE_DISC(0.5)  WITHIN GROUP (ORDER BY p.last_checked_at)))::float AS p50_age_seconds,
+            EXTRACT(EPOCH FROM (now() - PERCENTILE_DISC(0.05) WITHIN GROUP (ORDER BY p.last_checked_at)))::float AS p95_age_seconds
           FROM #{PARTITIONS_TABLE} p
           #{filter_sql}
         SQL
