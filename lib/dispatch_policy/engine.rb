@@ -3,24 +3,13 @@
 require "rails/engine"
 
 module DispatchPolicy
-  # Raised at boot when the host app is configured with an ActiveJob
-  # adapter that cannot participate in the staging transaction (Sidekiq,
-  # Resque, SQS, ...). dispatch_policy's atomicity guarantees only hold
-  # for adapters that share a PostgreSQL connection with our tables.
   class UnsupportedAdapterError < StandardError; end
 
   class Engine < ::Rails::Engine
     isolate_namespace DispatchPolicy
 
-    initializer "dispatch_policy.reference_gates" do
+    initializer "dispatch_policy.reference_patch" do
       config.to_prepare do
-        # Reference the built-in gates so they register in Gate.registry.
-        DispatchPolicy::Gates::Concurrency
-        DispatchPolicy::Gates::Throttle
-        DispatchPolicy::Gates::GlobalCap
-        DispatchPolicy::Gates::FairInterleave
-        DispatchPolicy::Gates::AdaptiveConcurrency
-
         DispatchPolicy::ActiveJobPerformAllLaterPatch
       end
     end
@@ -41,17 +30,13 @@ module DispatchPolicy
         (good_job, solid_queue) sharing the same connection as
         dispatch_policy_staged_jobs so admission and enqueue can run in
         a single transaction. Detected adapter: #{adapter.inspect}.
-        See README → "Adapter requirements". To override (at your own
-        risk), set DispatchPolicy.config.allowed_adapters.
       MSG
     end
 
     initializer "dispatch_policy.boot_prune", after: :load_config_initializers do
       config.to_prepare do
         begin
-          DispatchPolicy::Tick.prune_orphan_gate_rows
-          DispatchPolicy::Tick.prune_idle_partitions
-          DispatchPolicy::PartitionObservation.prune!
+          DispatchPolicy::Dispatch.purge_drained_partitions
         rescue ActiveRecord::NoDatabaseError,
                ActiveRecord::StatementInvalid,
                ActiveRecord::ConnectionNotEstablished

@@ -20,12 +20,7 @@ ActiveRecord::Migration.verbose = false
 migration_path = File.expand_path("../db/migrate", __dir__)
 %w[
   dispatch_policy_staged_jobs
-  dispatch_policy_partition_counts
-  dispatch_policy_throttle_buckets
-  dispatch_policy_adaptive_concurrency_stats
-  dispatch_policy_adaptive_concurrency_samples
-  dispatch_policy_partition_observations
-  dispatch_policy_partition_states
+  dispatch_policy_partitions
   dispatch_policy_policy_configs
   dispatch_policy_tick_runs
   schema_migrations

@@ -24,7 +24,7 @@ module DispatchPolicy
       reload_policy_configs!(policy_name)
 
       begin
-        ActiveRecord::Base.uncached { Tick.reap }
+        ActiveRecord::Base.uncached { Dispatch.reap }
       rescue StandardError => e
         Rails.logger&.error("[DispatchPolicy] reap error: #{e.class}: #{e.message}")
         Rails.error.report(e, handled: true) if defined?(Rails) && Rails.respond_to?(:error)
@@ -63,7 +63,7 @@ module DispatchPolicy
           admitted = 0
           begin
             ActiveRecord::Base.uncached do
-              admitted = Tick.run(policy_name: policy_name).to_i
+              admitted = Dispatch.run(policy_name: policy_name).to_i
             end
           rescue StandardError => e
             Rails.logger&.error("[DispatchPolicy] tick error: #{e.class}: #{e.message}")

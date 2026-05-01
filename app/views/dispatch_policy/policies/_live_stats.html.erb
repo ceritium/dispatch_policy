@@ -13,39 +13,41 @@
   <% else %>
     <div class="slo-grid">
       <div class="h">Policy</div>
-      <div class="h">Fairness (lru / gated)</div>
-      <div class="h">Capacity (active/batch)</div>
+      <div class="h">Partitions (ready / cncy / thr)</div>
+      <div class="h">Pending lag</div>
       <div class="h">Diagnosis</div>
 
       <% slos.each do |s| %>
         <%
           fair = s[:fairness]
-          cap  = s[:capacity]
           bn   = s[:bottleneck] || {}
         %>
         <div class="cell"><%= link_to(content_tag(:code, s[:policy_name]), policy_path(policy_name: s[:policy_name])) %></div>
 
         <div class="cell">
-          <% if bn[:applicable] == false %>
-            <span class="slo-pill info">—</span>
-            <span class="muted">no round_robin</span>
+          <% ready = fair[:ready_partitions].to_i
+             cncy  = fair[:concurrency_blocked].to_i
+             thr   = fair[:throttle_blocked].to_i %>
+          <span class="slo-pill <%= ready.positive? ? "ok" : "info" %>"><%= ready %> ready</span>
+          <span class="muted">/</span>
+          <span class="slo-pill <%= cncy.positive? ? "info" : "ok" %>"><%= cncy %> cncy</span>
+          <span class="muted">/</span>
+          <span class="slo-pill <%= thr.positive?  ? "info" : "ok" %>"><%= thr %> thr</span>
+        </div>
+
+        <div class="cell">
+          <% stale = fair[:stale_pending].to_i %>
+          <% if stale.zero? %>
+            <span class="slo-pill ok">0</span>
           <% else %>
-            <% lru = fair[:stale_partitions].to_i; gated = fair[:gate_blocked].to_i %>
-            <span class="slo-pill <%= lru.zero? ? "ok" : "bad" %>"><%= lru %> lru</span>
-            <span class="muted">/</span>
-            <span class="slo-pill info"><%= gated %> gated</span>
+            <span class="slo-pill <%= fair[:ok] ? "info" : "bad" %>">
+              <%= stale %> &gt;<%= fair[:threshold] %>s
+            </span>
           <% end %>
         </div>
 
         <div class="cell">
-          <span class="slo-pill info"><%= cap[:active_partitions] %>/<%= cap[:batch_size] %></span>
-          <% unless cap[:headroom] %>
-            <span class="slo-pill bad">rotating</span>
-          <% end %>
-        </div>
-
-        <div class="cell">
-          <% if bn[:applicable] && bn[:diagnosis] && bn[:diagnosis] != :ok %>
+          <% if bn[:diagnosis] && bn[:diagnosis] != :ok %>
             <span class="slo-pill bad"><%= bn[:diagnosis] %></span>
             <% rec = bn[:recommended_config] || {} %>
             <% if rec.any? %>
@@ -55,8 +57,6 @@
                 <% end %>
               </div>
             <% end %>
-          <% elsif bn[:applicable] == false %>
-            <span class="muted">—</span>
           <% else %>
             <span class="slo-pill ok">ok</span>
           <% end %>

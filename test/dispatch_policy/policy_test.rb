@@ -4,86 +4,71 @@ require "test_helper"
 
 module DispatchPolicy
   class PolicyTest < ActiveSupport::TestCase
-    class SampleJob < ActiveJob::Base
+    class CappedJob < ActiveJob::Base
       include DispatchPolicy::Dispatchable
       dispatch_policy do
-        context ->(args) { { tenant: args.first } }
-        dedupe_key ->(args) { "sample:#{args.first}" }
-        round_robin_by ->(args) { args.first }
-        gate :concurrency, max: 1, partition_by: ->(ctx) { ctx[:tenant] }
+        partition_by ->(args) { args.first }
+        concurrency  max: 3
       end
       def perform(*); end
     end
 
-    test "registers the policy under the underscored class name" do
-      policy = SampleJob.resolved_dispatch_policy
-      assert_equal "dispatch_policy-policy_test-sample_job", policy.name
-      assert_equal SampleJob, DispatchPolicy.registry[policy.name]
-    end
-
-    test "context, dedupe_key, and round_robin_by all invoke their lambdas" do
-      policy = SampleJob.resolved_dispatch_policy
-      assert_equal({ tenant: "A" }, policy.context_builder.call([ "A" ]))
-      assert_equal "sample:A", policy.build_dedupe_key([ "A" ])
-      assert_equal "A", policy.build_round_robin_key([ "A" ])
-    end
-
-    test "round_robin_key returns nil for empty/nil values" do
-      policy = SampleJob.resolved_dispatch_policy
-      assert_nil policy.build_round_robin_key([ nil ])
-      assert_nil policy.build_round_robin_key([ "" ])
-    end
-
-    # ─── Per-policy config overrides ───────────────────────────────
-
-    class TunedJob < ActiveJob::Base
+    class ThrottledJob < ActiveJob::Base
       include DispatchPolicy::Dispatchable
       dispatch_policy do
-        round_robin_by      ->(args) { args.first }
-        batch_size          1000
-        round_robin_quantum 1
-        lease_duration      5 * 60
-        round_robin_max_partitions_per_tick 250
+        partition_by ->(args) { args.first }
+        throttle     rate: 60, per: 60.seconds, burst: 60
       end
       def perform(*); end
     end
 
-    test "per-policy DSL overrides win over DispatchPolicy.config defaults" do
-      policy = TunedJob.resolved_dispatch_policy
-
-      assert_equal 1000,    policy.effective_batch_size
-      assert_equal 1,       policy.effective_round_robin_quantum
-      assert_equal 5 * 60,  policy.effective_lease_duration
-      assert_equal 250,     policy.effective_round_robin_max_partitions_per_tick
+    test "DSL captures concurrency_max" do
+      assert_equal 3, CappedJob.resolved_dispatch_policy.concurrency_max
     end
 
-    test "policy without overrides falls back to DispatchPolicy.config" do
-      policy = SampleJob.resolved_dispatch_policy
-
-      assert_equal DispatchPolicy.config.batch_size,          policy.effective_batch_size
-      assert_equal DispatchPolicy.config.round_robin_quantum, policy.effective_round_robin_quantum
-      assert_equal DispatchPolicy.config.lease_duration,      policy.effective_lease_duration
+    test "DSL captures throttle rate / burst" do
+      p = ThrottledJob.resolved_dispatch_policy
+      assert_in_delta 1.0, p.throttle_rate, 0.001  # 60/60s = 1 token/sec
+      assert_equal   60,   p.throttle_burst
     end
 
-    test "config_overrides reports only the overridden knobs" do
-      tuned     = TunedJob.resolved_dispatch_policy
-      untuned   = SampleJob.resolved_dispatch_policy
-
-      assert_equal 1000, tuned.config_overrides[:batch_size]
-      assert_equal 1,    tuned.config_overrides[:round_robin_quantum]
-      assert_empty       untuned.config_overrides
+    test "concurrency without partition_by raises" do
+      assert_raises ArgumentError do
+        Class.new(ActiveJob::Base) do
+          include DispatchPolicy::Dispatchable
+          def self.name; "Anon::A"; end
+          dispatch_policy { concurrency max: 1 }
+          def perform(*); end
+        end
+      end
     end
 
-    test "DSL setters can also be invoked at runtime to update config" do
-      policy = SampleJob.resolved_dispatch_policy
-      original_batch = policy.config_overrides[:batch_size]
+    test "throttle rate must be positive" do
+      assert_raises ArgumentError do
+        Class.new(ActiveJob::Base) do
+          include DispatchPolicy::Dispatchable
+          def self.name; "Anon::B"; end
+          dispatch_policy do
+            partition_by ->(args) { args.first }
+            throttle rate: 0, per: 1.second
+          end
+          def perform(*); end
+        end
+      end
+    end
 
-      policy.batch_size 200
-      assert_equal 200, policy.effective_batch_size
-      assert_equal 200, policy.config_overrides[:batch_size]
-    ensure
-      # Restore for other tests in random order
-      policy.instance_variable_set(:@override_batch_size, original_batch)
+    test "concurrency max must be Integer (not Proc)" do
+      assert_raises ArgumentError do
+        Class.new(ActiveJob::Base) do
+          include DispatchPolicy::Dispatchable
+          def self.name; "Anon::C"; end
+          dispatch_policy do
+            partition_by ->(args) { args.first }
+            concurrency  max: ->(_ctx) { 5 }
+          end
+          def perform(*); end
+        end
+      end
     end
   end
 end

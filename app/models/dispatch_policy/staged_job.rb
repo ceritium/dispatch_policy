@@ -1,6 +1,15 @@
 # frozen_string_literal: true
 
 module DispatchPolicy
+  # Payload + per-partition order. Stages a job at perform_later
+  # time, marks admitted at dispatch time, marks completed at
+  # around_perform exit time.
+  #
+  # Atomicity: stage! INSERTs the row AND increments
+  # PolicyPartition.pending_count in the same TX. mark_admitted_many!
+  # UPDATEs admitted_at + lease_expires_at AND PolicyPartition counters
+  # in the same TX (called from Dispatch.run inside a single
+  # transaction that also enqueues the adapter rows).
   class StagedJob < ApplicationRecord
     self.table_name = "dispatch_policy_staged_jobs"
 
@@ -12,165 +21,130 @@ module DispatchPolicy
       admitted.where("lease_expires_at IS NOT NULL AND lease_expires_at < ?", Time.current)
     }
 
-    # Merge the job's ActiveJob metadata (queue_name, priority) into the
-    # context hash so gate lambdas can partition_by :queue_name without
-    # the user having to pass it as a kwarg. User-provided keys win.
+    # ─── Stage ───────────────────────────────────────────────────
+
     def self.context_for(job_instance, policy)
       built = policy.context_builder.call(job_instance.arguments)
-      return built unless built.is_a?(Hash)
+      return {} unless built.is_a?(Hash)
       {
         queue_name: job_instance.queue_name,
         priority:   job_instance.priority
       }.merge(built.symbolize_keys)
     end
 
-    # Stages a job in the admission queue. Returns the created row, or nil if
-    # the policy declares a dedupe_key and an active row already exists.
+    # Single-job stage. Returns the row, or nil if dedupe collision.
     def self.stage!(job_instance:, policy:)
-      dedupe_key = policy.build_dedupe_key(job_instance.arguments)
+      now           = Time.current
+      dedupe_key    = policy.build_dedupe_key(job_instance.arguments)
+      partition_key = policy.build_partition_key(job_instance.arguments)
 
       if dedupe_key && exists?(policy_name: policy.name, dedupe_key: dedupe_key, completed_at: nil)
         return nil
       end
 
-      rrk = policy.build_round_robin_key(job_instance.arguments)
-      now = Time.current
-
-      staged = create!(
-        job_class:       job_instance.class.name,
-        policy_name:     policy.name,
-        arguments:       job_instance.serialize,
-        snapshot:        policy.build_snapshot(job_instance.arguments),
-        context:         context_for(job_instance, policy),
-        priority:        job_instance.priority || 100,
-        not_before_at:   job_instance.scheduled_at,
-        staged_at:       now,
-        dedupe_key:      dedupe_key,
-        round_robin_key: rrk
-      )
-
-      # Materialize partition activity so pluck_active_partitions can
-      # skip the DISTINCT scan over staged_jobs at high N.
-      if rrk
-        PartitionState.bulk_increment_pending!(
-          policy_name: policy.name,
-          counts:      { rrk => 1 },
-          now:         now
+      transaction do
+        staged = create!(
+          job_class:       job_instance.class.name,
+          policy_name:     policy.name,
+          partition_key:   partition_key,
+          arguments:       job_instance.serialize,
+          context:         context_for(job_instance, policy),
+          priority:        job_instance.priority || 100,
+          dedupe_key:      dedupe_key,
+          not_before_at:   job_instance.scheduled_at,
+          staged_at:       now
         )
-      end
 
-      staged
-    rescue ActiveRecord::RecordNotUnique
-      nil
+        PolicyPartition.bulk_seed!(
+          policy: policy,
+          counts: { partition_key => 1 },
+          now:    now
+        )
+
+        staged
+      end
     end
 
-    # Batch-insert variant of stage!.
+    # Bulk stage. Called from ActiveJob.perform_all_later. Skips
+    # dedupe collisions (relies on the unique partial index to ignore
+    # duplicates via ON CONFLICT DO NOTHING).
     def self.stage_many!(policy:, jobs:)
       return 0 if jobs.empty?
 
       now = Time.current
-      rows = jobs.map do |job_instance|
+
+      rows = jobs.map do |job|
         {
-          job_class:       job_instance.class.name,
-          policy_name:     policy.name,
-          arguments:       job_instance.serialize,
-          snapshot:        policy.build_snapshot(job_instance.arguments),
-          context:         context_for(job_instance, policy),
-          priority:        job_instance.priority || 100,
-          not_before_at:   job_instance.scheduled_at,
-          staged_at:       now,
-          dedupe_key:      policy.build_dedupe_key(job_instance.arguments),
-          round_robin_key: policy.build_round_robin_key(job_instance.arguments),
-          partitions:      {},
-          created_at:      now,
-          updated_at:      now
+          policy_name:   policy.name,
+          partition_key: policy.build_partition_key(job.arguments),
+          job_class:     job.class.name,
+          arguments:     job.serialize,
+          context:       context_for(job, policy),
+          priority:      job.priority || 100,
+          dedupe_key:    policy.build_dedupe_key(job.arguments),
+          not_before_at: job.scheduled_at,
+          staged_at:     now,
+          created_at:    now,
+          updated_at:    now
         }
       end
 
-      # Use returning to get the round_robin_key of inserted-not-deduped
-      # rows so partition_states.pending_count reflects exactly the
-      # rows that landed in staged_jobs.
-      result = insert_all(
-        rows,
-        unique_by: :idx_dp_staged_dedupe_active,
-        returning: %i[round_robin_key]
-      )
-
-      partition_counts = Hash.new(0)
-      result.rows.each do |row|
-        # rows is array of [round_robin_key] for this returning clause.
-        rrk = row.first
-        partition_counts[rrk] += 1 if rrk
-      end
-
-      if partition_counts.any?
-        PartitionState.bulk_increment_pending!(
-          policy_name: policy.name,
-          counts:      partition_counts,
-          now:         now
+      transaction do
+        # `RETURNING partition_key` so we count only rows that
+        # actually inserted (dedupe ON CONFLICT skips duplicates).
+        result = insert_all(
+          rows,
+          unique_by:   "idx_dp_staged_dedupe_active",
+          returning:   %i[partition_key]
         )
+        actual_counts = Hash.new(0)
+        result.rows.each { |row| actual_counts[row.first] += 1 }
+
+        PolicyPartition.bulk_seed!(policy: policy, counts: actual_counts, now: now) unless actual_counts.empty?
+        actual_counts.values.sum
       end
-
-      result.rows.size
     end
 
-    def self.mark_completed_by_active_job_id(active_job_id)
-      return 0 if active_job_id.blank?
-      where(active_job_id: active_job_id, completed_at: nil)
-        .update_all(completed_at: Time.current, lease_expires_at: nil)
-    end
-
-    def mark_admitted!(partitions:)
-      now = Time.current
-      job = instantiate_active_job
-      job._dispatch_partitions  = partitions
-      job._dispatch_admitted_at = now
-
-      update!(
-        admitted_at:      now,
-        lease_expires_at: now + DispatchPolicy.config.lease_duration,
-        active_job_id:    job.job_id,
-        partitions:       partitions
-      )
-
-      job
-    end
-
-    # Bulk variant of mark_admitted! for the tick path. Updates every
-    # row in the batch with one UPDATE … FROM (VALUES …) statement
-    # instead of N separate UPDATEs. The (id, active_job_id,
-    # partitions) tuples are computed in Ruby — the tick path
-    # deserializes the ActiveJob and assigns _dispatch_partitions in
-    # memory there, so we don't need a RETURNING clause.
+    # Bulk admission marker. Called from Dispatch inside the dispatch
+    # TX. `rows` is [[id, active_job_id], ...].
     def self.mark_admitted_many!(rows:, admitted_at:, lease_expires_at:)
       return 0 if rows.empty?
 
-      values_clause = ([ "(?::bigint, ?, ?::jsonb)" ] * rows.size).join(", ")
-      values_args   = rows.flat_map { |id, active_job_id, partitions|
-        [ id, active_job_id, partitions.to_json ]
-      }
+      values_clause = ([ "(?::bigint, ?)" ] * rows.size).join(", ")
+      values_args   = rows.flat_map { |id, ajid| [ id, ajid.to_s ] }
 
       sql = <<~SQL.squish
         UPDATE #{quoted_table_name} AS s
            SET admitted_at      = ?,
                lease_expires_at = ?,
                active_job_id    = d.active_job_id,
-               partitions       = d.partitions
-          FROM (VALUES #{values_clause}) AS d(id, active_job_id, partitions)
+               updated_at       = ?
+          FROM (VALUES #{values_clause}) AS d(id, active_job_id)
          WHERE s.id = d.id
       SQL
 
       connection.exec_update(
-        sanitize_sql_array([ sql, admitted_at, lease_expires_at, *values_args ])
+        sanitize_sql_array([ sql, admitted_at, lease_expires_at, admitted_at, *values_args ])
       )
-      # exec_update with raw SQL doesn't invalidate the AR query
-      # cache the way update_all does. Without this, callers running
-      # subsequent SELECTs against staged_jobs in the same query-cache
-      # scope see stale rows. TickLoop wraps in uncached so this is a
-      # no-op there, but we want correct semantics on direct callers.
       connection.clear_query_cache
     end
 
+    def self.mark_completed_by_active_job_id(active_job_id, now: Time.current)
+      return 0 unless active_job_id
+
+      sql = <<~SQL.squish
+        UPDATE #{quoted_table_name}
+           SET completed_at     = ?,
+               lease_expires_at = NULL,
+               updated_at       = ?
+         WHERE active_job_id = ?
+           AND completed_at IS NULL
+      SQL
+      connection.exec_update(sanitize_sql_array([ sql, now, now, active_job_id ]))
+      connection.clear_query_cache
+    end
+
+    # Re-instantiate the ActiveJob from the stored serialized payload.
     def instantiate_active_job
       ActiveJob::Base.deserialize(arguments)
     end

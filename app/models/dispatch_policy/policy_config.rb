@@ -15,8 +15,6 @@ module DispatchPolicy
 
     KNOWN_KEYS = %i[
       batch_size
-      round_robin_quantum
-      round_robin_max_partitions_per_tick
       lease_duration
     ].freeze
 

@@ -1,7 +1,6 @@
 <%= render "tick_perf",
       tick_perf:        @tick_perf,
       tick_perf_window: @tick_perf_window,
-      show_breakdown:   false,
       base_params:      { policy_name: @policy_name } %>
 
 <p class="back"><%= link_to "← All policies", root_path %></p>
@@ -14,7 +13,7 @@
     <div class="sub"><%= @pending_eligible_count %> eligible · <%= @pending_scheduled_count %> scheduled</div>
   </div>
   <div class="summary-item">
-    <div class="label">Admitted</div>
+    <div class="label">In-flight</div>
     <div class="value"><%= @admitted_count %></div>
   </div>
   <div class="summary-item">
@@ -24,188 +23,17 @@
   <div class="summary-item">
     <div class="label">Gates</div>
     <div class="value" style="font-size: 1em;">
-      <% (@policy&.gates || []).each do |g| %>
-        <span class="badge"><%= g.name %></span>
+      <% if @policy&.concurrency_max %>
+        <span class="badge">concurrency max=<%= @policy.concurrency_max %></span>
+      <% end %>
+      <% if @policy&.throttle_rate %>
+        <span class="badge">
+          throttle <%= @policy.throttle_rate.to_f.round(2) %>/s burst=<%= @policy.throttle_burst %>
+        </span>
       <% end %>
     </div>
   </div>
 </div>
-
-<% if @adaptive_global.any? { |v| !v.nil? } %>
-  <h2>Adaptive — EWMA queue lag (avg across partitions, last hour)</h2>
-  <div class="chart-global">
-    <canvas data-chart="line"
-            data-label="avg ewma_latency_ms"
-            data-labels='<%= @chart_labels.to_json %>'
-            data-values='<%= @adaptive_global.to_json %>'
-            data-counts='<%= @completions_global.to_json %>'></canvas>
-  </div>
-<% end %>
-
-<h2>Watched partitions <small class="muted">(<%= @partition_breakdown.size %>)</small></h2>
-
-<% if @partition_breakdown.empty? %>
-  <p class="muted">No partitions watched yet. Pick some from the list below with <strong>+ watch</strong>; your selection is stored locally in the browser.</p>
-<% else %>
-  <table data-watched-table data-policy-name="<%= @policy_name %>">
-    <thead>
-      <tr>
-        <th></th>
-        <th>Source</th>
-        <th>Partition</th>
-        <th class="text-end">Pending (eligible)</th>
-        <th class="text-end">Pending (scheduled)</th>
-        <th class="text-end">In-flight</th>
-        <th class="text-end">Completed (24h)</th>
-        <th class="text-end">Adaptive cap</th>
-        <th class="text-end">EWMA latency (ms)</th>
-      </tr>
-    </thead>
-    <tbody>
-      <% @partition_breakdown.each do |row| %>
-        <tr>
-          <td><button type="button" class="chip" data-unwatch="<%= row[:partition] %>" title="Stop watching">×</button></td>
-          <td><%= row[:source] %></td>
-          <td><code><%= row[:partition] %></code></td>
-          <td class="text-end"><%= row[:eligible] %></td>
-          <td class="text-end"><%= row[:scheduled] %></td>
-          <td class="text-end"><%= row[:in_flight] %></td>
-          <td class="text-end"><%= row[:completed_24h] %></td>
-          <td class="text-end">
-            <% if row[:current_max] %><strong><%= row[:current_max] %></strong><% else %><span class="muted">—</span><% end %>
-          </td>
-          <td class="text-end">
-            <% if row[:ewma_latency_ms] %><%= row[:ewma_latency_ms] %><% else %><span class="muted">—</span><% end %>
-          </td>
-        </tr>
-        <%
-          series      = @adaptive_samples[row[:partition]]    || Array.new(@chart_slots.size)
-          counts      = @completions_samples[row[:partition]] || Array.new(@chart_slots.size, 0)
-          has_samples = series.any? { |v| !v.nil? } || counts.any? { |c| c.positive? }
-        %>
-        <tr>
-          <td colspan="9" class="sparkline-cell">
-            <% if has_samples %>
-              <div class="sparkline-wrap">
-                <canvas data-chart="sparkline"
-                        data-labels='<%= @chart_labels.to_json %>'
-                        data-values='<%= series.to_json %>'
-                        data-counts='<%= counts.to_json %>'></canvas>
-              </div>
-            <% else %>
-              <div class="sparkline-wrap sparkline-empty"><span class="muted">no completions in the last hour yet</span></div>
-            <% end %>
-          </td>
-        </tr>
-      <% end %>
-    </tbody>
-  </table>
-<% end %>
-
-<h2>All partitions <small class="muted">(<%= @partition_total_list %>)</small></h2>
-
-<% if @partition_breakdown_truncated %>
-  <p class="muted" style="background: #fff3cd; border: 1px solid #f0d97f; padding: 0.5em 0.75em; border-radius: 4px;">
-    Showing the most-active partitions only. The full set exceeds the
-    admin's per-request cap (<code>DispatchPolicy.config.admin_partition_limit</code>
-    = <%= DispatchPolicy.config.admin_partition_limit %>); raise it if you need the long tail.
-  </p>
-<% end %>
-
-<turbo-frame id="partitions_list" data-turbo-action="advance">
-  <% if @partition_total_list.to_i.zero? && @partition_search.blank? %>
-    <p class="muted">This policy declares no partitioning (no gate with <code>partition_by</code> and no <code>round_robin_by</code>).</p>
-  <% else %>
-    <%= form_with url: url_for, method: :get, local: true, html: { class: "partition-search" } do %>
-      <% if params[:watch].present? %>
-        <%= hidden_field_tag :watch, params[:watch] %>
-      <% end %>
-      <%= text_field_tag :q, @partition_search, placeholder: "filter by partition key…", size: 30, autofocus: @partition_search.present? %>
-      <%= submit_tag "Search", name: nil %>
-      <% if @partition_search.present? %>
-        <%= link_to "clear", url_for(q: nil, page: nil, watch: params[:watch]), class: "muted" %>
-      <% end %>
-    <% end %>
-
-    <% if @partition_list.empty? %>
-      <p class="muted">No matches.</p>
-    <% else %>
-      <%
-        sort_link = lambda { |label, col, align_end: false|
-          active = @partition_sort == col
-          next_dir = active && @partition_dir == "desc" ? "asc" : "desc"
-          arrow = active ? (@partition_dir == "asc" ? " ▲" : " ▼") : ""
-          content_tag(:th, class: (align_end ? "text-end" : nil)) do
-            link_to "#{label}#{arrow}",
-              url_for(sort: col, dir: next_dir, q: @partition_search.presence, page: nil, watch: params[:watch]),
-              class: (active ? "sorted" : nil)
-          end
-        }
-      %>
-      <table data-policy-name="<%= @policy_name %>">
-        <thead>
-          <tr>
-            <th></th>
-            <%= sort_link.call("Source",         "source") %>
-            <%= sort_link.call("Partition",      "partition") %>
-            <%= sort_link.call("Pending",        "pending",            align_end: true) %>
-            <%= sort_link.call("In-flight",      "in_flight",          align_end: true) %>
-            <%= sort_link.call("Completed (24h)", "completed_24h",     align_end: true) %>
-            <%= sort_link.call("Last enqueue",   "last_enqueued_at") %>
-            <%= sort_link.call("Last dispatch",  "last_dispatched_at") %>
-          </tr>
-        </thead>
-        <tbody>
-          <% @partition_list.each do |row| %>
-            <% pending_total = row[:eligible] + row[:scheduled] %>
-            <tr>
-              <td>
-                <% if @watched_keys.include?(row[:partition]) %>
-                  <span class="chip on" title="Watched">✓</span>
-                <% else %>
-                  <button type="button" class="chip" data-watch="<%= row[:partition] %>" data-turbo-frame="_top" title="Watch this partition">+</button>
-                <% end %>
-              </td>
-              <td><%= row[:source] %></td>
-              <td><code><%= row[:partition] %></code></td>
-              <td class="text-end"><%= pending_total %></td>
-              <td class="text-end"><%= row[:in_flight] %></td>
-              <td class="text-end"><%= row[:completed_24h] %></td>
-              <td>
-                <% if row[:last_enqueued_at] %>
-                  <span title="<%= row[:last_enqueued_at] %>"><%= time_ago_in_words(row[:last_enqueued_at]) %> ago</span>
-                <% else %>
-                  <span class="muted">—</span>
-                <% end %>
-              </td>
-              <td>
-                <% if row[:last_dispatched_at] %>
-                  <span title="<%= row[:last_dispatched_at] %>"><%= time_ago_in_words(row[:last_dispatched_at]) %> ago</span>
-                <% else %>
-                  <span class="muted">—</span>
-                <% end %>
-              </td>
-            </tr>
-          <% end %>
-        </tbody>
-      </table>
-
-      <% total_pages = (@partition_total_list / DispatchPolicy::PoliciesController::PARTITION_LIST_PAGE_SIZE.to_f).ceil %>
-      <% if total_pages > 1 %>
-        <% page_params = { q: @partition_search.presence, watch: params[:watch], sort: params[:sort], dir: params[:dir] } %>
-        <div class="pagination">
-          <% if @partition_page > 1 %>
-            <%= link_to "← prev", url_for(page_params.merge(page: @partition_page - 1)) %>
-          <% end %>
-          <span class="muted">page <%= @partition_page %> / <%= total_pages %></span>
-          <% if @partition_page < total_pages %>
-            <%= link_to "next →", url_for(page_params.merge(page: @partition_page + 1)) %>
-          <% end %>
-        </div>
-      <% end %>
-    <% end %>
-  <% end %>
-</turbo-frame>
 
 <% if @policy_config %>
   <%= render "policy_configs",
@@ -213,26 +41,96 @@
         show_link:      false %>
 <% end %>
 
-<h2>Throttle buckets</h2>
-<% if @throttle_buckets.empty? %>
-  <p class="muted">No throttle buckets yet.</p>
-<% else %>
-  <table>
-    <thead>
-      <tr><th>Gate</th><th>Partition</th><th>Tokens</th><th>Refilled at</th></tr>
-    </thead>
-    <tbody>
-      <% @throttle_buckets.each do |b| %>
+<h2>Partitions <small class="muted">(<%= @partition_total_list %>)</small></h2>
+
+<turbo-frame id="partitions_list" data-turbo-action="advance">
+  <%= form_with url: url_for, method: :get, local: true, html: { class: "partition-search" } do %>
+    <%= text_field_tag :q, @partition_search, placeholder: "filter by partition key…", size: 30, autofocus: @partition_search.present? %>
+    <%= submit_tag "Search", name: nil %>
+    <% if @partition_search.present? %>
+      <%= link_to "clear", url_for(q: nil, page: nil), class: "muted" %>
+    <% end %>
+  <% end %>
+
+  <% if @partition_list.empty? %>
+    <p class="muted">No partitions yet — stage some jobs.</p>
+  <% else %>
+    <%
+      sort_link = lambda { |label, col, align_end: false|
+        active = @partition_sort == col
+        next_dir = active && @partition_dir == "desc" ? "asc" : "desc"
+        arrow = active ? (@partition_dir == "asc" ? " ▲" : " ▼") : ""
+        content_tag(:th, class: (align_end ? "text-end" : nil)) do
+          link_to "#{label}#{arrow}",
+            url_for(sort: col, dir: next_dir, q: @partition_search.presence, page: nil),
+            class: (active ? "sorted" : nil)
+        end
+      }
+    %>
+    <table>
+      <thead>
         <tr>
-          <td><%= b.gate_name %></td>
-          <td><code><%= b.partition_key %></code></td>
-          <td><%= b.tokens.round(2) %></td>
-          <td><%= b.refilled_at.to_s(:short) rescue b.refilled_at %></td>
+          <%= sort_link.call("Partition", "partition") %>
+          <%= sort_link.call("Status",    "status") %>
+          <%= sort_link.call("Pending",   "pending",   align_end: true) %>
+          <%= sort_link.call("In-flight", "in_flight", align_end: true) %>
+          <%= sort_link.call("Tokens",    "tokens",    align_end: true) %>
+          <%= sort_link.call("Last admitted", "last_admitted_at") %>
         </tr>
-      <% end %>
-    </tbody>
-  </table>
-<% end %>
+      </thead>
+      <tbody>
+        <% @partition_list.each do |row| %>
+          <tr>
+            <td><code><%= row[:partition_key] %></code></td>
+            <td>
+              <% case row[:status]
+                 when "ready"               then klass, label = "ok",   "ready"
+                 when "concurrency_blocked" then klass, label = "bad",  "concurrency"
+                 when "throttle_blocked"    then klass, label = "bad",  "throttle"
+                 when "idle"                then klass, label = "info", "idle"
+                 else                            klass, label = "info", row[:status]
+                 end %>
+              <span class="slo-pill <%= klass %>"><%= label %></span>
+              <% if row[:blocked_until] && row[:blocked_until] > Time.current %>
+                <span class="muted" style="font-size: 0.75em;">unblocks in <%= ((row[:blocked_until] - Time.current) * 1000).to_i %>ms</span>
+              <% end %>
+            </td>
+            <td class="text-end"><%= row[:pending] %></td>
+            <td class="text-end"><%= row[:in_flight] %></td>
+            <td class="text-end">
+              <% if row[:tokens] %>
+                <%= row[:tokens] %><span class="muted">/<%= row[:burst] %></span>
+              <% else %>
+                <span class="muted">—</span>
+              <% end %>
+            </td>
+            <td>
+              <% if row[:last_admitted_at] %>
+                <span title="<%= row[:last_admitted_at] %>"><%= time_ago_in_words(row[:last_admitted_at]) %> ago</span>
+              <% else %>
+                <span class="muted">never</span>
+              <% end %>
+            </td>
+          </tr>
+        <% end %>
+      </tbody>
+    </table>
+
+    <% total_pages = (@partition_total_list / DispatchPolicy::PoliciesController::PARTITION_LIST_PAGE_SIZE.to_f).ceil %>
+    <% if total_pages > 1 %>
+      <% page_params = { q: @partition_search.presence, sort: params[:sort], dir: params[:dir] } %>
+      <div class="pagination">
+        <% if @partition_page > 1 %>
+          <%= link_to "← prev", url_for(page_params.merge(page: @partition_page - 1)) %>
+        <% end %>
+        <span class="muted">page <%= @partition_page %> / <%= total_pages %></span>
+        <% if @partition_page < total_pages %>
+          <%= link_to "next →", url_for(page_params.merge(page: @partition_page + 1)) %>
+        <% end %>
+      </div>
+    <% end %>
+  <% end %>
+</turbo-frame>
 
 <h2>Pending (first 50)</h2>
 <% if @pending_jobs.empty? %>
@@ -241,7 +139,7 @@
   <table>
     <thead>
       <tr>
-        <th>ID</th><th>Dedupe key</th><th>Round-robin key</th>
+        <th>ID</th><th>Partition</th><th>Dedupe key</th>
         <th>Priority</th><th>Staged at</th><th>Not before</th>
       </tr>
     </thead>
@@ -249,8 +147,8 @@
       <% @pending_jobs.each do |job| %>
         <tr>
           <td><%= job.id %></td>
+          <td><code><%= job.partition_key %></code></td>
           <td><%= job.dedupe_key ? content_tag(:code, job.dedupe_key) : content_tag(:span, '—', class: 'muted') %></td>
-          <td><%= job.round_robin_key ? content_tag(:code, job.round_robin_key) : content_tag(:span, '—', class: 'muted') %></td>
           <td><%= job.priority %></td>
           <td><%= job.staged_at %></td>
           <td><%= job.not_before_at || content_tag(:span, '—', class: 'muted') %></td>

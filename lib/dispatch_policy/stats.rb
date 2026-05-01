@@ -1,278 +1,167 @@
 # frozen_string_literal: true
 
 module DispatchPolicy
-  # Operator-facing snapshot of the gem's runtime state. Cheap enough
-  # to call from health endpoints, console, or external scrapers.
-  # Pair with the AS::Notifications events
-  # ("tick.dispatch_policy" / "reap.dispatch_policy") for hot-path
-  # metrics that should be exported to Prometheus / StatsD / etc.
+  # Operator-facing snapshot of dispatcher state. All numbers come
+  # from `dispatch_policy_partitions` and `dispatch_policy_tick_runs`
+  # — no fan-out across multiple tables — so each call is a few
+  # straight queries.
   module Stats
     module_function
 
-    # Per-policy state snapshot. Returns a Hash with backlog, fairness,
-    # and capacity counters that are useful for dashboards and alerts.
-    #
-    #   DispatchPolicy::Stats.policy_summary("send_webhook_job")
-    #   # => {
-    #   #   policy_name: "send_webhook_job",
-    #   #   pending: 1234,
-    #   #   admitted: 12,
-    #   #   completed_24h: 88_213,
-    #   #   active_partitions: 540,
-    #   #   drained_partitions: 19_460,
-    #   #   oldest_pending_age_seconds: 0.83,
-    #   #   stale_partitions_60s: 3,
-    #   #   stale_partitions_300s: 0
-    #   # }
-    def policy_summary(policy_name, stale_thresholds: [ 60, 300 ])
+    # Per-policy summary: pending demand, admissions in flight, and
+    # how partitions break down by why they're not currently ready.
+    def policy_summary(policy_name)
       now = Time.current
 
-      pending  = StagedJob.pending.where(policy_name: policy_name).count
-      admitted = StagedJob.admitted.where(policy_name: policy_name).count
-      completed_24h = StagedJob.where(policy_name: policy_name)
-                              .where("completed_at > ?", 24.hours.ago).count
+      rows = PolicyPartition.where(policy_name: policy_name).pluck(
+        :pending_count, :in_flight, :concurrency_max,
+        :tokens, :throttle_rate, :throttle_burst, :refilled_at,
+        :ready, :blocked_until, :last_admitted_at
+      )
 
-      active_partitions  = PartitionState.where(policy_name: policy_name)
-                                         .where("pending_count > 0").count
-      drained_partitions = PartitionState.where(policy_name: policy_name)
-                                         .where(pending_count: 0).count
+      pending  = rows.sum { |r| r[0].to_i }
+      inflight = rows.sum { |r| r[1].to_i }
+      partitions = rows.size
 
-      oldest_staged_at = StagedJob.pending.where(policy_name: policy_name)
-                                  .minimum(:staged_at)
-      oldest_age = oldest_staged_at ? (now - oldest_staged_at).round(2) : nil
-
-      stale_counts = stale_thresholds.each_with_object({}) do |seconds, acc|
-        acc[:"stale_partitions_#{seconds}s"] = PartitionState
-          .where(policy_name: policy_name)
-          .where("pending_count > 0")
-          # COALESCE: never-admitted partitions count as stale only if
-          # they've been visible (created_at) longer than the threshold.
-          # A freshly staged partition isn't immediately "stale" — it
-          # just hasn't had its turn yet.
-          .where("COALESCE(last_admitted_at, created_at) < ?", seconds.seconds.ago)
-          .count
+      buckets = Hash.new(0)
+      rows.each do |pc, inf, cmax, tok, rate, _burst, refilled, ready, blocked_until, _last|
+        if pc.zero? && inf.zero?
+          buckets[:idle] += 1
+          next
+        end
+        if ready
+          buckets[:ready] += 1
+        elsif cmax && inf >= cmax
+          buckets[:concurrency_blocked] += 1
+        elsif rate
+          buckets[:throttle_blocked] += 1
+        else
+          buckets[:other] += 1
+        end
       end
 
       {
-        policy_name:                policy_name,
-        pending:                    pending,
-        admitted:                   admitted,
-        completed_24h:              completed_24h,
-        active_partitions:          active_partitions,
-        drained_partitions:         drained_partitions,
-        oldest_pending_age_seconds: oldest_age
-      }.merge(stale_counts)
+        policy_name:           policy_name,
+        pending:               pending,
+        in_flight:             inflight,
+        partition_count:       partitions,
+        ready_partitions:      buckets[:ready],
+        concurrency_blocked:   buckets[:concurrency_blocked],
+        throttle_blocked:      buckets[:throttle_blocked],
+        idle_partitions:       buckets[:idle]
+      }
     end
 
-    # Snapshot for every policy known to the registry. One row per
-    # policy. Use this to drive a JSON endpoint or render the admin
-    # UI's overview page.
-    def summary(stale_thresholds: [ 60, 300 ])
-      DispatchPolicy.registry.keys.map { |name| policy_summary(name, stale_thresholds: stale_thresholds) }
+    def summary
+      DispatchPolicy.registry.keys.map { |name| policy_summary(name) }
     end
 
-    # Per-policy SLO snapshot with operator-supplied budgets. Returns
-    # a Hash with the four canonical signals dispatch_policy recommends
-    # tracking: latency, fairness, throughput, capacity. Each (where
-    # applicable) carries an `ok:` flag the operator can OR-reduce
-    # for an alert. Throughput has no `ok:` because only the operator
-    # knows their ingress rate; we expose the measured value and the
-    # window so they can compute the comparison themselves.
-    #
-    # Fairness specifically counts ONLY LRU-lagged partitions — those
-    # waiting their LRU turn in spite of all gates having headroom.
-    # Partitions blocked by an at-cap concurrency / adaptive /
-    # throttle / global_cap gate are reported under
-    # `fairness[:gate_blocked]` (informational, not a verdict trigger)
-    # because that backlog is by design — the operator chose those
-    # caps.
-    def slo(policy_name,
-            latency_budget_seconds: 60,
-            fairness_threshold_seconds: 60,
-            throughput_window_seconds: 60)
-      now        = Time.current
-      batch_size = DispatchPolicy.config.batch_size
+    # Per-policy SLO snapshot. Latency = oldest pending staged_at age.
+    # Fairness = how many ready partitions we have vs blocked.
+    def slo(policy_name, latency_budget_seconds: 60, fairness_threshold_seconds: 60)
+      summary = policy_summary(policy_name)
 
-      oldest_staged_at = StagedJob.pending.where(policy_name: policy_name)
-                                  .minimum(:staged_at)
-      oldest_age = oldest_staged_at ? (now - oldest_staged_at).round(2) : nil
+      oldest_staged_at = StagedJob.pending.where(policy_name: policy_name).minimum(:staged_at)
+      oldest_age = oldest_staged_at ? (Time.current - oldest_staged_at).round(2) : nil
 
-      fairness = fairness_breakdown(policy_name, fairness_threshold_seconds)
-
-      admissions_in_window = StagedJob.where(policy_name: policy_name)
-        .where("admitted_at > ?", throughput_window_seconds.seconds.ago)
+      pending_with_lag = StagedJob.pending
+        .where(policy_name: policy_name)
+        .where("staged_at < ?", fairness_threshold_seconds.seconds.ago)
         .count
-      throughput_per_sec = (admissions_in_window.to_f / throughput_window_seconds).round(2)
-
-      active = PartitionState.where(policy_name: policy_name)
-                             .where("pending_count > 0").count
 
       {
-        policy_name: policy_name,
+        policy_name:  policy_name,
         latency: {
           seconds: oldest_age,
           budget:  latency_budget_seconds,
           ok:      oldest_age.nil? || oldest_age <= latency_budget_seconds
         },
-        fairness: fairness.merge(threshold: fairness_threshold_seconds),
-        throughput: {
-          admissions_per_sec: throughput_per_sec,
-          window_seconds:     throughput_window_seconds
+        fairness: {
+          ready_partitions:    summary[:ready_partitions],
+          concurrency_blocked: summary[:concurrency_blocked],
+          throttle_blocked:    summary[:throttle_blocked],
+          stale_pending:       pending_with_lag,
+          threshold:           fairness_threshold_seconds,
+          # ok = there's no demand stuck behind a non-gate reason. With
+          # the new dispatcher, "lru lag" is impossible — if a partition
+          # is ready, the next tick admits it. Therefore stale_pending
+          # is fully explained by gate-blocked partitions.
+          ok:                  pending_with_lag.zero? || summary[:ready_partitions].zero?
         },
         capacity: {
-          active_partitions: active,
-          batch_size:        batch_size,
-          utilization:       active.zero? ? 0.0 : (active.to_f / batch_size).round(2),
-          headroom:          active < batch_size
+          ready_partitions: summary[:ready_partitions],
+          batch_size:       DispatchPolicy.registry[policy_name]&.resolved_dispatch_policy&.effective_batch_size
         }
       }
     end
 
-    # SLO snapshot for every registered policy. Drop into a
-    # `/dispatch_policy/slos.json` endpoint or scrape periodically.
     def slos(**budgets)
       DispatchPolicy.registry.keys.map { |name| slo(name, **budgets) }
     end
 
-    # Per-policy bottleneck diagnosis. Splits stale partitions into
-    # "gate_blocked" (intentional — operator's choice) and "lru_lagged"
-    # (dispatch_policy can't keep up — tunable). Returns the dominant
-    # diagnosis kind plus the config knobs that address it.
-    #
-    #   DispatchPolicy::Stats.bottleneck("send_webhook_job")
-    #   # => {
-    #   #   policy_name: "send_webhook_job",
-    #   #   applicable: true,
-    #   #   stale_partitions: { gate_blocked: 12, lru_lagged: 3 },
-    #   #   diagnosis: :rotation_lag,
-    #   #   suggested_knobs: [:round_robin_quantum,
-    #   #                     :round_robin_max_partitions_per_tick]
-    #   # }
-    #
-    # Returns `applicable: false` for policies without round_robin_by
-    # (no partition_states rows, no rotation to lag).
-    def bottleneck(policy_name, fairness_threshold_seconds: 60)
-      policy = registry_lookup(policy_name)
-      return { policy_name: policy_name, applicable: false, diagnosis: :ok } unless policy && policy.round_robin?
+    # Bottleneck diagnosis. With concurrency + throttle, the only
+    # operator-tunable bottleneck dispatch_policy can introduce is a
+    # too-small batch_size relative to demand. Concurrency / throttle
+    # being at-cap is by design.
+    def bottleneck(policy_name)
+      policy  = DispatchPolicy.registry[policy_name]&.resolved_dispatch_policy
+      summary = policy_summary(policy_name)
 
-      breakdown = fairness_breakdown(policy_name, fairness_threshold_seconds)
-      gate_blocked = breakdown[:gate_blocked]
-      lru_lagged   = breakdown[:stale_partitions]
-      active       = PartitionState.where(policy_name: policy_name)
-                                   .where("pending_count > 0").count
+      ready  = summary[:ready_partitions]
+      pending = summary[:pending]
+      batch_size = policy&.effective_batch_size || DispatchPolicy.config.batch_size
 
-      current_batch_size = policy.effective_batch_size
-      current_quantum    = policy.effective_round_robin_quantum
-      current_cap        = policy.effective_round_robin_max_partitions_per_tick
-
-      diagnosis, knobs, recommended =
-        if lru_lagged.zero?
-          [ :ok, [], {} ]
-        elsif active > current_batch_size
-          # More active partitions than fit in one tick — widen the
-          # batch first, then drop quantum to make every plucked
-          # partition contribute.
-          recommended_batch = [ next_size_step(active), 5_000 ].min
-          [
-            :capacity_strain,
-            %i[batch_size round_robin_quantum round_robin_max_partitions_per_tick],
-            {
-              batch_size:          { current: current_batch_size, suggested: recommended_batch },
-              round_robin_quantum: { current: current_quantum,    suggested: 1 }
-            }
-          ]
+      diagnosis, recommended =
+        if pending.zero? || ready.zero?
+          [ :ok, {} ]
+        elsif ready > batch_size
+          # Demand fits in dispatcher, but a single tick can't drain
+          # all ready partitions. Suggest a larger batch.
+          suggested = next_size_step(ready)
+          [ :capacity_strain, { batch_size: { current: batch_size, suggested: suggested } } ]
         else
-          # Active partitions fit but rotation isn't reaching them all.
-          # Lower quantum is the cleanest knob.
-          [
-            :rotation_lag,
-            %i[round_robin_quantum round_robin_max_partitions_per_tick],
-            {
-              round_robin_quantum: { current: current_quantum, suggested: 1 }
-            }
-          ]
+          [ :ok, {} ]
         end
 
       {
         policy_name:        policy_name,
         applicable:         true,
-        stale_partitions:   { gate_blocked: gate_blocked, lru_lagged: lru_lagged },
         diagnosis:          diagnosis,
-        suggested_knobs:    knobs,
+        partition_state:    {
+          ready:               summary[:ready_partitions],
+          concurrency_blocked: summary[:concurrency_blocked],
+          throttle_blocked:    summary[:throttle_blocked]
+        },
         recommended_config: recommended,
-        current_config:     {
-          batch_size:                          current_batch_size,
-          round_robin_quantum:                 current_quantum,
-          round_robin_max_partitions_per_tick: current_cap,
-          lease_duration:                      policy.effective_lease_duration
+        current_config: {
+          batch_size:     batch_size,
+          lease_duration: policy&.effective_lease_duration
         }
       }
     end
 
-    # Round `n` up to the next sensible "operator value": 100, 200, 500,
-    # 1000, 2000, 5000. Avoids suggestions like batch_size=237.
     def next_size_step(n)
       [ 100, 200, 500, 1000, 2000, 5000 ].find { |v| v >= n } || 5_000
     end
     private_class_method :next_size_step
 
-    # Coarse health signal: returns :ok or a Symbol describing the
-    # first dispatch_policy-tunable concern. Intentional gate caps
-    # (concurrency at max, throttle exhausted, global_cap saturated)
-    # do NOT trigger this — those are operator-chosen limits, not
-    # dispatch_policy bottlenecks.
-    #
-    #   :ok             — no LRU rotation lag and no expired leases
-    #   :rotation_lag   — at least one partition with pending rows is
-    #                     waiting its LRU turn while all gates have
-    #                     headroom for it. Tune quantum / cap / batch_size.
-    #   :inflight_drift — admitted rows past their lease (worker
-    #                     crashes outpacing the reaper). Tune
-    #                     lease_duration or investigate workers.
-    def health(stale_threshold_seconds: nil)
-      stale_threshold = stale_threshold_seconds || (DispatchPolicy.config.lease_duration * 3)
-
-      DispatchPolicy.registry.keys.each do |policy_name|
-        breakdown = fairness_breakdown(policy_name, stale_threshold)
-        return :rotation_lag if breakdown[:stale_partitions].positive?
-      end
-
+    # Coarse health: :ok or :inflight_drift (lease-expired admissions
+    # waiting for the reaper). Pure dispatcher concerns; gate caps
+    # never trip this signal.
+    def health
       return :inflight_drift if StagedJob.expired_leases.exists?
-
       :ok
     end
 
-    # Aggregated TickLoop performance over the last `window` seconds.
-    # Reads from dispatch_policy_tick_runs (populated in batches by
-    # TickLoop). Returns p50/p95/p99 of duration_ms, total ticks,
-    # admitted, partitions, and error/decline counts. Use to drive a
-    # performance dashboard or detect deploys that slowed the loop.
-    #
-    #   DispatchPolicy::Stats.tick_runs(window: 60)
-    #   # => {
-    #   #   ticks: 312,
-    #   #   admitted: 4_280,
-    #   #   partitions: 1_205,
-    #   #   p50_ms: 12.4,
-    #   #   p95_ms: 34.8,
-    #   #   p99_ms: 78.1,
-    #   #   max_ms: 142.0,
-    #   #   errored: 0,
-    #   #   declined: 1,
-    #   #   per_policy: { "send_webhook_job" => { ticks: 312, ...}, ... }
-    #   # }
+    # ─── TickLoop perf samples ───────────────────────────────────
+
     def tick_runs(window: 300, policy_name: nil)
       scope = TickRun.where("started_at > ?", window.seconds.ago)
       scope = scope.where(policy_name: policy_name) if policy_name
 
-      rows = scope.pluck(:policy_name, :duration_ms, :admitted, :partitions,
-                         :declined, :error_class)
-
+      rows = scope.pluck(:policy_name, :duration_ms, :admitted, :partitions, :declined, :error_class)
       overall = aggregate_tick_rows(rows)
-
-      per_policy = rows.group_by { |r| r[0] }.transform_values do |group|
-        aggregate_tick_rows(group)
-      end
+      per_policy = rows.group_by { |r| r[0] }.transform_values { |g| aggregate_tick_rows(g) }
 
       overall.merge(window_seconds: window, per_policy: per_policy)
     end
@@ -282,21 +171,16 @@ module DispatchPolicy
       return blank_tick_summary(ticks) if ticks.zero?
 
       durations = rows.map { |r| r[1].to_f }.sort
-      admitted   = rows.sum { |r| r[2].to_i }
-      partitions = rows.sum { |r| r[3].to_i }
-      declined   = rows.count { |r| r[4] }
-      errored    = rows.count { |r| r[5].present? }
-
       {
         ticks:      ticks,
-        admitted:   admitted,
-        partitions: partitions,
+        admitted:   rows.sum { |r| r[2].to_i },
+        partitions: rows.sum { |r| r[3].to_i },
         p50_ms:     percentile(durations, 0.5),
         p95_ms:     percentile(durations, 0.95),
         p99_ms:     percentile(durations, 0.99),
         max_ms:     durations.last.round(2),
-        errored:    errored,
-        declined:   declined
+        errored:    rows.count { |r| r[5].present? },
+        declined:   rows.count { |r| r[4] }
       }
     end
     private_class_method :aggregate_tick_rows
@@ -310,8 +194,6 @@ module DispatchPolicy
     end
     private_class_method :blank_tick_summary
 
-    # Linear-interpolation percentile on a pre-sorted array. We only
-    # call this with ticks > 0, so no nil branch needed here.
     def percentile(sorted, q)
       return sorted.first.round(2) if sorted.size == 1
       idx = (sorted.size - 1) * q
@@ -320,123 +202,5 @@ module DispatchPolicy
       (lo + (hi - lo) * (idx - idx.floor)).round(2)
     end
     private_class_method :percentile
-
-    # ─── Internal helpers ─────────────────────────────────────────
-
-    # Returns { stale_partitions: int, gate_blocked: int, ok: bool }.
-    # `stale_partitions` is the LRU-lagged count (operator-tunable).
-    # `gate_blocked` is informational — partitions waiting because a
-    # gate cap is reached.
-    def fairness_breakdown(policy_name, threshold_seconds)
-      stale_keys = PartitionState
-        .where(policy_name: policy_name)
-        .where("pending_count > 0")
-        .where("COALESCE(last_admitted_at, created_at) < ?", threshold_seconds.seconds.ago)
-        .pluck(:partition_key)
-
-      if stale_keys.empty?
-        return { stale_partitions: 0, gate_blocked: 0, ok: true }
-      end
-
-      policy = registry_lookup(policy_name)
-      blocked_keys = stale_keys.empty? || policy.nil? ? [] : gate_blocked_keys(policy, stale_keys)
-
-      {
-        stale_partitions: stale_keys.size - blocked_keys.size,
-        gate_blocked:     blocked_keys.size,
-        ok:               (stale_keys.size - blocked_keys.size).zero?
-      }
-    end
-    private_class_method :fairness_breakdown
-
-    # Among `stale_keys` for `policy`, return the subset that has at
-    # least one tracks_inflight gate at its cap (or throttle out of
-    # tokens, or global_cap saturated). Those are intentional waits,
-    # not LRU lag.
-    def gate_blocked_keys(policy, stale_keys)
-      policy_name = policy.name
-      blocked = Set.new
-
-      # Throttle: tokens < 1 means rejected at admission.
-      ThrottleBucket
-        .where(policy_name: policy_name, partition_key: stale_keys)
-        .where("tokens < 1")
-        .pluck(:partition_key)
-        .each { |pk| blocked << pk }
-
-      # Concurrency / Global / Adaptive: compare in_flight against the
-      # gate's effective max. Pull all in one query, group by partition.
-      in_flight_rows = PartitionInflightCount
-        .where(policy_name: policy_name, partition_key: stale_keys)
-        .pluck(:gate_name, :partition_key, :in_flight)
-      in_flight_by_pk = in_flight_rows.group_by { |_, pk, _| pk }
-        .transform_values { |rows| rows.to_h { |gn, _, inf| [ gn, inf ] } }
-
-      adaptive_max = AdaptiveConcurrencyStats
-        .where(policy_name: policy_name, partition_key: stale_keys)
-        .pluck(:gate_name, :partition_key, :current_max)
-        .each_with_object({}) { |(gn, pk, cm), h| h[[ pk, gn ]] = cm }
-
-      # global_cap is a single number across all partitions for the
-      # policy. If the policy's total in_flight ≥ gate.max, every
-      # partition is blocked by it.
-      global_cap_blocked_all = false
-      policy.gates.each do |gate|
-        next unless gate.is_a?(Gates::GlobalCap)
-        cap = gate_max_value(gate.max)
-        next unless cap
-        total = PartitionInflightCount
-          .where(policy_name: policy_name, gate_name: gate.name.to_s)
-          .sum(:in_flight)
-        global_cap_blocked_all = true if total >= cap
-      end
-
-      stale_keys.each do |pk|
-        next if blocked.include?(pk)
-        if global_cap_blocked_all
-          blocked << pk
-          next
-        end
-
-        gate_inflight = in_flight_by_pk[pk] || {}
-        hit_cap = policy.gates.any? do |gate|
-          next false unless gate.tracks_inflight?
-          gn = gate.name.to_s
-          cur = gate_inflight[gn].to_i
-          cap = case gate
-          when Gates::Concurrency
-            gate_max_value(gate.max)
-          when Gates::AdaptiveConcurrency
-            adaptive_max[[ pk, gn ]] || gate_max_value(gate.initial_max)
-          else
-            nil
-          end
-          cap && cur >= cap
-        end
-        blocked << pk if hit_cap
-      end
-
-      blocked.to_a
-    end
-    private_class_method :gate_blocked_keys
-
-    # The cap can be a literal Integer or a Proc/lambda (resolved at
-    # filter time with a context). For diagnostic purposes we only
-    # interpret literals — Proc-bound caps fall through to "lru_lagged"
-    # rather than risk evaluating without context.
-    def gate_max_value(max)
-      return nil if max.nil?
-      return max if max.is_a?(Integer)
-      nil
-    end
-    private_class_method :gate_max_value
-
-    # Lookup a policy by name via the dispatchable job registry.
-    # Returns nil if the job class hasn't been autoloaded yet.
-    def registry_lookup(policy_name)
-      job_class = DispatchPolicy.registry[policy_name]
-      job_class&.resolved_dispatch_policy
-    end
-    private_class_method :registry_lookup
   end
 end
