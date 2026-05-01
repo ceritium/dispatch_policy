@@ -63,13 +63,17 @@ module DispatchPolicy
         def self.name; "Anon::Dynamic"; end
         dispatch_policy do
           partition_by ->(args) { args.first[:id] }
-          concurrency  max: ->(args) { args.first[:tier] == "high" ? 10 : 2 }
+          # Proc receives partition_key (not args) so it can be
+          # re-evaluated whenever a refresh is needed.
+          concurrency  max: ->(partition_key) {
+            partition_key.start_with?("hi-") ? 10 : 2
+          }
         end
         def perform(*); end
       end
       policy = klass.resolved_dispatch_policy
-      assert_equal 10, policy.resolve_concurrency_max([ { id: "a", tier: "high" } ])
-      assert_equal 2,  policy.resolve_concurrency_max([ { id: "b", tier: "low" } ])
+      assert_equal 10, policy.resolve_concurrency_max("hi-acct-1")
+      assert_equal 2,  policy.resolve_concurrency_max("acct-2")
     end
 
     test "concurrency max rejects non-Integer non-callable" do

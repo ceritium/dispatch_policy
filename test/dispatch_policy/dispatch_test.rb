@@ -124,36 +124,47 @@ module DispatchPolicy
 
     # ─── Dynamic concurrency cap ────────────────────────────────
 
+    # The Proc takes partition_key. We use a class-level Hash as a
+    # tiny "lookup table" the test can mutate to simulate plan
+    # changes between sync passes.
     class DynamicCappedJob < ActiveJob::Base
       include DispatchPolicy::Dispatchable
-      # Plan-aware cap: pro accounts get 5 concurrent, others get 1.
+      class << self
+        attr_accessor :plan_table
+      end
+      self.plan_table = { "pro" => 5, "free" => 1 }
+
       dispatch_policy do
         partition_by ->(args) { args.first[:account_id] }
-        concurrency  max: ->(args) {
-          args.first[:plan] == "pro" ? 5 : 1
+        concurrency  max: ->(partition_key) {
+          plan = DynamicCappedJob.plan_table.fetch(partition_key, "free")
+          plan.is_a?(Integer) ? plan : DynamicCappedJob.plan_table[plan] || 1
         }
       end
       def perform(*); end
     end
 
     test "dynamic concurrency max resolves per-partition at stage time" do
-      DynamicCappedJob.perform_later(account_id: "free-1", plan: "free")
-      DynamicCappedJob.perform_later(account_id: "pro-1",  plan: "pro")
+      DynamicCappedJob.plan_table = { "free-1" => 1, "pro-1" => 5 }
+      DynamicCappedJob.perform_later(account_id: "free-1")
+      DynamicCappedJob.perform_later(account_id: "pro-1")
 
-      free = PolicyPartition.find_by(partition_key: "free-1")
-      pro  = PolicyPartition.find_by(partition_key: "pro-1")
-      assert_equal 1, free.concurrency_max
-      assert_equal 5, pro.concurrency_max
+      assert_equal 1, PolicyPartition.find_by(partition_key: "free-1").concurrency_max
+      assert_equal 5, PolicyPartition.find_by(partition_key: "pro-1").concurrency_max
     end
 
-    test "dynamic concurrency max persists per partition; subsequent jobs don't change it" do
-      DynamicCappedJob.perform_later(account_id: "x", plan: "pro")
+    test "TickLoop reload re-evaluates the callable for every partition" do
+      DynamicCappedJob.plan_table = { "x" => 5 }
+      DynamicCappedJob.perform_later(account_id: "x")
       assert_equal 5, PolicyPartition.find_by(partition_key: "x").concurrency_max
 
-      # Even if "plan" changes mid-flight, the persisted cap stays.
-      DynamicCappedJob.perform_later(account_id: "x", plan: "free")
-      assert_equal 5, PolicyPartition.find_by(partition_key: "x").concurrency_max,
-        "first stage wins; partition cap doesn't update on subsequent stages"
+      # "Plan" changes — table now returns a different value.
+      DynamicCappedJob.plan_table = { "x" => 20 }
+
+      DispatchPolicy::TickLoop.reload_policy_configs!(DynamicCappedJob.resolved_dispatch_policy.name)
+
+      assert_equal 20, PolicyPartition.find_by(partition_key: "x").concurrency_max,
+        "callable cap must be re-resolved for every partition on TickLoop boot"
     end
 
     # ─── DSL change propagation ─────────────────────────────────
@@ -175,17 +186,6 @@ module DispatchPolicy
       CappedJob.resolved_dispatch_policy.instance_variable_set(:@concurrency_max, original) if original
     end
 
-    test "TickLoop reload preserves partition cap when DSL uses a callable" do
-      # Dynamic policies opt out of sync (we can't recompute without args).
-      DynamicCappedJob.perform_later(account_id: "x", plan: "pro")
-      pname = DynamicCappedJob.resolved_dispatch_policy.name
-      assert_equal 5, PolicyPartition.find_by(policy_name: pname, partition_key: "x").concurrency_max
-
-      DispatchPolicy::TickLoop.reload_policy_configs!(pname)
-
-      assert_equal 5, PolicyPartition.find_by(policy_name: pname, partition_key: "x").concurrency_max,
-        "callable-cap policies must not be touched by sync"
-    end
 
     # ─── Cursor lag ─────────────────────────────────────────────
 

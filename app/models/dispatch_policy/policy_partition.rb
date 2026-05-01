@@ -154,6 +154,30 @@ module DispatchPolicy
       connection.clear_query_cache
     end
 
+    # ─── Cap sync (dynamic / callable concurrency.max) ───────────
+
+    # Bulk update concurrency_max for the given partitions. Used by
+    # Policy#sync_partition_caps_via_callable! when the DSL declares
+    # a Proc and the resolved value drifted from what's persisted.
+    def self.bulk_set_concurrency_max!(policy_name:, caps:, now: Time.current)
+      return 0 if caps.empty?
+
+      values_clause = ([ "(?, ?::int)" ] * caps.size).join(", ")
+      values_args   = caps.flat_map { |pk, max| [ pk.to_s, max.to_i ] }
+
+      sql = <<~SQL.squish
+        UPDATE #{quoted_table_name} AS p
+           SET concurrency_max = d.cmax,
+               updated_at      = NOW()
+          FROM (VALUES #{values_clause}) AS d(partition_key, cmax)
+         WHERE p.policy_name   = ?
+           AND p.partition_key = d.partition_key
+      SQL
+
+      connection.exec_update(sanitize_sql_array([ sql, *values_args, policy_name ]))
+      connection.clear_query_cache
+    end
+
     # ─── Reap path ───────────────────────────────────────────────
 
     def self.bulk_decrement_in_flight!(policy_name:, counts:, now: Time.current)

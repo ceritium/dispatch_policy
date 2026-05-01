@@ -63,16 +63,20 @@ module DispatchPolicy
 
     # Concurrency cap. `max` can be:
     #   - a positive Integer (same cap for every partition), or
-    #   - a callable that takes the job's arguments and returns the
-    #     cap for THAT partition. The callable is invoked at stage
-    #     time and the result is persisted to policy_partitions.
-    #     concurrency_max for the partition_key, so each partition's
-    #     cap is set by the FIRST job that creates the row. Plan
-    #     upgrades take effect once the old partition row drains
-    #     and gets purged, or via a manual partition_cap update.
+    #   - a callable that takes a partition_key and returns the cap
+    #     for THAT partition. The callable is re-evaluated whenever
+    #     the cap needs refreshing — at stage time AND on every
+    #     TickLoop boot — so plan changes propagate within ~one
+    #     tick_max_duration without redeploying.
     #
     #   concurrency max: 5
-    #   concurrency max: ->(args) { Account.find(args.first[:account_id]).max_concurrent }
+    #   concurrency max: ->(account_id) { Account.find(account_id).max_concurrent }
+    #
+    # Why partition_key and not args: the cap is a property of the
+    # partition (e.g. an account's plan), not of any single job
+    # encoded in args. Taking partition_key lets us recompute the
+    # cap from a stale partition row without needing the original
+    # arguments.
     def concurrency(max:)
       if max.is_a?(Integer)
         raise ArgumentError, "concurrency max must be positive (got #{max})" unless max.positive?
@@ -83,14 +87,18 @@ module DispatchPolicy
       @concurrency_max = max
     end
 
-    # Resolve `concurrency_max` for a specific job's arguments. Used
-    # at stage time. Returns nil when no concurrency gate is declared.
-    def resolve_concurrency_max(arguments)
+    # Resolve concurrency_max for a specific partition_key. Returns
+    # nil when no concurrency gate is declared.
+    def resolve_concurrency_max(partition_key)
       return nil if @concurrency_max.nil?
-      value = @concurrency_max.is_a?(Integer) ? @concurrency_max : @concurrency_max.call(arguments)
-      raise ArgumentError, "concurrency max callable returned non-positive #{value.inspect} for #{name}" \
+      value = @concurrency_max.is_a?(Integer) ? @concurrency_max : @concurrency_max.call(partition_key)
+      raise ArgumentError, "concurrency max callable returned non-positive #{value.inspect} for #{name} / #{partition_key}" \
         unless value.is_a?(Integer) && value.positive?
       value
+    end
+
+    def concurrency_callable?
+      @concurrency_max.respond_to?(:call)
     end
 
     # throttle rate: 60, per: 60.seconds, burst: 60
@@ -199,6 +207,11 @@ module DispatchPolicy
           .where(policy_name: @name)
           .where("concurrency_max IS DISTINCT FROM ?", @concurrency_max)
           .update_all(concurrency_max: @concurrency_max, updated_at: Time.current)
+      elsif concurrency_callable?
+        # Re-evaluate the Proc for every active partition. Cheap
+        # if the callable is fast (a simple Account.find_by); skip
+        # rows whose cap is already correct.
+        sync_partition_caps_via_callable!
       end
 
       if @throttle_rate
@@ -215,6 +228,28 @@ module DispatchPolicy
           )
       end
     end
+
+    # Walk every partition row for this policy, resolve the cap from
+    # the callable, and bulk-update the rows whose cap changed. One
+    # SELECT, one UPDATE … FROM (VALUES …) — bounded by the row
+    # count, not by job volume.
+    def sync_partition_caps_via_callable!
+      rows = DispatchPolicy::PolicyPartition
+        .where(policy_name: @name)
+        .pluck(:partition_key, :concurrency_max)
+
+      changed = rows.each_with_object({}) do |(pk, current), acc|
+        new_cap = resolve_concurrency_max(pk)
+        acc[pk] = new_cap if new_cap != current
+      end
+      return if changed.empty?
+
+      DispatchPolicy::PolicyPartition.bulk_set_concurrency_max!(
+        policy_name: @name,
+        caps:        changed
+      )
+    end
+    private :sync_partition_caps_via_callable!
 
     # ─── Validation ──────────────────────────────────────────────
 

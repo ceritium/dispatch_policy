@@ -60,7 +60,7 @@ module DispatchPolicy
           seeds: [ {
             partition_key:    partition_key,
             delta:            1,
-            concurrency_max:  policy.resolve_concurrency_max(job_instance.arguments)
+            concurrency_max:  policy.resolve_concurrency_max(partition_key)
           } ],
           now: now
         )
@@ -99,7 +99,7 @@ module DispatchPolicy
       caps_by_partition = {}
       jobs.each do |job|
         pk = policy.build_partition_key(job.arguments)
-        caps_by_partition[pk] ||= policy.resolve_concurrency_max(job.arguments)
+        caps_by_partition[pk] ||= policy.resolve_concurrency_max(pk)
       end
 
       transaction do
