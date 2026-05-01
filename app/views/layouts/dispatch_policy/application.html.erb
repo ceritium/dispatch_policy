@@ -5,6 +5,11 @@
     <meta name="viewport" content="width=device-width,initial-scale=1">
     <title>dispatch_policy</title>
     <%= csrf_meta_tags %>
+    <%# Same-URL Turbo.visit (used by the auto-refresh) is treated as a "page %>
+    <%# refresh"; with these two meta tags Turbo morphs the body in place and %>
+    <%# preserves scroll position. %>
+    <meta name="turbo-refresh-method" content="morph">
+    <meta name="turbo-refresh-scroll" content="preserve">
     <style><%= DispatchPolicy::Engine.root.join("app/assets/stylesheets/dispatch_policy/application.css").read.html_safe %></style>
     <script src="https://cdn.jsdelivr.net/npm/@hotwired/turbo@8.0.4/dist/turbo.es2017-umd.min.js"></script>
     <script>
