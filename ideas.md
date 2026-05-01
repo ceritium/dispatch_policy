@@ -194,31 +194,3 @@ junto al move-into-TX y al bulk handoff (las tres tocan
 `Tick#admit_partition` y `Forwarder.dispatch`); reescribir tres veces
 el mismo código sería derroche.
 
-## Auto-refresh: evitar Turbo.visit apilados cuando la página va lenta
-
-**Síntoma.** En `app/views/layouts/dispatch_policy/application.html.erb`
-el `setTimeout` dispara `Turbo.visit(href, { action: "replace" })`
-cada N segundos. Si la respuesta tarda más que el siguiente ciclo
-(DB lenta, query pesada en /partitions), un nuevo timer puede
-programarse encima — al volver `turbo:load` rearma `restart()` que
-limpia el timer anterior, pero entre el dispatch del visit y el
-`turbo:load` puede haber otro timer corriendo. El PR 18 upstream
-(`517df4d8`) añadió un guard "skip if Turbo visit in flight".
-
-**Solución.** Flag in-flight:
-
-```js
-var visiting = false;
-document.addEventListener("turbo:visit",  function () { visiting = true;  });
-document.addEventListener("turbo:load",   function () { visiting = false; });
-document.addEventListener("turbo:render", function () { visiting = false; });
-
-// dentro de setTimeout:
-if (visiting) { restart(); return; }   // reprograma sin disparar
-Turbo.visit(window.location.href, { action: "replace" });
-```
-
-**Por qué se aplaza.** Bajo carga normal en local no se nota, y
-empíricamente nadie ha reportado refresh stuck. Apuntado para no
-olvidarlo cuando alguien tenga un /partitions con 100k+ filas y la
-query pase de los 2s.

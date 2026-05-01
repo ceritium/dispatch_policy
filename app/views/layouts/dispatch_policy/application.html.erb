@@ -16,6 +16,12 @@
       (function () {
         var KEY = "dispatch_policy:refresh-interval";
         var timer = null;
+        // True between turbo:visit and turbo:load|turbo:render. While true,
+        // setTimeout reprograms instead of firing — otherwise a slow page
+        // (DB churn under load, /partitions with many rows) lets the
+        // setTimeout fire while the previous Turbo visit is still in
+        // flight, stacking requests on top of each other.
+        var visiting = false;
 
         function getInterval() {
           return parseInt(sessionStorage.getItem(KEY) || "0", 10);
@@ -32,6 +38,7 @@
           var seconds = getInterval();
           if (seconds > 0) {
             timer = setTimeout(function () {
+              if (visiting) { restart(); return; }
               if (typeof Turbo !== "undefined") {
                 Turbo.visit(window.location.href, { action: "replace" });
               } else {
@@ -69,6 +76,10 @@
 
         document.addEventListener("DOMContentLoaded", init);
         document.addEventListener("turbo:load",       init);
+
+        document.addEventListener("turbo:visit",  function () { visiting = true;  });
+        document.addEventListener("turbo:load",   function () { visiting = false; });
+        document.addEventListener("turbo:render", function () { visiting = false; });
 
         // Pause refresh when the tab is hidden (saves DB load); resume when visible.
         document.addEventListener("visibilitychange", function () {
