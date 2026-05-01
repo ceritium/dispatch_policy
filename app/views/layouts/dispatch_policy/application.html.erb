@@ -6,9 +6,8 @@
     <title>dispatch_policy</title>
     <%= csrf_meta_tags %>
     <style><%= DispatchPolicy::Engine.root.join("app/assets/stylesheets/dispatch_policy/application.css").read.html_safe %></style>
-    <script src="https://cdn.jsdelivr.net/npm/@hotwired/turbo@8.0.4/dist/turbo.es2017-umd.min.js" defer></script>
   </head>
-  <body data-turbo="true">
+  <body>
     <header class="dp-header">
       <div class="dp-brand">
         <%= link_to "dispatch_policy", root_path, class: "dp-logo" %>
@@ -28,5 +27,15 @@
       <span>dispatch_policy v<%= DispatchPolicy::VERSION %></span>
       <span>now: <%= Time.current.utc.strftime("%Y-%m-%d %H:%M:%S UTC") %></span>
     </footer>
+
+    <% refresh_seconds = content_for?(:auto_refresh_seconds) ? content_for(:auto_refresh_seconds).to_i : 0 %>
+    <% if refresh_seconds.positive? %>
+      <script>
+        (function () {
+          var here = window.location.pathname + window.location.search;
+          setTimeout(function () { window.location.assign(here); }, <%= refresh_seconds * 1000 %>);
+        })();
+      </script>
+    <% end %>
   </body>
 </html>
