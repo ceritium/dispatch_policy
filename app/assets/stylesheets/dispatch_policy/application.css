@@ -126,3 +126,12 @@ h2 { font-size: 15px; margin: 24px 0 10px; font-weight: 600; color: #374151; tex
   font-family: "SFMono-Regular", Menlo, monospace; font-size: 16px;
   background: #1d2330; color: #f6f7fa; padding: 2px 8px; letter-spacing: 1px;
 }
+
+.dp-pagination {
+  display: flex; justify-content: space-between; align-items: center;
+  padding: 14px 0; gap: 12px; flex-wrap: wrap;
+}
+.dp-pagination-info { color: #6b7280; font-size: 13px; font-variant-numeric: tabular-nums; }
+.dp-pagination-nav  { display: flex; gap: 6px; }
+.dp-pagination-nav  .dp-btn { padding: 4px 10px; font-size: 12.5px; text-decoration: none; }
+.dp-btn-disabled    { opacity: 0.4; cursor: default; pointer-events: none; }

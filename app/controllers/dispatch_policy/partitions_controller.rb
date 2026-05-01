@@ -7,24 +7,54 @@ module DispatchPolicy
     DRAIN_MAX_PER_REQUEST = 10_000
     DRAIN_BATCH_SIZE      = 200
 
+    PAGE_SIZE = 100
+    SORT_OPTIONS = {
+      "pending"    => "pending_count DESC, last_admit_at DESC NULLS LAST, id ASC",
+      "admitted"   => "total_admitted DESC, id ASC",
+      "stale"      => "last_checked_at ASC NULLS FIRST, id ASC",
+      "recent"     => "last_admit_at DESC NULLS LAST, id ASC",
+      "key"        => "partition_key ASC, id ASC"
+    }.freeze
+    DEFAULT_SORT = "pending"
+
     def index
       scope = Partition.all
       scope = scope.for_policy(params[:policy]) if params[:policy].present?
       scope = scope.for_shard(params[:shard])   if params[:shard].present?
-      if (q = params[:q]).present?
-        scope = scope.where("partition_key ILIKE ?", "%#{q}%")
-      end
-      scope = scope.order(Arel.sql("pending_count DESC, last_admit_at DESC NULLS LAST"))
+      scope = scope.where("partition_key ILIKE ?", "%#{params[:q]}%") if params[:q].present?
+      scope = scope.where("pending_count > 0")                         if params[:only_pending] == "1"
 
-      @policy     = params[:policy]
-      @shard      = params[:shard]
-      @query      = params[:q]
-      @partitions = scope.limit(200)
+      @sort  = SORT_OPTIONS.key?(params[:sort]) ? params[:sort] : DEFAULT_SORT
+      scope  = scope.order(Arel.sql(SORT_OPTIONS.fetch(@sort)))
+
+      @page       = [Integer(params[:page] || 1), 1].max
+      @page_size  = PAGE_SIZE
+      @total      = scope.count
+      @last_page  = [(@total.to_f / @page_size).ceil, 1].max
+      @page       = [@page, @last_page].min
+      @partitions = scope.offset((@page - 1) * @page_size).limit(@page_size)
+
+      @policy        = params[:policy]
+      @shard         = params[:shard]
+      @query         = params[:q]
+      @only_pending  = params[:only_pending] == "1"
 
       shards_scope = Partition.all
       shards_scope = shards_scope.for_policy(params[:policy]) if params[:policy].present?
       @shards      = shards_scope.distinct.pluck(:shard).sort
     end
+
+    def pagination_params(overrides = {})
+      {
+        policy:        @policy.presence,
+        shard:         @shard.presence,
+        q:             @query.presence,
+        sort:          (@sort if @sort != DEFAULT_SORT),
+        only_pending:  ("1" if @only_pending),
+        page:          (@page if @page > 1)
+      }.compact.merge(overrides)
+    end
+    helper_method :pagination_params
 
     def show
       @recent_jobs = StagedJob

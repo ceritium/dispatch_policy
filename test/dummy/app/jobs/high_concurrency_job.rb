@@ -25,7 +25,7 @@ class HighConcurrencyJob < ApplicationJob
   end
 
   def perform(attrs = {})
-    sleep(Float(ENV.fetch("HIGH_CONCURRENCY_SLEEP", "0.1")))
+    # sleep(Float(ENV.fetch("HIGH_CONCURRENCY_SLEEP", "0.1")))
     Rails.logger.info("[HighConcurrencyJob] bucket=#{attrs['bucket']} seq=#{attrs['seq']} ran at #{Time.current.iso8601}")
   end
 end
