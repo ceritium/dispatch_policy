@@ -180,6 +180,28 @@ class RepositoryIntegrationTest < Minitest::Test
                     "unclaim! must preserve original enqueued_at to keep FIFO ordering"
   end
 
+  def test_claim_staged_jobs_with_zero_limit_still_records_evaluation
+    DispatchPolicy::Repository.stage!(
+      policy_name: "p", partition_key: "k", queue_name: nil,
+      job_class: "J", job_data: { "job_id" => "j", "job_class" => "J", "arguments" => [] },
+      context: {}, priority: 0
+    )
+
+    rows = DispatchPolicy::Repository.claim_staged_jobs!(
+      policy_name: "p", partition_key: "k", limit: 0,
+      gate_state_patch: { "throttle" => { "tokens" => 0.4 } },
+      retry_after: 5.0
+    )
+
+    assert_empty rows
+    partition = DispatchPolicy::Partition.first
+    assert_equal 1, partition.pending_count, "no rows admitted, pending_count must be unchanged"
+    refute_nil partition.next_eligible_at,
+               "concurrency-full / throttle-denied evaluations must still set next_eligible_at"
+    assert_in_delta 5.0, partition.next_eligible_at - Time.current, 1.0
+    assert_equal({ "throttle" => { "tokens" => 0.4 } }, partition.gate_state)
+  end
+
   def test_inflight_count_round_trip
     DispatchPolicy::Repository.insert_inflight!([
       { policy_name: "p", partition_key: "concurrency=acct:1", active_job_id: "abc" },
