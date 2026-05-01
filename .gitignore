@@ -10,9 +10,11 @@
 .rspec_status
 Gemfile.lock
 *.log
-test/dummy_*/log/*
-test/dummy_*/tmp/*
-test/dummy_*/db/*.sqlite3*
-test/dummy_*/storage/
-test/dummy_*/.bundle/
+test/dummy/log/*
+test/dummy/tmp/*
+test/dummy/db/*.sqlite3*
+test/dummy/storage/
+test/dummy/.bundle/
+!test/dummy/log/.keep
+!test/dummy/tmp/.keep
 .DS_Store
