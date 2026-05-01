@@ -268,6 +268,22 @@ class RepositoryIntegrationTest < Minitest::Test
     assert_equal 1, reasons["concurrency_full"]
   end
 
+  def test_tick_samples_buckets_returns_per_minute_aggregates
+    base = { policy_name: "p", duration_ms: 0, partitions_seen: 0, partitions_admitted: 0,
+             partitions_denied: 0, forward_failures: 0,
+             pending_total: 0, inflight_total: 0, denied_reasons: {} }
+    DispatchPolicy::Repository.record_tick_sample!(**base.merge(jobs_admitted: 5))
+    DispatchPolicy::Repository.record_tick_sample!(**base.merge(jobs_admitted: 7))
+
+    buckets = DispatchPolicy::Repository.tick_samples_buckets(
+      policy_name: "p", since: Time.current - 60, bucket_seconds: 60
+    )
+
+    assert_equal 1, buckets.size, "two samples within the same minute → one bucket"
+    assert_equal 12, buckets.first[:jobs_admitted]
+    assert buckets.first[:bucket_at], "bucket_at must be present (date_bin result)"
+  end
+
   def test_partition_round_trip_stats
     # Three partitions: one never checked, one checked 10s ago, one checked 1s ago
     DispatchPolicy::Repository.stage!(
