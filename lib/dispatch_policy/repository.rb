@@ -412,10 +412,12 @@ module DispatchPolicy
       bucket_param_idx = params.size + 1
       params << bucket_seconds.to_i
 
+      # `date_bin` requires Postgres 14+. We compute the bucket via floor on
+      # the epoch instead so the gem also runs on Postgres 12/13.
       result = connection.exec_query(
         <<~SQL.squish,
           SELECT
-            date_bin(($#{bucket_param_idx} || ' seconds')::interval, sampled_at, TIMESTAMP '2000-01-01') AS bucket_at,
+            to_timestamp(floor(extract(epoch from sampled_at) / $#{bucket_param_idx})::bigint * $#{bucket_param_idx}) AS bucket_at,
             COALESCE(SUM(jobs_admitted), 0)::int AS jobs_admitted,
             COALESCE(SUM(forward_failures), 0)::int AS forward_failures,
             COUNT(*)::int AS ticks
