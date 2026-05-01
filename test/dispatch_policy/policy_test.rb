@@ -76,6 +76,21 @@ module DispatchPolicy
       assert_equal 2,  policy.resolve_concurrency_max("acct-2")
     end
 
+    test "concurrency max rejects callables with wrong arity" do
+      err = assert_raises ArgumentError do
+        Class.new(ActiveJob::Base) do
+          include DispatchPolicy::Dispatchable
+          def self.name; "Anon::Arity0"; end
+          dispatch_policy do
+            partition_by ->(args) { args.first }
+            concurrency  max: -> { 100 }    # arity 0 — must accept partition_key
+          end
+          def perform(*); end
+        end
+      end
+      assert_match(/partition_key/, err.message)
+    end
+
     test "concurrency max rejects non-Integer non-callable" do
       assert_raises ArgumentError do
         Class.new(ActiveJob::Base) do

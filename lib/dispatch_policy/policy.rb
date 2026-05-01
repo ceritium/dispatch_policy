@@ -80,7 +80,18 @@ module DispatchPolicy
     def concurrency(max:)
       if max.is_a?(Integer)
         raise ArgumentError, "concurrency max must be positive (got #{max})" unless max.positive?
-      elsif !max.respond_to?(:call)
+      elsif max.respond_to?(:call)
+        # The callable is invoked with one argument (partition_key).
+        # Reject arities that won't accept it, with a message that
+        # points at the fix instead of letting the user discover the
+        # mismatch via a runtime ArgumentError on the first stage.
+        ar = max.arity
+        unless ar == 1 || ar == -1 || ar == -2
+          raise ArgumentError,
+            "concurrency max callable must accept one argument (partition_key); got arity #{ar}. " \
+            "Change `concurrency max: -> { ... }` to `concurrency max: ->(partition_key) { ... }`."
+        end
+      else
         raise ArgumentError,
           "concurrency max must be a positive Integer or a callable (got #{max.inspect})"
       end
