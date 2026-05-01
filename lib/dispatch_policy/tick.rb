@@ -73,9 +73,8 @@ module DispatchPolicy
       max_budget = @policy.admission_batch_size || @config.admission_batch_size
       result     = pipe.call(ctx, partition, max_budget)
 
-      preinserted_ids = []
-
-      claimed_rows =
+      admitted = 0
+      Repository.with_connection do
         ActiveRecord::Base.transaction(requires_new: true) do
           rows = Repository.claim_staged_jobs!(
             policy_name:      @policy_name,
@@ -85,37 +84,54 @@ module DispatchPolicy
             retry_after:      result.retry_after
           )
 
-          if rows.any?
-            # Always pre-insert an inflight row per admitted job so the UI
-            # has an accurate count regardless of gates. If a concurrency
-            # gate exists, use its (coarser) partition key so the gate's
-            # query keeps aggregating correctly across staged partitions.
-            concurrency_gate = @policy.gates.find { |g| g.name == :concurrency }
-            inflight_rows = rows.filter_map do |row|
-              ajid = row.dig("job_data", "job_id")
-              next unless ajid
+          # Deny path: the partition's gate_state / next_eligible_at have
+          # already been persisted by claim_staged_jobs!; commit to lock in
+          # the backoff and exit cleanly.
+          next if rows.empty?
 
-              key = if concurrency_gate
-                concurrency_gate.inflight_partition_key(@policy_name, Context.wrap(row["context"]))
-              else
-                row["partition_key"]
-              end
+          # Pre-insert an inflight row per admitted job so the concurrency
+          # gate sees them immediately. With a concurrency gate, use its
+          # (coarser) partition key so the gate's COUNT(*) keeps aggregating
+          # correctly across staged sub-partitions.
+          concurrency_gate = @policy.gates.find { |g| g.name == :concurrency }
+          inflight_rows = rows.filter_map do |row|
+            ajid = row.dig("job_data", "job_id")
+            next unless ajid
 
-              preinserted_ids << ajid
-              { policy_name: @policy_name, partition_key: key, active_job_id: ajid }
+            key = if concurrency_gate
+              concurrency_gate.inflight_partition_key(@policy_name, Context.wrap(row["context"]))
+            else
+              row["partition_key"]
             end
-            Repository.insert_inflight!(inflight_rows) if inflight_rows.any?
+            { policy_name: @policy_name, partition_key: key, active_job_id: ajid }
           end
+          Repository.insert_inflight!(inflight_rows) if inflight_rows.any?
 
-          rows
+          # Re-enqueue to the real adapter *inside this transaction*. The
+          # adapter (good_job / solid_queue) shares ActiveRecord::Base's
+          # connection, so its INSERT into good_jobs / solid_queue_jobs
+          # participates in the same TX. If anything raises (deserialize,
+          # adapter error, network), the whole TX rolls back atomically:
+          # staged_jobs return, inflight rows vanish, partition counters
+          # revert, and the adapter rows are also reverted. This is the
+          # at-least-once guarantee — there is no window where staged is
+          # gone but the adapter never received the job.
+          Forwarder.dispatch(rows)
+          admitted = rows.size
         end
-
-      if claimed_rows.empty?
-        return { admitted: 0, failures: 0, reasons: deduce_reasons(result) }
       end
 
-      failures = Forwarder.dispatch(claimed_rows, preinserted_inflight_ids: preinserted_ids)
-      { admitted: claimed_rows.size - failures.size, failures: failures.size, reasons: [] }
+      if admitted.zero?
+        { admitted: 0, failures: 0, reasons: deduce_reasons(result) }
+      else
+        { admitted: admitted, failures: 0, reasons: [] }
+      end
+    rescue StandardError => e
+      DispatchPolicy.config.logger&.error(
+        "[dispatch_policy] forward failed for #{@policy_name}/#{partition['partition_key']}: " \
+        "#{e.class}: #{e.message}"
+      )
+      { admitted: 0, failures: 1, reasons: ["forward_failed"] }
     end
 
     # When admit_count was 0, the Pipeline's `reasons` array contains entries

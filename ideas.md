@@ -67,68 +67,6 @@ de heartbeat que no se refrescaba durante el perform (el sweeper de
 5min mataba inflight rows de jobs legítimamente largos). Una vez ese
 está corregido, esto es afinación de defaults y monitoring.
 
-## Atomic admission: mover `Forwarder.dispatch` dentro de la TX
-
-**Síntoma.** Hay una ventana de pérdida de jobs entre el `COMMIT` de
-`claim_staged_jobs!` y la finalización de `Forwarder.dispatch`. Hoy en
-`tick.rb:79-117`:
-
-1. TX abre, `DELETE … RETURNING` de `staged_jobs` + pre-INSERT en
-   `inflight_jobs`.
-2. **COMMIT** — la fila ya no está en staging.
-3. Fuera de TX, `Forwarder.dispatch` deserializa y hace `job.enqueue`.
-
-Si el proceso muere (kill -9, OOM, deploy) entre #2 y #3:
-
-- `staged_jobs`: borrado.
-- `inflight_jobs`: presente. Se barrerá por `heartbeat_at` stale en
-  ~5min, pero eso solo libera cupo de concurrency, no recupera el job.
-- Adapter real: nunca recibió nada.
-- `unclaim!` no corre — solo se invoca en el `rescue` de
-  `Forwarder.dispatch`, que requiere proceso vivo.
-
-→ **Job perdido silenciosamente.** Mismo bug que arregla el PR 18
-(`f1a8ed68`) en `ceritium/dispatch_policy`.
-
-**Solución.** Meter `job.enqueue` dentro de la misma TX de PG. Funciona
-porque good_job / solid_queue usan la misma conexión que la gema, así
-que el `INSERT` en `good_jobs` o `solid_queue_jobs` participa de la
-misma transacción que el `DELETE FROM staged_jobs`. Si el adapter
-falla, la TX revierte y la fila staged sigue ahí — at-least-once real.
-
-**Cambios concretos.**
-
-1. En `tick.rb` `admit_partition`, mover la llamada a
-   `Forwarder.dispatch` **dentro** del bloque `transaction(requires_new: true)`,
-   después de `Repository.insert_inflight!`. Si `dispatch` lanza, la
-   TX revierte automáticamente (y `unclaim!` ya no hace falta como
-   compensación, deja de existir).
-2. `Forwarder.dispatch` cambia de "loop con rescue per-row" a "todo o
-   nada": una excepción en cualquier `job.enqueue` aborta la TX
-   entera. Per-row failures no son tolerables — si un job no se puede
-   serializar/encolar, queremos saberlo y reintentar el batch.
-   Alternativa: separar el batch fallido en dos mitades y reintentar
-   (binary search del job problemático). Probablemente overkill.
-3. Boot guard que rechace adapters no-PG (Sidekiq, Resque, async,
-   inline en producción) con mensaje claro: "dispatch_policy requires
-   a PG-backed ActiveJob adapter for atomic admission. Got
-   ActiveJob::QueueAdapters::SidekiqAdapter." Documentar en README.
-4. Soportar `database_role` config (Rails multi-DB con DB separada
-   para queues, p.ej. solid_queue con su propia DB) — el `transaction`
-   debe abrirse contra la conexión que comparten staging y la tabla
-   del adapter.
-5. Eliminar `Repository.unclaim!` y la lógica de
-   `preinserted_inflight_ids` en `Forwarder.dispatch` (ya no son
-   necesarias, la TX revierte todo junto).
-
-**Por qué se aplaza.** Es un cambio mayor: rompe el contrato actual
-("funciona con cualquier ActiveJob adapter") a cambio de la garantía
-de no-pérdida. Hay que validar contra los dos adapters soportados,
-añadir el boot guard, actualizar README + CLAUDE.md, y probablemente
-un test de integración que mate el proceso entre commit y enqueue
-para verificar que la TX revierte. Va junto con el bulk handoff
-(siguiente sección) porque ambos tocan el mismo path.
-
 ## Bulk handoff: `ActiveJob.perform_all_later` en `Forwarder.dispatch`
 
 **Síntoma.** Hoy `Forwarder.dispatch` (`forwarder.rb:23-44`) itera

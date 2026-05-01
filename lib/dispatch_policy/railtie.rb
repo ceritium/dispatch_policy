@@ -23,5 +23,9 @@ module DispatchPolicy
       gem_root = File.expand_path("../..", __dir__)
       app.config.paths["db/migrate"] << File.join(gem_root, "db/migrate") if File.directory?(File.join(gem_root, "db/migrate"))
     end
+
+    config.after_initialize do
+      DispatchPolicy.warn_unsupported_adapter
+    end
   end
 end

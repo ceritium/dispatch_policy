@@ -15,30 +15,11 @@ class ForwarderTest < Minitest::Test
     super
     Object.const_set(:FwdGoodJob, GoodJob) unless Object.const_defined?(:FwdGoodJob)
     Object.const_set(:FwdBoomJob, BoomJob) unless Object.const_defined?(:FwdBoomJob)
-
-    @inflight_deletes = []
-    @unclaimed        = []
-
-    repo_singleton = DispatchPolicy::Repository.singleton_class
-    @originals = {}
-    %i[delete_inflight! unclaim!].each do |m|
-      @originals[m] = repo_singleton.instance_method(m)
-    end
-    repo_singleton.define_method(:delete_inflight!) { |active_job_id:| ForwarderTest.collected_deletes << active_job_id }
-    repo_singleton.define_method(:unclaim!) { |rows| ForwarderTest.collected_unclaims.concat(rows) }
   end
 
   def teardown
-    @originals&.each { |m, mi| DispatchPolicy::Repository.singleton_class.define_method(m, mi) }
     Object.send(:remove_const, :FwdGoodJob) if Object.const_defined?(:FwdGoodJob)
     Object.send(:remove_const, :FwdBoomJob) if Object.const_defined?(:FwdBoomJob)
-    self.class.collected_deletes.clear
-    self.class.collected_unclaims.clear
-  end
-
-  class << self
-    def collected_deletes; @cd ||= []; end
-    def collected_unclaims; @cu ||= []; end
   end
 
   def staged_row(klass, ajid)
@@ -64,37 +45,28 @@ class ForwarderTest < Minitest::Test
     end
 
     rows = [staged_row(FwdGoodJob, "abc")]
-    failures = DispatchPolicy::Forwarder.dispatch(rows)
+    DispatchPolicy::Forwarder.dispatch(rows)
 
-    assert_empty failures
     assert_equal [[true, "ForwarderTest::GoodJob"]], received
   ensure
     FwdGoodJob.queue_adapter.singleton_class.alias_method(:enqueue, :__orig_enqueue) if FwdGoodJob.queue_adapter.singleton_class.method_defined?(:__orig_enqueue)
   end
 
-  def test_failed_forward_unclaims_and_deletes_preinserted_inflight
+  # The new contract is "all or nothing": any per-row failure propagates so
+  # the surrounding admission TX can roll back. There is no per-row failure
+  # return value anymore — compensation (unclaim, delete inflight) is gone
+  # because TX rollback handles it for free.
+  def test_dispatch_propagates_per_row_failures_to_caller
     FwdBoomJob.queue_adapter.singleton_class.define_method(:enqueue) { |_job| raise "boom" }
 
     rows = [staged_row(FwdBoomJob, "ajid-99")]
-    failures = DispatchPolicy::Forwarder.dispatch(rows, preinserted_inflight_ids: ["ajid-99"])
-
-    assert_equal 1, failures.size
-    assert_equal "boom", failures.first.error.message
-    assert_equal ["ajid-99"], self.class.collected_deletes,
-                 "preinserted inflight rows must be deleted on forward failure to keep concurrency budget accurate"
-    assert_equal 1, self.class.collected_unclaims.size
+    err = assert_raises(RuntimeError) { DispatchPolicy::Forwarder.dispatch(rows) }
+    assert_equal "boom", err.message
   ensure
     FwdBoomJob.queue_adapter.singleton_class.send(:remove_method, :enqueue) rescue nil
   end
 
-  def test_failed_forward_without_preinsert_does_not_delete_inflight
-    FwdBoomJob.queue_adapter.singleton_class.define_method(:enqueue) { |_job| raise "boom" }
-
-    rows = [staged_row(FwdBoomJob, "ajid-99")]
-    DispatchPolicy::Forwarder.dispatch(rows, preinserted_inflight_ids: [])
-
-    assert_empty self.class.collected_deletes
-  ensure
-    FwdBoomJob.queue_adapter.singleton_class.send(:remove_method, :enqueue) rescue nil
+  def test_dispatch_no_op_on_empty
+    DispatchPolicy::Forwarder.dispatch([])
   end
 end
