@@ -82,4 +82,10 @@ class ThrottleGateTest < Minitest::Test
     decision = gate.evaluate(DispatchPolicy::Context.wrap({}), empty_partition, 100)
     assert_equal 0, decision.allowed
   end
+
+  def test_zero_per_raises_on_construction
+    assert_raises(ArgumentError) do
+      DispatchPolicy::Gates::Throttle.new(rate: 5, per: 0, partition_by: ->(_c) { "x" })
+    end
+  end
 end

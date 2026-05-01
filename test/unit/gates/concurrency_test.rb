@@ -25,11 +25,19 @@ class ConcurrencyGateTest < Minitest::Test
     assert_equal 3, d.allowed
   end
 
-  def test_full_returns_zero
+  def test_full_returns_zero_with_retry_after_to_prevent_busy_loop
     stub_repo_count(5)
     gate = DispatchPolicy::Gates::Concurrency.new(max: 5, partition_by: ->(_c) { "acct:1" })
     d = gate.evaluate(DispatchPolicy::Context.wrap({}), partition, 100)
     assert_equal 0, d.allowed
+    assert d.retry_after && d.retry_after.positive?, "concurrency-full must back off via retry_after"
+  end
+
+  def test_custom_full_backoff
+    stub_repo_count(5)
+    gate = DispatchPolicy::Gates::Concurrency.new(max: 5, partition_by: ->(_c) { "k" }, full_backoff: 7.5)
+    d = gate.evaluate(DispatchPolicy::Context.wrap({}), partition, 100)
+    assert_in_delta 7.5, d.retry_after, 0.001
   end
 
   def test_dynamic_max_changes_between_calls

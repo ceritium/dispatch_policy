@@ -13,11 +13,14 @@ module DispatchPolicy
     # Inflight rows are keyed by `inflight_partition_key(policy, ctx)`,
     # written by InflightTracker around_perform and read by this gate.
     class Concurrency < Gate
-      attr_reader :max_proc
+      DEFAULT_FULL_BACKOFF = 1.0 # seconds
 
-      def initialize(max:, partition_by: nil)
+      attr_reader :max_proc, :full_backoff
+
+      def initialize(max:, partition_by: nil, full_backoff: DEFAULT_FULL_BACKOFF)
         super(partition_by: partition_by)
-        @max_proc = max.respond_to?(:call) ? max : ->(_ctx) { max }
+        @max_proc     = max.respond_to?(:call) ? max : ->(_ctx) { max }
+        @full_backoff = full_backoff.to_f
       end
 
       def name
@@ -26,14 +29,18 @@ module DispatchPolicy
 
       def evaluate(ctx, partition, admit_budget)
         cap = capacity_for(ctx)
-        return Decision.deny(reason: "max=0") if cap <= 0
+        return Decision.deny(retry_after: @full_backoff, reason: "max=0") if cap <= 0
 
         in_flight = Repository.count_inflight(
           policy_name:   partition["policy_name"],
           partition_key: inflight_partition_key(partition["policy_name"], ctx)
         )
         remaining = cap - in_flight
-        return Decision.new(allowed: 0, reason: "concurrency_full") if remaining <= 0
+        if remaining <= 0
+          # Stop hammering this partition with COUNT(*) every tick — back off
+          # until enough jobs are likely to have finished.
+          return Decision.new(allowed: 0, retry_after: @full_backoff, reason: "concurrency_full")
+        end
 
         Decision.new(allowed: [remaining, admit_budget].min)
       end
