@@ -26,7 +26,6 @@ class CreateDispatchPolicyTables < ActiveRecord::Migration[7.1]
       t.string   :queue_name
       t.string   :status,             null: false, default: "active"
       t.integer  :pending_count,      null: false, default: 0
-      t.integer  :in_flight_count,    null: false, default: 0
       t.jsonb    :context,            null: false, default: {}
       t.datetime :context_updated_at
       t.datetime :last_enqueued_at

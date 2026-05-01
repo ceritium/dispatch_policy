@@ -9,13 +9,15 @@ module DispatchPolicy
       db_names       = Partition.distinct.pluck(:policy_name)
       names          = (registry_names + db_names).uniq.sort
 
+      in_flight_by_policy = InflightJob.where(policy_name: names).group(:policy_name).count
+
       @rows = names.map do |name|
         partitions = Partition.for_policy(name)
         {
           name:           name,
           registered:     registry_names.include?(name),
           pending:        partitions.sum(:pending_count),
-          in_flight:      partitions.sum(:in_flight_count),
+          in_flight:      in_flight_by_policy[name] || 0,
           partitions:     partitions.count,
           paused_count:   partitions.paused.count
         }
@@ -28,8 +30,8 @@ module DispatchPolicy
                                 .order(Arel.sql("pending_count DESC, last_admit_at DESC NULLS LAST"))
                                 .limit(100)
       @totals = {
-        pending:   Partition.for_policy(@policy_name).sum(:pending_count),
-        in_flight: Partition.for_policy(@policy_name).sum(:in_flight_count),
+        pending:    Partition.for_policy(@policy_name).sum(:pending_count),
+        in_flight:  InflightJob.where(policy_name: @policy_name).count,
         partitions: Partition.for_policy(@policy_name).count
       }
     end
