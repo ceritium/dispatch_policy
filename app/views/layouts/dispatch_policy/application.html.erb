@@ -6,6 +6,75 @@
     <title>dispatch_policy</title>
     <%= csrf_meta_tags %>
     <style><%= DispatchPolicy::Engine.root.join("app/assets/stylesheets/dispatch_policy/application.css").read.html_safe %></style>
+    <script src="https://cdn.jsdelivr.net/npm/@hotwired/turbo@8.0.4/dist/turbo.es2017-umd.min.js"></script>
+    <script>
+      (function () {
+        var KEY = "dispatch_policy:refresh-interval";
+        var timer = null;
+
+        function getInterval() {
+          return parseInt(sessionStorage.getItem(KEY) || "0", 10);
+        }
+
+        function setInterval(value) {
+          sessionStorage.setItem(KEY, String(value));
+          syncControls();
+          restart();
+        }
+
+        function restart() {
+          if (timer) { clearTimeout(timer); timer = null; }
+          var seconds = getInterval();
+          if (seconds > 0) {
+            timer = setTimeout(function () {
+              if (typeof Turbo !== "undefined") {
+                Turbo.visit(window.location.href, { action: "replace" });
+              } else {
+                window.location.assign(window.location.href);
+              }
+            }, seconds * 1000);
+          }
+        }
+
+        function syncControls() {
+          var current = getInterval();
+          document.querySelectorAll("[data-dp-refresh]").forEach(function (btn) {
+            var v = parseInt(btn.getAttribute("data-dp-refresh"), 10);
+            if (v === current) btn.classList.add("dp-refresh-active");
+            else btn.classList.remove("dp-refresh-active");
+          });
+        }
+
+        function bindControls() {
+          document.querySelectorAll("[data-dp-refresh]").forEach(function (btn) {
+            if (btn.dataset.bound) return;
+            btn.dataset.bound = "1";
+            btn.addEventListener("click", function (e) {
+              e.preventDefault();
+              setInterval(parseInt(btn.getAttribute("data-dp-refresh"), 10));
+            });
+          });
+          syncControls();
+        }
+
+        function init() {
+          bindControls();
+          restart();
+        }
+
+        document.addEventListener("DOMContentLoaded", init);
+        document.addEventListener("turbo:load",       init);
+
+        // Pause refresh when the tab is hidden (saves DB load); resume when visible.
+        document.addEventListener("visibilitychange", function () {
+          if (document.hidden) {
+            if (timer) { clearTimeout(timer); timer = null; }
+          } else {
+            restart();
+          }
+        });
+      })();
+    </script>
   </head>
   <body>
     <header class="dp-header">
@@ -17,6 +86,13 @@
         <%= link_to "Policies",   policies_path %>
         <%= link_to "Partitions", partitions_path %>
       </nav>
+      <div class="dp-refresh">
+        <span class="dp-refresh-label">Auto-refresh</span>
+        <button type="button" class="dp-refresh-btn" data-dp-refresh="0">off</button>
+        <button type="button" class="dp-refresh-btn" data-dp-refresh="2">2s</button>
+        <button type="button" class="dp-refresh-btn" data-dp-refresh="5">5s</button>
+        <button type="button" class="dp-refresh-btn" data-dp-refresh="10">10s</button>
+      </div>
     </header>
     <% if flash[:notice] %><div class="dp-flash dp-flash-ok"><%= flash[:notice] %></div><% end %>
     <% if flash[:alert]  %><div class="dp-flash dp-flash-err"><%= flash[:alert]  %></div><% end %>
@@ -27,15 +103,5 @@
       <span>dispatch_policy v<%= DispatchPolicy::VERSION %></span>
       <span>now: <%= Time.current.utc.strftime("%Y-%m-%d %H:%M:%S UTC") %></span>
     </footer>
-
-    <% refresh_seconds = content_for?(:auto_refresh_seconds) ? content_for(:auto_refresh_seconds).to_i : 0 %>
-    <% if refresh_seconds.positive? %>
-      <script>
-        (function () {
-          var here = window.location.pathname + window.location.search;
-          setTimeout(function () { window.location.assign(here); }, <%= refresh_seconds * 1000 %>);
-        })();
-      </script>
-    <% end %>
   </body>
 </html>

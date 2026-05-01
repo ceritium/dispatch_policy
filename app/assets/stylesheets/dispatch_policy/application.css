@@ -25,8 +25,29 @@ code { font-family: "SFMono-Regular", Menlo, monospace; font-size: 13px; backgro
 }
 .dp-header a { color: #f6f7fa; }
 .dp-logo { font-weight: 600; font-size: 16px; letter-spacing: 0.4px; }
+.dp-nav { flex: 1; }
 .dp-nav a { margin-left: 22px; opacity: 0.85; }
 .dp-nav a:hover { opacity: 1; text-decoration: none; }
+
+.dp-refresh {
+  display: flex; align-items: center; gap: 6px;
+  font-size: 12px; color: rgba(246, 247, 250, 0.7);
+}
+.dp-refresh-label {
+  margin-right: 4px; text-transform: uppercase; letter-spacing: 0.6px; font-size: 10.5px;
+}
+.dp-refresh-btn {
+  background: transparent; color: rgba(246, 247, 250, 0.85);
+  border: 1px solid rgba(246, 247, 250, 0.25);
+  padding: 3px 9px; border-radius: 3px;
+  font-size: 12px; cursor: pointer;
+  font-variant-numeric: tabular-nums;
+}
+.dp-refresh-btn:hover { background: rgba(246, 247, 250, 0.08); }
+.dp-refresh-btn.dp-refresh-active {
+  background: rgba(246, 247, 250, 0.92); color: #1d2330;
+  border-color: rgba(246, 247, 250, 0.92); font-weight: 600;
+}
 
 .dp-main { max-width: 1200px; margin: 24px auto; padding: 0 28px 64px; }
 .dp-footer {
