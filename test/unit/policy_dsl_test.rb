@@ -65,12 +65,16 @@ class PolicyDSLTest < Minitest::Test
     end
   end
 
-  def test_no_gates_raises
-    assert_raises(DispatchPolicy::InvalidPolicy) do
-      DispatchPolicy::PolicyDSL.build("p") do
-        partition_by ->(_c) { "k" }
-      end
+  def test_no_gates_is_allowed_for_fairness_only_policies
+    # A policy with no gates uses admission_batch_size (or
+    # tick_admission_budget) as its ceiling and relies on the in-tick
+    # fairness reorder to distribute admissions across partitions.
+    # Valid for "balance N tenants without rate-limiting any of them".
+    policy = DispatchPolicy::PolicyDSL.build("fair_only") do
+      partition_by ->(c) { c[:tenant] }
     end
+    assert_empty policy.gates
+    assert_equal "fair_only", policy.name
   end
 
   def test_missing_partition_by_raises

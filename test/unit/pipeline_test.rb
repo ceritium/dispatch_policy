@@ -65,6 +65,18 @@ class PipelineTest < Minitest::Test
     assert_in_delta 3, result.retry_after, 0.001
   end
 
+  def test_pipeline_with_no_gates_admits_full_budget
+    # Fairness-only policies have no gates; the pipeline should pass
+    # the budget through unchanged and the Tick caps it via fair_share.
+    pipeline = DispatchPolicy::Pipeline.new(make_policy([]))
+    result = pipeline.call(DispatchPolicy::Context.wrap({}), { "policy_name" => "p" }, 42)
+
+    assert_equal 42, result.admit_count
+    assert_nil result.retry_after
+    assert_empty result.reasons
+    assert_empty result.gate_state_patch
+  end
+
   def test_gate_state_patches_are_merged
     g1 = FakeGate.new(name: :a, decision: DispatchPolicy::Decision.new(allowed: 5, gate_state_patch: { "throttle" => { "tokens" => 0.5 } }))
     g2 = FakeGate.new(name: :b, decision: DispatchPolicy::Decision.new(allowed: 10))

@@ -19,7 +19,7 @@ Ver `README.md` para la API y los ejemplos.
 v0.1 (en master). Todo el flujo principal está implementado y testeado.
 Lo pendiente está en `ideas.md` con su porqué.
 
-100 tests / 217 assertions. `bundle exec rake test` desde la raíz.
+101 tests / 225 assertions. `bundle exec rake test` desde la raíz.
 
 ## Arquitectura — 4 tablas
 
@@ -64,6 +64,12 @@ dispatch_policy_tick_samples     una fila por Tick.run para métricas
   `partition_by:` per-gate**. Si se omite, `Policy#validate!` lanza
   `InvalidPolicy: partition_by required`. Para necesidades reales
   de gates con scopes distintos, usar policies separadas.
+- **Los gates NO son obligatorios.** Una policy con `partition_by`
+  y sin gates es válida — el pipeline devuelve `admit_count =
+  max_budget`, y la fairness intra-tick (decay reorder + fair_share)
+  sigue actuando. Útil para "reparte admisiones entre N tenants sin
+  rate-limit individual". Sin un gate de concurrency tampoco hace
+  falta `dispatch_policy_inflight_tracking` en el job.
 - **`partitions.context` se refresca en cada `perform_later`** vía
   UPSERT. Los gates leen ese ctx, no el de `staged_jobs.context`
   (que es histórico). Esto permite que un cambio en la DB del host

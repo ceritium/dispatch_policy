@@ -74,11 +74,15 @@ module DispatchPolicy
 
     def validate!
       raise InvalidPolicy, "policy name required" if @name.empty?
-      raise InvalidPolicy, "at least one gate required" if @gates.empty?
       raise InvalidPolicy, "partition_by required" unless @partition_by_proc
       unless %i[restage bypass].include?(@retry_strategy)
         raise InvalidPolicy, "retry_strategy must be :restage or :bypass"
       end
+      # Note: gates are NOT required. A policy with no gates uses the
+      # admission_batch_size (or tick_admission_budget when set) as its
+      # only ceiling, with the in-tick fairness reorder distributing
+      # admissions across partitions. Useful for "balance N tenants
+      # fairly without rate-limiting any of them" workloads.
     end
   end
 end

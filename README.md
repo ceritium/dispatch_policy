@@ -82,9 +82,16 @@ restart the chain if a process is killed mid-loop.
 
 ## Choosing the partition scope
 
-`partition_by` is the most consequential decision in a policy. It tells
-the gem **what counts as one logical partition** — what scope each gate
-enforces against, and what the in-tick fairness reorder operates over.
+`partition_by` is the most consequential decision in a policy and the
+only required field. It tells the gem **what counts as one logical
+partition** — what scope each gate enforces against, and what the
+in-tick fairness reorder operates over.
+
+A policy with `partition_by` and **no gates** is valid: the pipeline
+passes the full budget through, and the Tick caps it via
+`admission_batch_size` (or `tick_admission_budget` if set). Useful
+when you want fairness ("balance N tenants evenly") without
+rate-limiting any tenant individually.
 
 The recommended form declares it once at the **policy level**, so every
 gate enforces its state at exactly that scope:
