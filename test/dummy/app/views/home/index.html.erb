@@ -78,8 +78,8 @@
 
 <%= render "dispatch_form",
   kind:  "adaptive_demo",
-  title: "AdaptiveDemoJob — :adaptive_concurrency (self-tuning cap)",
-  desc:  "initial_max=3, target_lag_ms=500. Burst makes the EWMA queue lag exceed target; current_max shrinks via 0.95×. A quiet period of 30s+ grows it back +1 per fast success.",
+  title: "AdaptiveDemoJob — :adaptive_concurrency + fairness (composed)",
+  desc:  "Adaptive cap (initial_max=3, target_lag_ms=500) plus in-tick fairness (half_life=20s, tick_admission_budget=30). admit_count per tenant = min(fair_share, current_max - in_flight). Adaptive shrinks the cap on saturation; fairness keeps cold tenants from waiting behind the hot one. Use the Storm form below to drive both at once.",
   defaults: { tenant: "acme" },
   default_count: 50 %>
 

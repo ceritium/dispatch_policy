@@ -211,6 +211,59 @@ and admits `min(allowed)` across all of them. All gates share the
 policy's `partition_by` — there's one canonical scope per partition,
 so throttle's bucket and concurrency's count line up.
 
+### Mixing `:adaptive_concurrency` with fairness
+
+Adaptive and fairness operate at different layers and compose
+without sharing state:
+
+- **Fairness** (`fairness half_life:` + `tick_admission_budget`) is
+  a policy-level orchestrator. It reorders the partitions claimed
+  in a tick by their EWMA `decayed_admits` and caps each at
+  `fair_share = ceil(tick_admission_budget / N)`.
+- **Adaptive** is a gate. It contributes a per-partition cap
+  (`current_max`) that adjusts via AIMD on the queue-lag signal.
+
+Each tick the actual admit_count for a partition becomes:
+
+```
+min(fair_share, current_max - in_flight)
+```
+
+with the safety valve `max(remaining, initial_max)` when
+`in_flight == 0`. The two writes are independent — fairness
+updates `partitions.decayed_admits` inside the per-partition
+admission TX, and adaptive updates
+`dispatch_policy_adaptive_concurrency_stats` from the worker's
+around_perform via `record_observation`. Different tables,
+different locks.
+
+The combined behaviour is: fairness picks an order and budget per
+tick (so a busy tenant can't monopolise a tick), and adaptive
+shapes how aggressively each tenant consumes its share (so a
+struggling tenant scales itself back without operator tuning).
+
+```ruby
+class TenantWorkJob < ApplicationJob
+  dispatch_policy :tenants do
+    partition_by ->(c) { c[:tenant] }
+
+    gate :adaptive_concurrency,
+         initial_max:   5,
+         target_lag_ms: 1000,
+         min:           1
+
+    fairness half_life: 30.seconds
+    tick_admission_budget 60
+  end
+end
+```
+
+Demoed in the dummy app: `AdaptiveDemoJob` declares both. The
+storm form on the home page (`/`) drives it across many tenants
+with a triangular distribution so you can watch the EWMA reorder
+hot tenants to the back AND the AIMD shrink their cap when they
+saturate the worker pool.
+
 ### `partitions.context` is refreshed on every enqueue
 
 When you call `perform_later`, the gem evaluates your `context` proc and
