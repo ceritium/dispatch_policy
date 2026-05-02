@@ -19,7 +19,7 @@ Ver `README.md` para la API y los ejemplos.
 v0.1 (en master). Todo el flujo principal está implementado y testeado.
 Lo pendiente está en `ideas.md` con su porqué.
 
-86 tests / 199 assertions. `bundle exec rake test` desde la raíz.
+101 tests / 217 assertions. `bundle exec rake test` desde la raíz.
 
 ## Arquitectura — 4 tablas
 
@@ -56,6 +56,17 @@ dispatch_policy_tick_samples     una fila por Tick.run para métricas
   de routing.** El shard se pinea en el primer write
   (`COALESCE(EXCLUDED.shard, partitions.shard)`) para que las
   particiones no salten entre tick workers.
+- **`partition_by` recomendado a nivel policy.** Cuando se declara
+  con `partition_by ->(ctx) { … }` en el bloque de la policy, el
+  partition_key del staged_job y la `inflight_partition_key` del
+  gate de concurrency comparten el mismo valor canónico → ningún
+  gate sufre dilución de scope. El `partition_by:` per-gate sigue
+  funcionando (backwards-compat) y es el path heredado: hace que
+  partition_key se construya como concatenación de los `partition_by`
+  de TODOS los gates → el bucket de throttle se divide N veces si
+  los gates tienen scopes distintos. Si los dos están definidos a
+  la vez, gana el de policy y se loguea un warning. Para necesidades
+  reales de gates con scopes distintos, usar policies separadas.
 - **`partitions.context` se refresca en cada `perform_later`** vía
   UPSERT. Los gates leen ese ctx, no el de `staged_jobs.context`
   (que es histórico). Esto permite que un cambio en la DB del host

@@ -80,6 +80,40 @@ production:
 The job self-chains every second, so the cron above is just a safety net to
 restart the chain if a process is killed mid-loop.
 
+## Choosing the partition scope
+
+`partition_by` is the most consequential decision in a policy. It tells
+the gem **what counts as one logical partition** — what scope each gate
+enforces against, and what the in-tick fairness reorder operates over.
+
+The recommended form declares it once at the **policy level**, so every
+gate enforces its state at exactly that scope:
+
+```ruby
+class FetchEndpointJob < ApplicationJob
+  dispatch_policy :endpoints do
+    partition_by ->(ctx) { ctx[:endpoint_id] }
+    gate :throttle,    rate: 60, per: 60
+    gate :concurrency, max: 5
+  end
+end
+```
+
+The staged_jobs row and the concurrency gate's inflight_jobs row both
+use the same canonical key (`ctx[:endpoint_id]`). Throttle's bucket
+sits on a single partition row per endpoint; concurrency counts inflight
+under that same key. No dilution.
+
+You can still set `partition_by:` per gate (for backwards
+compatibility), but the throttle gate's bucket lives in the staged
+partition row, so if you give two gates different `partition_by:`
+lambdas the staged partition_key becomes their concatenation, which
+splits the throttle bucket N ways. Symptom: the rate limit is
+"`rate × N_other_partition_values`" instead of "`rate`".
+
+→ Use one `partition_by` at the policy level. If you need different
+gate scopes, **split into separate policies**.
+
 ## Declaring a policy
 
 ```ruby
@@ -237,46 +271,125 @@ Each job uses `good_job_control_concurrency_with` (or
 
 ## Fairness within a tick
 
-When several partitions are competing for admission inside the same tick,
+When several partitions compete for admission in the same tick,
 `dispatch_policy` reorders them by **least-recently-active first** so a
 hot partition with thousands of pending jobs cannot starve a cold one
 that just woke up.
 
-Each partition keeps an exponentially weighted moving average of its
-recent admissions (`decayed_admits`), updated atomically inside the
-admit transaction. The half-life is configurable; with the default 60s,
-a partition that admitted 100 jobs is "weighted as 50" 60s later, "25"
-two minutes later, and so on. Inside the tick, claimed partitions are
-sorted by this value ASC and processed in that order.
+The mechanism has two knobs: an EWMA half-life (controls *how* the
+order is decided) and an optional global tick cap (controls *how much*
+each partition is allowed in one tick).
 
-Optionally, you can set a global cap on admissions per tick. When set,
-`fair_share = ceil(cap / claimed_partitions)` becomes the per-partition
-ceiling, and any leftover from partitions that didn't fill their share
-is redistributed in a second pass — still in least-recently-active
-order.
+### `fairness half_life:` — the EWMA half-life
+
+Each partition row keeps two columns, updated atomically inside the
+admission transaction:
+
+- `decayed_admits` — an exponentially weighted moving average of recent
+  admissions.
+- `decayed_admits_at` — the wall-clock instant of the last update.
+
+Whenever a partition admits `N` jobs, the gem applies:
+
+```
+decayed_admits := decayed_admits * exp(-Δt / τ) + N
+decayed_admits_at := now()
+```
+
+where `τ = half_life / ln(2)` and `Δt` is the time elapsed since the
+previous update. The defining property of a half-life is intuitive:
+
+> after `half_life` seconds without admitting, a partition's
+> `decayed_admits` has decayed to half its previous value.
+
+Inside the tick, claimed partitions are sorted by current
+`decayed_admits` ASC (refreshed in memory using the same formula) and
+visited in that order. Partitions that haven't been admitting recently
+get first crack at the budget; the hot ones drop to the back.
+
+**Picking a value.** Half-life is the only knob:
+
+| Value     | Behavior                                                                     |
+|-----------|------------------------------------------------------------------------------|
+| 5–10s     | Fairness reacts to brief pauses. Good for bursty traffic where short stalls should give a partition a head start. |
+| **60s** (default) | Stable steady-state behavior. A hot partition stays "hot" through normal latency variation. |
+| 5–15min   | Long memory. A burst on partition A penalizes A for many minutes; useful when bursts last that long and you want quieter partitions to ride the recovery. |
+
+Set `c.fairness_half_life_seconds = nil` (or `0`) to disable the
+reorder entirely — the column stops being updated and partitions are
+processed in `claim_partitions` order (last-checked-first). The gem
+still runs; you just lose the in-tick rebalance.
+
+### `tick_admission_budget` — global cap per tick
+
+Without this set, each partition admits up to `admission_batch_size`
+in its tick visit. With many active partitions × a generous batch
+size, one tick can admit thousands of jobs.
+
+When you set `tick_admission_budget`, the per-partition ceiling
+becomes `fair_share = ceil(cap / claimed_partitions)`. Pass-1 walks
+the (decay-sorted) partitions giving each up to `fair_share`; pass-2
+redistributes any leftover budget to whoever filled their share —
+still in least-recently-active order — until the cap is reached.
+
+Concrete example with `tick_admission_budget = 30` and 5 partitions
+claimed:
+
+- `fair_share = ceil(30 / 5) = 6`
+- Pass-1: each partition admits up to 6 → if all five are eager,
+  total = 30, cap reached.
+- If only one partition has pending, it admits 6 in pass-1, then up to
+  another `cap - 6 = 24` in pass-2 (capped at `fair_share` per call).
+
+When the cap is hit before all claimed partitions admit, the
+remainder are denied with reason `tick_cap_exhausted`. They were still
+*observed* (their `last_checked_at` was bumped), so they're back in
+the ordering pool next tick — usually at the front, since their
+`decayed_admits` didn't grow.
 
 ```ruby
 DispatchPolicy.configure do |c|
-  c.fairness_half_life_seconds = 60   # default; tune per workload
-  c.tick_admission_budget      = nil  # default = no global cap
+  c.fairness_half_life_seconds = 60   # default
+  c.tick_admission_budget      = nil  # default — no global cap
 end
 
 # Per-policy overrides:
 class FetchEndpointJob < ApplicationJob
   dispatch_policy :endpoints do
-    fairness half_life: 30.seconds       # snappier rebalance for this policy
-    tick_admission_budget 200             # cap admissions/tick globally
-    gate :throttle, rate: ->(c) { c[:rate] }, per: 60, partition_by: ->(c) { c[:endpoint_id] }
+    fairness half_life: 30.seconds   # snappier rebalance for this policy
+    tick_admission_budget 200         # cap admissions/tick globally
+    gate :throttle, rate: ->(c) { c[:rate] }, per: 60,
+                    partition_by: ->(c) { c[:endpoint_id] }
   end
 end
 ```
 
-**Anti-stagnation guarantee.** The decayed-admits ordering only
-applies to the partitions already claimed in this tick. The selection
-itself (`claim_partitions`) still uses `last_checked_at NULLS FIRST`,
-so every partition with pending is visited in at most
-⌈active_partitions / partition_batch_size⌉ ticks regardless of how hot
-or cold it is.
+### Anti-stagnation guarantee
+
+The decay-based reorder only applies to partitions already claimed
+this tick. Partition *selection* — `Repository.claim_partitions` —
+still orders by `last_checked_at NULLS FIRST, id`. Every active
+partition with pending jobs and an eligible `next_eligible_at` is
+visited in at most `⌈active_partitions / partition_batch_size⌉` ticks
+regardless of how hot or cold its `decayed_admits` is.
+
+In other words: hot partitions don't get reordered to the back
+*forever*; they get reordered to the back *of this tick*. The next
+tick claims a fresh batch by staleness, so every partition gets its
+turn in bounded time.
+
+### Watching it in the UI
+
+`/dispatch_policy/policies/<name>` shows `decayed_admits` per
+partition (refreshed live with the elapsed-time decay applied) plus
+an "≈ admits/min" estimate computed as
+`decayed_admits × ln(2) / half_life × 60`. When fairness is
+rebalancing healthily, the values across partitions converge over a
+few half-lives.
+
+The dashboard also surfaces `tick_cap_exhausted` in the per-policy
+`Top denial` column — a steady non-zero value there means your
+`tick_admission_budget` is binding (raise it, accept it, or shard).
 
 ## Configuration
 
