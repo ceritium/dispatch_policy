@@ -2,7 +2,8 @@
 
 module DispatchPolicy
   class Config
-    attr_accessor :tick_max_duration,
+    attr_accessor :enabled,
+                  :tick_max_duration,
                   :partition_batch_size,
                   :admission_batch_size,
                   :idle_pause,
@@ -20,6 +21,12 @@ module DispatchPolicy
                   :adapter_throughput_target
 
     def initialize
+      # Master switch. When false, the around_enqueue and the BulkEnqueue
+      # patch pass through to the real adapter without staging — all of
+      # the gem's machinery becomes a no-op for new perform_later calls.
+      # The TickLoop also exits early. Used during cutovers to drain
+      # the staging table without taking traffic offline.
+      @enabled                   = true
       @tick_max_duration         = 25
       @partition_batch_size      = 50
       @admission_batch_size      = 100

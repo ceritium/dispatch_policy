@@ -52,6 +52,17 @@ class JobExtensionTest < Minitest::Test
     assert_equal "default", row[:shard]
   end
 
+  def test_disabled_config_passes_through_to_adapter
+    # Master switch off: jobs go straight to the adapter, the staging
+    # table is untouched. Used during cutovers / migrations to drain
+    # the gem without taking the app offline.
+    DispatchPolicy.config.enabled = false
+    JobExtensionTestJob.perform_later("hello")
+    assert_empty Recorder.rows, "config.enabled = false must skip staging"
+  ensure
+    DispatchPolicy.config.enabled = true
+  end
+
   def test_bypass_block_does_not_stage
     DispatchPolicy::Bypass.with do
       JobExtensionTestJob.perform_later("inside-bypass")

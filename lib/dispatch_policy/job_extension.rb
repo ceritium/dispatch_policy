@@ -27,6 +27,7 @@ module DispatchPolicy
     # Called by the around_enqueue lambda. Public so it can be tested directly.
     def self.around_enqueue_for(job, block)
       return block.call if Bypass.active?
+      return block.call unless DispatchPolicy.config.enabled
 
       policy = DispatchPolicy.registry.fetch(job.class.dispatch_policy_name)
       return block.call unless policy
@@ -107,6 +108,7 @@ module DispatchPolicy
         # admission loop with the wrong context (job.arguments is still []
         # at that point because ActiveJob defers deserialization).
         return super if DispatchPolicy::Bypass.active?
+        return super unless DispatchPolicy.config.enabled
         return super unless DispatchPolicy.registry.size.positive?
 
         with_policy, without_policy = flat.partition do |j|
