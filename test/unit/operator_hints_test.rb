@@ -51,9 +51,22 @@ class OperatorHintsTest < Minitest::Test
   def test_pending_growth_hint
     hints = call(
       admitted_per_minute: 100,
+      pending_total:       500,
       pending_trend:       :up
     )
     assert(hints.any? { |h| h.message.include?("Inflow > outflow") })
+  end
+
+  def test_pending_growth_hint_silenced_when_backlog_drained
+    # A transient spike in the tail third of the sparkline still
+    # makes trend_direction return :up, even after the backlog
+    # fully drained. With pending = 0, the situation is resolved.
+    hints = call(
+      admitted_per_minute: 100,
+      pending_total:       0,
+      pending_trend:       :up
+    )
+    refute(hints.any? { |h| h.message.include?("Inflow > outflow") })
   end
 
   def test_forward_failure_rate_thresholds

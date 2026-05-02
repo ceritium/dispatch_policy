@@ -60,7 +60,13 @@ module DispatchPolicy
       end
 
       # ---- pending growing while admit rate is non-trivial -----------
-      if m[:pending_trend] == :up && m[:admitted_per_minute].to_i.positive?
+      # `pending_trend` compares head/tail thirds of the sparkline; a
+      # transient spike that already drained still leaves the tail
+      # average elevated. Gate on current pending > 0 so a recovered
+      # backlog does not raise a warning.
+      if m[:pending_trend] == :up &&
+         m[:admitted_per_minute].to_i.positive? &&
+         m[:pending_total].to_i.positive?
         hints << Hint.new(
           level: :warn,
           message: "Pending is growing while we are admitting. Inflow > outflow — " \
