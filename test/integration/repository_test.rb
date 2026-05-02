@@ -48,6 +48,7 @@ class RepositoryIntegrationTest < Minitest::Test
     dispatch_policy_partitions
     dispatch_policy_inflight_jobs
     dispatch_policy_tick_samples
+    dispatch_policy_adaptive_concurrency_stats
   ].freeze
 
   def schema_present?

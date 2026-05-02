@@ -10,7 +10,8 @@ class HomeController < ApplicationController
     "high_concurrency"  => HighConcurrencyJob,
     "high_throttle"     => HighThrottleJob,
     "sharded"           => ShardedJob,
-    "fairness_demo"     => FairnessDemoJob
+    "fairness_demo"     => FairnessDemoJob,
+    "adaptive_demo"     => AdaptiveDemoJob
   }.freeze
 
   def index

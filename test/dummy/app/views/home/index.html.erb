@@ -92,6 +92,26 @@
   </p>
 </div>
 
+<h2>Adaptive concurrency (self-tuning cap)</h2>
+
+<div class="card">
+  <h3 style="margin:6px 0;">AdaptiveDemoJob (initial_max=3, target_lag_ms=500)</h3>
+  <%= form_with url: enqueue_many_path(job: "adaptive_demo"), method: :post, local: true do %>
+    <label>tenant</label> <input name="attrs[tenant]" value="acme"><br>
+    <label>count</label>  <input name="count" value="50" size="6"><br>
+    <button>Flood AdaptiveDemoJob</button>
+  <% end %>
+  <p style="font-size:12px;color:#6b7280;">
+    Cap starts at 3 per tenant. Each perform sleeps ~300ms; a burst
+    of 50 will queue up at the adapter, the EWMA queue lag will
+    cross 500ms, and <code>current_max</code> shrinks via 0.95×
+    per observation. A quiet period of 30s lets the cap grow back
+    +1 per fast success. State lives in
+    <code>dispatch_policy_adaptive_concurrency_stats</code> — query
+    it directly to watch the AIMD react in real time.
+  </p>
+</div>
+
 <h2>Sharding (shard_by)</h2>
 
 <div class="card">
