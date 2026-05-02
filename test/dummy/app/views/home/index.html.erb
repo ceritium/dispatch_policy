@@ -1,163 +1,122 @@
-<h1>dispatch_policy dummy <small style="font-size:13px;color:#6b7280;">(<%= @adapter %>)</small></h1>
-
-<p>
-  <a href="/dispatch_policy">→ open dispatch_policy dashboard</a>
-  <% if @adapter == "good_job" %> · <a href="/good_job">→ good_job dashboard</a><% end %>
+<h1>dispatch_policy playground</h1>
+<p class="muted">
+  Every form below enqueues real jobs through the gem. Submit any of
+  them, then watch <a href="/dispatch_policy">the admin dashboard</a>
+  to see the partitions, gates, and tick samples react.
 </p>
 
-<h2>Single enqueue</h2>
+<h2>Single-gate basics</h2>
 
-<div class="card">
-  <h3 style="margin:6px 0;">SlowExternalApiJob (throttle by endpoint)</h3>
-  <%= form_with url: enqueue_path(job: "slow_external_api"), method: :post, local: true do %>
-    <label>endpoint_id</label> <input name="attrs[endpoint_id]" value="ep-1"><br>
-    <label>rate</label>        <input name="attrs[rate]"        value="6" size="6">
-    <label>per (s)</label>     <input name="attrs[per]"         value="60" size="6"><br>
-    <button>Enqueue 1</button>
-  <% end %>
-</div>
+<%= render "dispatch_form",
+  kind:  "slow_external_api",
+  title: "SlowExternalApiJob — :throttle per endpoint",
+  desc:  "Token bucket per ctx[:endpoint_id]. Bursts admit up to the bucket size, then drip at rate/per.",
+  defaults: { endpoint_id: "ep-1", rate: 6, per: 60 } %>
 
-<div class="card">
-  <h3 style="margin:6px 0;">BulkAccountJob (concurrency by account)</h3>
-  <%= form_with url: enqueue_path(job: "bulk_account"), method: :post, local: true do %>
-    <label>account_id</label> <input name="attrs[account_id]" value="acct-1"><br>
-    <label>max_per_account</label> <input name="attrs[max]" value="3" size="6"><br>
-    <button>Enqueue 1</button>
-  <% end %>
-</div>
+<%= render "dispatch_form",
+  kind:  "bulk_account",
+  title: "BulkAccountJob — :concurrency per account",
+  desc:  "Caps in-flight per ctx[:account_id]. New admissions wait until the cap clears.",
+  defaults: { account_id: "acct-1", max: 3 } %>
 
-<div class="card">
-  <h3 style="margin:6px 0;">MixedJob (throttle + concurrency)</h3>
-  <%= form_with url: enqueue_path(job: "mixed"), method: :post, local: true do %>
-    <label>endpoint_id</label> <input name="attrs[endpoint_id]" value="ep-1"><br>
-    <label>account_id</label>  <input name="attrs[account_id]"  value="acct-1"><br>
-    <label>rate</label> <input name="attrs[rate]" value="10" size="6">
-    <label>max</label>  <input name="attrs[max]"  value="2"  size="6"><br>
-    <button>Enqueue 1</button>
-  <% end %>
-</div>
+<%= render "dispatch_form",
+  kind:  "mixed",
+  title: "MixedJob — :throttle + :concurrency on a composite scope",
+  desc:  "Both gates use the policy partition_by 'ep:E|acct:A' so neither bucket nor cap is diluted.",
+  defaults: { endpoint_id: "ep-1", account_id: "acct-1", rate: 10, per: 60, max: 2 } %>
 
-<div class="card">
-  <h3 style="margin:6px 0;">PerformInJob (with delay)</h3>
-  <%= form_with url: enqueue_path(job: "perform_in"), method: :post, local: true do %>
-    <label>key</label>      <input name="attrs[key]" value="k1"><br>
-    <label>delay (s)</label> <input name="delay" value="10" size="6"><br>
-    <button>Enqueue 1</button>
-  <% end %>
-</div>
+<h2>Scheduling</h2>
+
+<%= render "dispatch_form",
+  kind:  "perform_in",
+  title: "PerformInJob — set(wait:) round-trip",
+  desc:  "Schedules each job N seconds in the future. Verifies the gem preserves scheduled_at across the staging round-trip.",
+  defaults: { key: "k1" },
+  default_count: 1,
+  hide_batch: true,
+  show_wait: true %>
+
+<h2>Reliability</h2>
+
+<%= render "dispatch_form",
+  kind:  "retry_flaky",
+  title: "RetryFlakyJob — retry_strategy: :restage",
+  desc:  "Job raises with probability fail_rate. ActiveJob retries; the policy's :restage strategy puts retries back through the gates instead of bypassing them.",
+  defaults: { key: "k1", fail_rate: 0.7 } %>
 
 <h2>Stress tests</h2>
 
-<div class="card">
-  <h3 style="margin:6px 0;">HighConcurrencyJob (concurrency only, max=100, sleep=0.1s)</h3>
-  <%= form_with url: enqueue_many_path(job: "high_concurrency"), method: :post, local: true do %>
-    <label>bucket</label> <input name="attrs[bucket]" value="hot"><br>
-    <label>max</label>    <input name="attrs[max]"    value="100" size="6"><br>
-    <label>count</label>  <input name="count"         value="500" size="6"><br>
-    <button>Flood with HighConcurrencyJob</button>
-  <% end %>
-  <p style="font-size:12px;color:#6b7280;">Watch <code>/dispatch_policy</code> dashboard: <code>in_flight</code> should rise toward <code>max</code>; <code>avg tick</code> should stay low.</p>
-</div>
+<%= render "dispatch_form",
+  kind:  "high_throttle",
+  title: "HighThrottleJob — rate=10k/min, almost unconstrained",
+  desc:  "Bucket fills almost instantly; the limiter is the worker pool. Used to measure tick duration, admit batch saturation, and forwarder throughput under load.",
+  defaults: { endpoint: "hot", rate: 10_000 },
+  default_count: 500 %>
 
-<div class="card">
-  <h3 style="margin:6px 0;">HighThrottleJob (throttle only, rate=10k/min, sleep=0.05s)</h3>
-  <%= form_with url: enqueue_many_path(job: "high_throttle"), method: :post, local: true do %>
-    <label>endpoint</label> <input name="attrs[endpoint]" value="hot"><br>
-    <label>rate</label>     <input name="attrs[rate]"     value="10000" size="8"><br>
-    <label>count</label>    <input name="count"           value="2000"  size="6"><br>
-    <button>Flood with HighThrottleJob</button>
-  <% end %>
-  <p style="font-size:12px;color:#6b7280;">Bucket fills instantly so the limiter is your worker pool: tick should saturate <code>admission_batch_size</code> per partition.</p>
-</div>
+<%= render "dispatch_form",
+  kind:  "high_concurrency",
+  title: "HighConcurrencyJob — max=100, very short jobs",
+  desc:  "max=100 with 100ms perform. Inflight count rises toward 100; tick duration stays low.",
+  defaults: { bucket: "hot", max: 100 },
+  default_count: 500 %>
 
-<h2>Fairness intra-tick</h2>
+<h2>Architecture demos</h2>
 
-<div class="card">
-  <h3 style="margin:6px 0;">FairnessDemoJob (5 tenants, uneven backlog)</h3>
-  <%= form_with url: fairness_demo_flood_path, method: :post, local: true do %>
-    <label>hot tenant count</label> <input name="hot_count"  value="500" size="6"><br>
-    <label>cold tenant count (×4)</label> <input name="cold_count" value="10"  size="6"><br>
-    <button>Flood the unfair workload</button>
-  <% end %>
-  <p style="font-size:12px;color:#6b7280;">
-    Enqueues <code>hot_count</code> jobs for tenant <code>hot</code> and
-    <code>cold_count</code> each for tenants <code>cold-1..cold-4</code>.
-    The policy declares <code>tick_admission_budget&nbsp;30</code> and
-    <code>fairness half_life:&nbsp;30.seconds</code>, so each tick admits
-    ~6 jobs per tenant; cold drain in 1-2 ticks while hot progresses at
-    the capped rate. Watch
-    <code>/dispatch_policy/policies/fairness_demo</code> — the
-    <strong>decayed_admits</strong> column on each partition is the EWMA
-    used to order them inside the tick.
+<%= render "dispatch_form",
+  kind:  "sharded",
+  title: "ShardedJob — shard_by",
+  desc:  "queue_as derives 'shard-N' from account_id; the policy mirrors that as shard_by. Run one DispatchTickLoopJob per shard to admit in parallel.",
+  defaults: { account_id: "acct-A", max: 5 },
+  default_count: 80 %>
+
+<%= render "dispatch_form",
+  kind:  "fairness_demo",
+  title: "FairnessDemoJob — in-tick EWMA reorder + tick_admission_budget",
+  desc:  "Five tenants, fair_share=ceil(30/N). With an uneven backlog, cold tenants drain in 1–2 ticks while the hot one progresses at the capped rate.",
+  defaults: { tenant: "hot" },
+  default_count: 100 %>
+
+<%= render "dispatch_form",
+  kind:  "adaptive_demo",
+  title: "AdaptiveDemoJob — :adaptive_concurrency (self-tuning cap)",
+  desc:  "initial_max=3, target_lag_ms=500. Burst makes the EWMA queue lag exceed target; current_max shrinks via 0.95×. A quiet period of 30s+ grows it back +1 per fast success.",
+  defaults: { tenant: "acme" },
+  default_count: 50 %>
+
+<h2>Storm — multi-partition stress generator</h2>
+
+<%= form_with url: storms_path, method: :post, local: true, html: { class: "dispatch" } do |f| %>
+  <h3>StormJob — flood many tenants with a triangular distribution</h3>
+  <p class="desc">
+    For <em>duration</em> seconds, enqueue the chosen target for many
+    distinct <code>acc_1</code>..<code>acc_N</code> accounts with weight =
+    account number (so <code>acc_N</code> is N× more likely than
+    <code>acc_1</code>). Exercises the admin UI, fairness reorder, and
+    adaptive cap with hundreds of partitions and a skewed distribution.
   </p>
-</div>
-
-<h2>Adaptive concurrency (self-tuning cap)</h2>
-
-<div class="card">
-  <h3 style="margin:6px 0;">AdaptiveDemoJob (initial_max=3, target_lag_ms=500)</h3>
-  <%= form_with url: enqueue_many_path(job: "adaptive_demo"), method: :post, local: true do %>
-    <label>tenant</label> <input name="attrs[tenant]" value="acme"><br>
-    <label>count</label>  <input name="count" value="50" size="6"><br>
-    <button>Flood AdaptiveDemoJob</button>
-  <% end %>
-  <p style="font-size:12px;color:#6b7280;">
-    Cap starts at 3 per tenant. Each perform sleeps ~300ms; a burst
-    of 50 will queue up at the adapter, the EWMA queue lag will
-    cross 500ms, and <code>current_max</code> shrinks via 0.95×
-    per observation. A quiet period of 30s lets the cap grow back
-    +1 per fast success. State lives in
-    <code>dispatch_policy_adaptive_concurrency_stats</code> — query
-    it directly to watch the AIMD react in real time.
-  </p>
-</div>
-
-<h2>Sharding (shard_by)</h2>
-
-<div class="card">
-  <h3 style="margin:6px 0;">ShardedJob (account_id → 4 shards, queue = shard)</h3>
-  <%= form_with url: enqueue_many_path(job: "sharded"), method: :post, local: true do %>
-    <label>account_id</label> <input name="attrs[account_id]" value="acct-A"><br>
-    <label>max</label>        <input name="attrs[max]"        value="5"  size="6"><br>
-    <label>count</label>      <input name="count"             value="80" size="6"><br>
-    <button>Flood with ShardedJob</button>
-  <% end %>
-  <p style="font-size:12px;color:#6b7280;">
-    The job routes itself to <code>shard-N</code> (queue = shard). Launch
-    <code>4.times { |i| DispatchTickLoopJob.perform_later("sharded", "shard-#{i}") }</code>
-    in <code>bin/rails console</code> to enable parallel admission across shards.
-    Watch <code>/dispatch_policy/partitions?policy=sharded</code> with the shard filter.
-  </p>
-</div>
-
-<h2>Bulk enqueue (perform_all_later)</h2>
-
-<div class="card">
-  <%= form_with url: enqueue_many_path(job: "slow_external_api"), method: :post, local: true do %>
-    <label>endpoint_id</label> <input name="attrs[endpoint_id]" value="ep-1"><br>
-    <label>rate</label>        <input name="attrs[rate]"        value="6"  size="6">
-    <label>per (s)</label>     <input name="attrs[per]"         value="60" size="6"><br>
-    <label>count</label>       <input name="count"              value="100" size="6"><br>
-    <button>Enqueue many SlowExternalApiJob</button>
-  <% end %>
-</div>
-
-<div class="card">
-  <%= form_with url: enqueue_many_path(job: "mixed"), method: :post, local: true do %>
-    <label>endpoint_id</label> <input name="attrs[endpoint_id]" value="ep-1"><br>
-    <label>account_id</label>  <input name="attrs[account_id]"  value="acct-1"><br>
-    <label>rate</label> <input name="attrs[rate]" value="10" size="6">
-    <label>max</label>  <input name="attrs[max]"  value="2"  size="6"><br>
-    <label>count</label> <input name="count" value="50" size="6"><br>
-    <button>Enqueue many MixedJob</button>
-  <% end %>
-</div>
-
-<div class="card">
-  <%= form_with url: enqueue_many_path(job: "retry_flaky"), method: :post, local: true do %>
-    <label>key</label>       <input name="attrs[key]"       value="k1"><br>
-    <label>fail_rate</label> <input name="attrs[fail_rate]" value="0.7" size="6"><br>
-    <label>count</label>     <input name="count"            value="20"  size="6"><br>
-    <button>Enqueue many RetryFlakyJob</button>
-  <% end %>
-</div>
+  <div class="fields">
+    <label>
+      target
+      <%= f.select :target,
+            [
+              ["AdaptiveDemoJob",     "adaptive_demo"],
+              ["FairnessDemoJob",     "fairness_demo"],
+              ["HighThrottleJob",     "high_throttle"],
+              ["HighConcurrencyJob",  "high_concurrency"]
+            ] %>
+    </label>
+    <label>
+      num_accounts
+      <%= f.number_field :num_accounts, value: 100, min: 1, max: 2_000 %>
+    </label>
+    <label>
+      duration (s)
+      <%= f.number_field :duration_seconds, value: 60, min: 1, max: 600 %>
+    </label>
+    <label>
+      batch_size
+      <%= f.number_field :batch_size, value: 20, min: 1, max: 200 %>
+    </label>
+    <button type="submit">Start storm</button>
+  </div>
+<% end %>
