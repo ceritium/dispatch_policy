@@ -70,6 +70,28 @@
   <p style="font-size:12px;color:#6b7280;">Bucket fills instantly so the limiter is your worker pool: tick should saturate <code>admission_batch_size</code> per partition.</p>
 </div>
 
+<h2>Fairness intra-tick</h2>
+
+<div class="card">
+  <h3 style="margin:6px 0;">FairnessDemoJob (5 tenants, uneven backlog)</h3>
+  <%= form_with url: fairness_demo_flood_path, method: :post, local: true do %>
+    <label>hot tenant count</label> <input name="hot_count"  value="500" size="6"><br>
+    <label>cold tenant count (×4)</label> <input name="cold_count" value="10"  size="6"><br>
+    <button>Flood the unfair workload</button>
+  <% end %>
+  <p style="font-size:12px;color:#6b7280;">
+    Enqueues <code>hot_count</code> jobs for tenant <code>hot</code> and
+    <code>cold_count</code> each for tenants <code>cold-1..cold-4</code>.
+    The policy declares <code>tick_admission_budget&nbsp;30</code> and
+    <code>fairness half_life:&nbsp;30.seconds</code>, so each tick admits
+    ~6 jobs per tenant; cold drain in 1-2 ticks while hot progresses at
+    the capped rate. Watch
+    <code>/dispatch_policy/policies/fairness_demo</code> — the
+    <strong>decayed_admits</strong> column on each partition is the EWMA
+    used to order them inside the tick.
+  </p>
+</div>
+
 <h2>Sharding (shard_by)</h2>
 
 <div class="card">
