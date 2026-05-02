@@ -26,6 +26,13 @@ namespace :bench do
       load File.expand_path("test/benchmark/bench_#{name}.rb", __dir__)
     end
   end
+
+  desc "Real-adapter end-to-end bench. Defaults to good_job on the dummy DB. " \
+       "Override via BENCH_ADAPTER=solid_queue and/or BENCH_DB_NAME=…. " \
+       "Requires the adapter's tables to exist (run `bin/dummy setup good_job` first)."
+  task :real do
+    load File.expand_path("test/benchmark/bench_real_adapter.rb", __dir__)
+  end
 end
 
 desc "Alias for bench:all"

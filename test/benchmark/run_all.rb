@@ -14,9 +14,12 @@ require_relative "bench_helper"
 Bench.connect!
 Bench.recreate_schema!
 
-# Skip bench_helper.rb itself (it's required by every bench_*.rb).
+# Skip bench_helper.rb (required by every bench_*.rb) and the
+# real-adapter bench (boots the dummy Rails app and needs the dummy DB
+# pre-seeded with good_job/solid_queue tables — runs separately via
+# `rake bench:real`).
 scripts = Dir[File.join(__dir__, "bench_*.rb")]
-            .reject { |p| File.basename(p) == "bench_helper.rb" }
+            .reject { |p| %w[bench_helper.rb bench_real_adapter.rb].include?(File.basename(p)) }
             .sort
 filter  = ARGV.first
 
