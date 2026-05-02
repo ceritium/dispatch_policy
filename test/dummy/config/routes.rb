@@ -3,6 +3,11 @@
 Rails.application.routes.draw do
   root "home#index"
 
+  # New unified card-form endpoint.
+  resources :dispatches, only: :create
+  resources :storms,     only: :create
+
+  # Legacy paths kept so older bookmarks / scripts still work.
   post "/enqueue/:job",      to: "home#enqueue",      as: :enqueue
   post "/enqueue_many/:job", to: "home#enqueue_many", as: :enqueue_many
   post "/fairness_demo",     to: "home#fairness_demo_flood", as: :fairness_demo_flood

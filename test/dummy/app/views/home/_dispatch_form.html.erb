@@ -1,0 +1,38 @@
+<%= form_with url: dispatches_path, method: :post, local: true, html: { class: "dispatch" } do |f| %>
+  <%= f.hidden_field :kind, value: kind %>
+  <h3><%= title %></h3>
+  <p class="desc"><%= desc %></p>
+
+  <div class="fields">
+    <% (defaults || {}).each do |name, value| %>
+      <label>
+        <%= name.to_s %>
+        <%= text_field_tag "attrs[#{name}]", value, size: 8 %>
+      </label>
+    <% end %>
+
+    <% unless local_assigns[:hide_count] %>
+      <label>
+        count
+        <%= number_field_tag :count, local_assigns[:default_count] || 10, min: 1, max: 2000 %>
+      </label>
+    <% end %>
+
+    <% if local_assigns.fetch(:show_wait, false) %>
+      <label>
+        wait (s)
+        <%= number_field_tag :wait_seconds, 0, min: 0 %>
+      </label>
+    <% end %>
+
+    <div style="margin-left: auto; display: flex; gap: 0.8em; align-items: center;">
+      <% unless local_assigns[:hide_batch] %>
+        <label style="flex-direction: row; align-items: center; gap: 0.4em;">
+          <%= check_box_tag :batch, "1", true %>
+          perform_all_later
+        </label>
+      <% end %>
+      <button type="submit" style="margin-left: 0;">Enqueue</button>
+    </div>
+  </div>
+<% end %>
