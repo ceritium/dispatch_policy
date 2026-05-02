@@ -6,6 +6,12 @@
   <div class="dp-stat"><span class="dp-stat-label">In flight</span><span class="dp-stat-value"><%= format_count(@totals[:in_flight]) %></span></div>
 </section>
 
+<%= render "dispatch_policy/shared/hints", hints: @hints %>
+<%= render "dispatch_policy/shared/capacity",
+           capacity: @capacity,
+           pending_trend: @pending_trend,
+           pending_buckets: @sparkline %>
+
 <section class="dp-section">
   <h2>Throughput</h2>
   <table class="dp-table">
@@ -14,13 +20,19 @@
     </thead>
     <tbody>
       <% @windows.each do |label, m| %>
+        <% fail_pct = m[:jobs_admitted].positive? ? (m[:forward_failures].to_f / m[:jobs_admitted] * 100) : 0.0 %>
         <tr>
           <td><strong><%= label %></strong></td>
           <td class="dp-num"><%= format_count(m[:jobs_admitted]) %></td>
           <td class="dp-num"><%= format_count(m[:ticks]) %></td>
           <td class="dp-num"><%= format_duration_ms(m[:avg_duration_ms]) %></td>
           <td class="dp-num"><%= format_duration_ms(m[:max_duration_ms]) %></td>
-          <td class="dp-num <%= "dp-warn" if m[:forward_failures].positive? %>"><%= format_count(m[:forward_failures]) %></td>
+          <td class="dp-num <%= "dp-warn" if fail_pct >= 1.0 %>">
+            <%= format_count(m[:forward_failures]) %>
+            <% if m[:jobs_admitted].positive? && m[:forward_failures].positive? %>
+              <span style="color:#9ca3af; font-size:11px;">(<%= format("%.2f%%", fail_pct) %>)</span>
+            <% end %>
+          </td>
           <td class="dp-num"><%= format_count(m[:partitions_seen]) %></td>
         </tr>
       <% end %>

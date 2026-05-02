@@ -467,7 +467,12 @@ module DispatchPolicy
     end
 
     # Returns time-bucketed series for sparklines. `bucket_seconds` is the
-    # bucket width. Each row: { bucket_at:, jobs_admitted:, ... }.
+    # bucket width. Each row: { bucket_at:, jobs_admitted:, forward_failures:,
+    # pending_total:, ticks: }.
+    #
+    # `pending_total` is the AVERAGE pending observed across the ticks
+    # in that bucket — using AVG (not MAX/last) gives a smoother trend
+    # that's resilient to a single outlier sample dragging the bucket up.
     def tick_samples_buckets(policy_name: nil, since:, bucket_seconds: 60)
       where_sql, params = sample_filter(policy_name, since)
       bucket_param_idx = params.size + 1
@@ -481,6 +486,7 @@ module DispatchPolicy
             to_timestamp(floor(extract(epoch from sampled_at) / $#{bucket_param_idx})::bigint * $#{bucket_param_idx}) AS bucket_at,
             COALESCE(SUM(jobs_admitted), 0)::int AS jobs_admitted,
             COALESCE(SUM(forward_failures), 0)::int AS forward_failures,
+            COALESCE(AVG(pending_total), 0)::int AS pending_total,
             COUNT(*)::int AS ticks
           FROM #{SAMPLES_TABLE}
           #{where_sql}
@@ -491,8 +497,34 @@ module DispatchPolicy
         params
       )
       result.to_a.map do |r|
-        { bucket_at: r["bucket_at"], jobs_admitted: r["jobs_admitted"].to_i,
-          forward_failures: r["forward_failures"].to_i, ticks: r["ticks"].to_i }
+        { bucket_at:        r["bucket_at"],
+          jobs_admitted:    r["jobs_admitted"].to_i,
+          forward_failures: r["forward_failures"].to_i,
+          pending_total:    r["pending_total"].to_i,
+          ticks:            r["ticks"].to_i }
+      end
+    end
+
+    # Direction of a numeric series. Compares the average of the first
+    # third to the last third — robust to noise on the ends.
+    def self.trend_direction(values, threshold_ratio: 0.10)
+      return :flat if values.size < 3
+
+      n      = values.size
+      head   = values.first(n / 3)
+      tail   = values.last(n / 3)
+      head_avg = head.sum.to_f / head.size
+      tail_avg = tail.sum.to_f / tail.size
+
+      return :flat if head_avg.zero? && tail_avg.zero?
+
+      delta_ratio = (tail_avg - head_avg) / [head_avg, 1.0].max
+      if delta_ratio >= threshold_ratio
+        :up
+      elsif delta_ratio <= -threshold_ratio
+        :down
+      else
+        :flat
       end
     end
 

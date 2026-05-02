@@ -1,0 +1,67 @@
+<%
+  capacity = local_assigns.fetch(:capacity)
+  pending_trend = local_assigns.fetch(:pending_trend, :flat)
+  pending_buckets = local_assigns[:pending_buckets]
+
+  jps          = capacity[:admitted_per_second] || (capacity[:admitted_per_minute].to_f / 60.0)
+  target       = capacity[:adapter_target_jps]
+  ratio_jps    = (target && target.positive?) ? jps / target : nil
+  tick_ratio   = (capacity[:tick_max_duration_ms].to_i.positive? ?
+                  capacity[:avg_tick_ms].to_f / capacity[:tick_max_duration_ms] : nil)
+
+  arrow = case pending_trend
+          when :up   then "↑"
+          when :down then "↓"
+          else            "→"
+          end
+%>
+
+<section class="dp-section">
+  <h2>Capacity headroom</h2>
+  <div class="dp-stats">
+    <div class="dp-stat">
+      <span class="dp-stat-label">Admit rate (1m)</span>
+      <span class="dp-stat-value"><%= format("%.1f", jps) %> jobs/sec</span>
+    </div>
+    <% if ratio_jps %>
+      <div class="dp-stat">
+        <span class="dp-stat-label">Of adapter ceiling (<%= target %>/sec)</span>
+        <span class="dp-stat-value <%= "dp-warn" if ratio_jps >= 0.7 %>">
+          <%= format("%.0f%%", ratio_jps * 100) %>
+        </span>
+      </div>
+    <% end %>
+    <div class="dp-stat">
+      <span class="dp-stat-label">Avg tick</span>
+      <span class="dp-stat-value"><%= format_duration_ms(capacity[:avg_tick_ms]) %></span>
+    </div>
+    <% if tick_ratio %>
+      <div class="dp-stat">
+        <span class="dp-stat-label">Of tick_max_duration</span>
+        <span class="dp-stat-value <%= "dp-warn" if tick_ratio >= 0.6 %>">
+          <%= format("%.0f%%", tick_ratio * 100) %>
+        </span>
+      </div>
+    <% end %>
+    <div class="dp-stat">
+      <span class="dp-stat-label">Pending trend (30m)</span>
+      <span class="dp-stat-value <%= "dp-warn" if pending_trend == :up %>">
+        <%= arrow %> <%= pending_trend %>
+      </span>
+    </div>
+  </div>
+
+  <% if pending_buckets && pending_buckets.any? %>
+    <p class="dp-spark">
+      Pending across the last 30 min:
+      <code><%= sparkline(pending_buckets.map { |b| b[:pending_total] }, width: 30) %></code>
+    </p>
+  <% end %>
+  <% if target.nil? %>
+    <p class="dp-hint">
+      Set <code>DispatchPolicy.config.adapter_throughput_target = 3500</code>
+      (jobs/sec) in your initializer to see the admit rate as a percentage.
+      Locally we measure ~3500/sec per worker against good_job; calibrate to your prod adapter.
+    </p>
+  <% end %>
+</section>
