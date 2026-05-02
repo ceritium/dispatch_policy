@@ -19,7 +19,7 @@ Ver `README.md` para la API y los ejemplos.
 v0.1 (en master). Todo el flujo principal está implementado y testeado.
 Lo pendiente está en `ideas.md` con su porqué.
 
-65 tests / 149 assertions. `bundle exec rake test` desde la raíz.
+69 tests / 163 assertions. `bundle exec rake test` desde la raíz.
 
 ## Arquitectura — 4 tablas
 
@@ -63,6 +63,20 @@ dispatch_policy_tick_samples     una fila por Tick.run para métricas
 - **`shard_by` debe ser ≥ tan grueso como el `partition_by` del
   throttle más restrictivo.** Si no, el bucket se duplica entre
   shards y el rate efectivo es `rate × N_shards`.
+- **`BulkEnqueue.perform_all_later` chequea `Bypass.active?`** y delega
+  a `super` cuando está activo. Sin esto, la llamada que hace
+  `Forwarder.dispatch` (deserializa + `perform_all_later` bajo Bypass)
+  re-stageaba en bucle infinito. El fix vive en `job_extension.rb`;
+  hay un test de regresión en `test/integration/tick_atomic_test.rb`
+  (`test_full_tick_with_kwargs_does_not_re_stage`) que falla si lo
+  quitas.
+- **`JobExtension.ensure_arguments_materialized!(job)`** se llama
+  antes de leer `job.arguments` tanto en el path single como en el
+  bulk. Razón: `klass.deserialize(payload)` solo setea
+  `@serialized_arguments`; el getter público `arguments` es un
+  `attr_accessor` puro que devuelve `@arguments = []` hasta que
+  `perform_now` dispara la materialización privada. Sin esta defensa
+  el context proc recibía `[]` y caía a sus defaults.
 - **`Forwarder.dispatch` corre dentro de la TX de admisión.** El
   adapter (good_job / solid_queue) usa
   `ActiveRecord::Base.connection`, así que su INSERT en `good_jobs`
