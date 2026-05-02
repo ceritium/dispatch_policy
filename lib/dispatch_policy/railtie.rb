@@ -19,10 +19,14 @@ module DispatchPolicy
       end
     end
 
-    initializer "dispatch_policy.migration_paths" do |app|
-      gem_root = File.expand_path("../..", __dir__)
-      app.config.paths["db/migrate"] << File.join(gem_root, "db/migrate") if File.directory?(File.join(gem_root, "db/migrate"))
-    end
+    # Hosts copy the gem's migration into their own db/migrate via
+    # `rails railties:install:migrations` (or hand-write a cutover
+    # migration like opstasks did). We deliberately do NOT auto-merge
+    # the gem's db/migrate into the host's lookup paths — that
+    # surfaces an `ActiveRecord::DuplicateMigrationNameError` for
+    # any host already carrying a migration named
+    # `CreateDispatchPolicyTables` (e.g. one copied from the
+    # upstream tick-hardening branch during a cutover).
 
     config.after_initialize do
       DispatchPolicy.warn_unsupported_adapter
