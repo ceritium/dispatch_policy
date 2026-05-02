@@ -33,6 +33,12 @@ namespace :bench do
   task :real do
     load File.expand_path("test/benchmark/bench_real_adapter.rb", __dir__)
   end
+
+  desc "Stretch every path to its breaking point. Set BENCH_DB_NAME=dispatch_policy_dummy " \
+       "for end-to-end limits including the good_job INSERT; default DB stays gem-only."
+  task :limits do
+    load File.expand_path("test/benchmark/bench_limits.rb", __dir__)
+  end
 end
 
 desc "Alias for bench:all"
