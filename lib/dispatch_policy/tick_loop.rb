@@ -50,7 +50,11 @@ module DispatchPolicy
           sweep!
         end
 
-        sleep(config.idle_pause) if admitted.zero?
+        if admitted.zero?
+          sleep(config.idle_pause)
+        elsif config.busy_pause.to_f.positive?
+          sleep(config.busy_pause)
+        end
       end
     end
 

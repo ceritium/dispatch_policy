@@ -7,6 +7,7 @@ module DispatchPolicy
                   :partition_batch_size,
                   :admission_batch_size,
                   :idle_pause,
+                  :busy_pause,
                   :partition_inactive_after,
                   :inflight_stale_after,
                   :inflight_heartbeat_interval,
@@ -31,6 +32,12 @@ module DispatchPolicy
       @partition_batch_size      = 50
       @admission_batch_size      = 100
       @idle_pause                = 0.5
+      # Sleep between iterations when the previous tick admitted > 0
+      # jobs. 0 (default) preserves the original "busy = no pause"
+      # behavior. Set to a small value (e.g. 0.02) to back off the DB
+      # when several TickLoops compete for connections; the per-loop
+      # throughput ceiling becomes admission_batch_size / busy_pause.
+      @busy_pause                = 0.0
       @partition_inactive_after  = 24 * 60 * 60
       @inflight_stale_after      = 5 * 60
       @inflight_heartbeat_interval = 30
