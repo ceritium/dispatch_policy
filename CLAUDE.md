@@ -1,208 +1,206 @@
-# dispatch_policy — guía para futuras sesiones
+# dispatch_policy — guide for future sessions
 
-Resumen mínimo para retomar el proyecto sin recargar la memoria entera.
-La verdad está en el código + git log + README; este archivo es
-**solo** lo que NO es derivable leyendo eso.
+Minimal cheat sheet to pick up the project without rehydrating the
+whole memory. The truth lives in the code, git log, and README; this
+file is **only** what is NOT derivable by reading those.
 
-## Qué es
+## What it is
 
-Gema Rails que actúa como **admission control por partición** sobre
-ActiveJob, persistido en Postgres. Intercepta `perform_later`, stagea
-en una tabla intermedia, y un *tick loop* periódico decide cuántos jobs
-liberar al adapter real (`good_job` / `solid_queue`) según gates
-declarados (`throttle`, `concurrency`).
+Rails gem that acts as **per-partition admission control** over
+ActiveJob, persisted in Postgres. It intercepts `perform_later`,
+stages the job in an intermediate table, and a periodic *tick loop*
+decides how many jobs to release to the real adapter (`good_job` /
+`solid_queue`) according to declared gates (`throttle`, `concurrency`).
 
-Ver `README.md` para la API y los ejemplos.
+See `README.md` for the API and examples.
 
-## Estado
+## Status
 
-v0.1 (en master). Todo el flujo principal está implementado y testeado.
-Lo pendiente está en `ideas.md` con su porqué.
+v0.1 (on master). The whole main flow is implemented and tested.
+What's pending lives in `ideas.md` with the rationale.
 
-101 tests / 225 assertions. `bundle exec rake test` desde la raíz.
+101 tests / 225 assertions. `bundle exec rake test` from the root.
 
-## Arquitectura — 4 tablas
+## Architecture — 4 tables
 
 ```
-dispatch_policy_staged_jobs      jobs interceptados, esperando admisión
-dispatch_policy_partitions       una fila por (policy, partition_key)
+dispatch_policy_staged_jobs      intercepted jobs awaiting admission
+dispatch_policy_partitions       one row per (policy, partition_key)
                                  — gate_state (token bucket), shard,
                                  last_checked_at, next_eligible_at, …
-dispatch_policy_inflight_jobs    jobs admitidos que están corriendo
-                                 — heartbeat_at lo refresca un thread
-dispatch_policy_tick_samples     una fila por Tick.run para métricas
+dispatch_policy_inflight_jobs    admitted jobs currently running
+                                 — heartbeat_at refreshed by a thread
+dispatch_policy_tick_samples     one row per Tick.run for metrics
                                  (operator decisions panel)
 ```
 
-## Flujo
+## Flow
 
 1. `MyJob.perform_later(args)` → `JobExtension.around_enqueue_for` →
-   `Repository.stage!` (INSERT staged + UPSERT partition con ctx
-   refrescado y shard pinned-on-first-write).
-2. Un `DispatchTickLoopJob` corre `TickLoop.run(policy_name:, shard:)`.
-3. Cada Tick: `Repository.claim_partitions` → para cada partición,
-   `Pipeline.call(ctx, partition)` → **una sola TX** que hace
+   `Repository.stage!` (INSERT staged + UPSERT partition with
+   refreshed ctx and shard pinned-on-first-write).
+2. A `DispatchTickLoopJob` runs `TickLoop.run(policy_name:, shard:)`.
+3. Each Tick: `Repository.claim_partitions` → for each partition,
+   `Pipeline.call(ctx, partition)` → **a single TX** doing
    `Repository.claim_staged_jobs!` (DELETE … RETURNING) +
-   pre-INSERT en `inflight_jobs` + `Forwarder.dispatch` (re-enqueue
-   al adapter con `Bypass.with`). El adapter PG-backed comparte la
-   conexión, así que su INSERT entra en la misma TX.
-4. El worker del adapter ejecuta el job: `InflightTracker.track`
-   (around_perform) hace INSERT idempotente en `inflight_jobs`,
-   spawn un thread de heartbeat, en `ensure` lo cancela y DELETE.
+   pre-INSERT in `inflight_jobs` + `Forwarder.dispatch` (re-enqueue
+   to the adapter under `Bypass.with`). The PG-backed adapter shares
+   the connection, so its INSERT joins the same TX.
+4. The adapter's worker runs the job: `InflightTracker.track`
+   (around_perform) idempotently INSERTs into `inflight_jobs`,
+   spawns a heartbeat thread, and on `ensure` cancels it and DELETEs.
 
-## Invariantes — no romper sin pensar
+## Invariants — don't break without thinking
 
-- **`partition_key` identifica una partición; `shard` es metadata
-  de routing.** El shard se pinea en el primer write
-  (`COALESCE(EXCLUDED.shard, partitions.shard)`) para que las
-  particiones no salten entre tick workers.
-- **`partition_by` es a nivel policy y obligatorio.** Una sola
-  declaración `partition_by ->(ctx) { … }` en el bloque de la
-  policy. El `partition_key` del staged_job y la
-  `inflight_partition_key` del gate de concurrency comparten ese
-  mismo valor canónico → ningún gate sufre dilución. **Ya no hay
-  `partition_by:` per-gate**. Si se omite, `Policy#validate!` lanza
-  `InvalidPolicy: partition_by required`. Para necesidades reales
-  de gates con scopes distintos, usar policies separadas.
-- **Los gates NO son obligatorios.** Una policy con `partition_by`
-  y sin gates es válida — el pipeline devuelve `admit_count =
-  max_budget`, y la fairness intra-tick (decay reorder + fair_share)
-  sigue actuando. Útil para "reparte admisiones entre N tenants sin
-  rate-limit individual". Sin un gate de concurrency tampoco hace
-  falta `dispatch_policy_inflight_tracking` en el job.
-- **`partitions.context` se refresca en cada `perform_later`** vía
-  UPSERT. Los gates leen ese ctx, no el de `staged_jobs.context`
-  (que es histórico). Esto permite que un cambio en la DB del host
-  (p.ej. nuevo `max_per_account`) tome efecto al siguiente enqueue.
-- **`shard_by` debe ser ≥ tan grueso como el `partition_by` del
-  throttle más restrictivo.** Si no, el bucket se duplica entre
-  shards y el rate efectivo es `rate × N_shards`.
-- **`BulkEnqueue.perform_all_later` chequea `Bypass.active?`** y delega
-  a `super` cuando está activo. Sin esto, la llamada que hace
-  `Forwarder.dispatch` (deserializa + `perform_all_later` bajo Bypass)
-  re-stageaba en bucle infinito. El fix vive en `job_extension.rb`;
-  hay un test de regresión en `test/integration/tick_atomic_test.rb`
-  (`test_full_tick_with_kwargs_does_not_re_stage`) que falla si lo
-  quitas.
-- **`JobExtension.ensure_arguments_materialized!(job)`** se llama
-  antes de leer `job.arguments` tanto en el path single como en el
-  bulk. Razón: `klass.deserialize(payload)` solo setea
-  `@serialized_arguments`; el getter público `arguments` es un
-  `attr_accessor` puro que devuelve `@arguments = []` hasta que
-  `perform_now` dispara la materialización privada. Sin esta defensa
-  el context proc recibía `[]` y caía a sus defaults.
-- **`Forwarder.dispatch` corre dentro de la TX de admisión.** El
-  adapter (good_job / solid_queue) usa
-  `ActiveRecord::Base.connection`, así que su INSERT en `good_jobs`
-  / `solid_queue_jobs` participa en la misma transacción que el
-  DELETE de `staged_jobs` y el INSERT de `inflight_jobs`. Cualquier
-  excepción (deserialize, adapter, network) revierte todo
-  atómicamente — no hay ventana de pérdida entre el commit de
-  admisión y el enqueue al adapter. **No reintroduzcas `unclaim!`
-  ni `preinserted_inflight_ids`**: el rollback hace ese trabajo.
-  Si soportas un adapter no-PG en el futuro, antes piensa cómo
-  garantizar at-least-once sin esta invariante.
-- **Adapter no-PG = warning al boot, no hard-fail.** El railtie
-  llama a `DispatchPolicy.warn_unsupported_adapter` en
-  `after_initialize`. Si el host usa Sidekiq/Resque, se loguea un
-  warning explicando que la atomicidad se pierde. Es deliberado:
-  un adapter PG-backed custom (no detectado) puede seguir
-  funcionando, y queremos no romper su deploy.
-- **`config.database_role`**: para Rails multi-DB (p.ej.
-  solid_queue con DB separada), define el role contra el que se
-  abre la TX de admisión. `Repository.with_connection` envuelve la
-  TX en `connected_to(role:)` cuando está fijado. Las tablas de
-  staging y la del adapter deben estar en la misma DB para que la
-  atomicidad funcione.
-- **Todos los jobs admitidos crean una fila en `inflight_jobs`**,
-  tengan o no gate de concurrency. La key cambia: con concurrency,
-  la key del gate (coarse, agrega cross-staged-partition); sin
-  concurrency, la `partition_key` del staged. La UI cuenta por
-  `policy_name` y siempre da un valor real.
-- **Fairness intra-tick = orden + cap, NO se mezcla con la
-  selección.** `claim_partitions` sigue ordenando por
-  `last_checked_at NULLS FIRST, id` (anti-stagnation: cada partición
-  con pending se procesa cada ⌈N/B⌉ ticks). Una vez claimed, el Tick
-  las reordena en memoria por `decayed_admits ASC` (EWMA con
-  half_life = 60s default) y aplica `fair_share = ceil(tick_cap / N)`
-  como techo per partición. **No reintroduzcas decayed_admits en el
-  ORDER BY del SELECT FOR UPDATE** — eso rompe la garantía
-  anti-stagnation cuando hay > batch_size particiones frescas.
-- **El cap global del tick gana al floor anti-stagnation per-tick.**
-  Si `tick_admission_budget < N_claimed`, algunas particiones admiten
-  0 en este tick. NO se les fuerza un floor de 1 (eso rompería el
-  cap). La fairness viene de claim_partitions: como sus
-  `last_checked_at` se bumpean al ser claimed, el siguiente tick las
-  pone al frente.
-- **El decay update se hace en la misma TX que el admit.** En
-  `record_partition_admit!`, si `half_life_seconds` está fijado, el
-  UPDATE incluye `decayed_admits = decayed_admits * exp(-Δt/τ) +
-  admitted` y `decayed_admits_at = now()`. Mismo lock de fila que ya
-  teníamos. `bulk_record_partition_denies!` NO toca el decay (en
-  deny no hubo admisión).
-- **`claim_staged_jobs!` requiere `limit > 0`** (ahora es la
-  vía solo-admit). El path de deny puro va por
-  `Repository.bulk_record_partition_denies!`: el Tick acumula
-  todos los deny del lote y los flushea en un único
-  `UPDATE…FROM(VALUES…)` al final, en vez de N statements per
-  partición. La equivalencia per-fila (sin agregación
-  cross-partición) preserva la corrección. Lo crítico es no
-  perder el `gate_state || patch` (jsonb merge) — un test de
-  integración bloquea el caso "el patch sobreescribe claves
-  pre-existentes".
+- **`partition_key` identifies a partition; `shard` is routing
+  metadata.** The shard is pinned on first write
+  (`COALESCE(EXCLUDED.shard, partitions.shard)`) so partitions don't
+  jump between tick workers.
+- **`partition_by` is policy-level and required.** A single
+  declaration `partition_by ->(ctx) { … }` in the policy block. The
+  staged_job's `partition_key` and the concurrency gate's
+  `inflight_partition_key` share that same canonical value → no gate
+  suffers scope dilution. **There is no per-gate `partition_by:`
+  anymore.** If omitted, `Policy#validate!` raises
+  `InvalidPolicy: partition_by required`. For genuinely different
+  per-gate scopes, use separate policies.
+- **Gates are NOT required.** A policy with `partition_by` and no
+  gates is valid — the pipeline returns `admit_count = max_budget`
+  and the in-tick fairness reorder (decay + fair_share) still
+  applies. Useful for "balance N tenants without rate-limiting any
+  of them". Without a concurrency gate the job doesn't need
+  `dispatch_policy_inflight_tracking` either.
+- **`partitions.context` is refreshed on every `perform_later`** via
+  UPSERT. Gates read that ctx, NOT `staged_jobs.context` (which is
+  historical). This lets a change in the host DB (e.g. new
+  `max_per_account`) take effect on the next enqueue.
+- **`shard_by` must be ≥ as coarse as the most restrictive throttle's
+  scope.** If not, the bucket duplicates across shards and the
+  effective rate becomes `rate × N_shards`.
+- **`BulkEnqueue.perform_all_later` checks `Bypass.active?`** and
+  delegates to `super` when active. Without it, the call from
+  `Forwarder.dispatch` (deserialize + `perform_all_later` under
+  Bypass) re-staged in an infinite loop. The fix lives in
+  `job_extension.rb`; a regression test in
+  `test/integration/tick_atomic_test.rb`
+  (`test_full_tick_with_kwargs_does_not_re_stage`) fails if you
+  remove it.
+- **`JobExtension.ensure_arguments_materialized!(job)`** is called
+  before reading `job.arguments` in both the single and bulk paths.
+  Reason: `klass.deserialize(payload)` only sets
+  `@serialized_arguments`; the public `arguments` getter is a plain
+  `attr_accessor` returning `@arguments = []` until `perform_now`
+  triggers private materialization. Without this defense the context
+  proc receives `[]` and falls back to its defaults.
+- **`Forwarder.dispatch` runs INSIDE the admission TX.** The adapter
+  (good_job / solid_queue) uses `ActiveRecord::Base.connection`, so
+  its INSERT into `good_jobs` / `solid_queue_jobs` joins the same
+  transaction as the DELETE from `staged_jobs` and the INSERT into
+  `inflight_jobs`. Any exception (deserialize, adapter, network)
+  rolls everything back atomically — no loss window between admission
+  COMMIT and adapter enqueue. **Do not reintroduce `unclaim!` or
+  `preinserted_inflight_ids`**: TX rollback covers that. If you ever
+  support a non-PG adapter, think first about how to keep
+  at-least-once without this invariant.
+- **Non-PG adapter = warn at boot, no hard-fail.** The railtie calls
+  `DispatchPolicy.warn_unsupported_adapter` in `after_initialize`.
+  If the host runs Sidekiq/Resque, a warning explains atomicity is
+  lost. Deliberate: a custom PG-backed adapter (not detected) can
+  still work, and we don't want to break its deploy.
+- **`config.database_role`**: for Rails multi-DB (e.g. solid_queue
+  with a separate DB), sets the role the admission TX is opened
+  against. `Repository.with_connection` wraps the TX in
+  `connected_to(role:)` when set. Staging tables and the adapter's
+  table must live in the same DB for atomicity to hold.
+- **Every admitted job creates a row in `inflight_jobs`**, whether or
+  not there's a concurrency gate. The key changes: with concurrency,
+  the gate's key (coarse, aggregates cross-staged-partition); without,
+  the staged `partition_key`. The UI counts by `policy_name` and
+  always reports a real value.
+- **In-tick fairness = ordering + cap, NOT mixed with selection.**
+  `claim_partitions` still orders by `last_checked_at NULLS FIRST,
+  id` (anti-stagnation: each partition with pending is processed
+  every ⌈N/B⌉ ticks). Once claimed, the Tick reorders them in
+  memory by `decayed_admits ASC` (EWMA, default `half_life = 60s`)
+  and applies `fair_share = ceil(tick_cap / N)` as the per-partition
+  ceiling. **Do not reintroduce `decayed_admits` into the SELECT FOR
+  UPDATE's ORDER BY** — that breaks the anti-stagnation guarantee
+  when there are > batch_size fresh partitions.
+- **The global tick cap wins over the anti-stagnation per-tick
+  floor.** If `tick_admission_budget < N_claimed`, some partitions
+  admit 0 this tick. We do NOT force a floor of 1 (that would break
+  the cap). Fairness comes from claim_partitions: their
+  `last_checked_at` is bumped on claim, so the next tick puts them
+  at the front.
+- **The decay update happens inside the admit TX.** In
+  `record_partition_admit!`, when `half_life_seconds` is set, the
+  UPDATE includes `decayed_admits = decayed_admits * exp(-Δt/τ) +
+  admitted` and `decayed_admits_at = now()`. Same row lock we already
+  hold. `bulk_record_partition_denies!` does NOT touch the decay
+  (no admission means no increment).
+- **`claim_staged_jobs!` requires `limit > 0`** (it's now the
+  admit-only path). The pure-deny path goes through
+  `Repository.bulk_record_partition_denies!`: the Tick accumulates
+  all denies in the batch and flushes them with a single
+  `UPDATE…FROM(VALUES…)` at the end, instead of N per-partition
+  statements. Per-row equivalence (no cross-partition aggregation)
+  preserves correctness. The critical part is not losing the
+  `gate_state || patch` (jsonb merge) — an integration test pins
+  the case "the patch must not overwrite pre-existing keys".
 
-## Cosas que romper rompe la UI
+## Things whose break breaks the UI
 
-- El layout no usa Turbo (lo removí por una colisión con
-  `<meta http-equiv="refresh">`). El usuario añadió un picker de
-  auto-refresh en sessionStorage. Si reintroduces Turbo, recuerda
-  que el setTimeout vanilla puede competir con `Turbo.visit`.
-- `lib/` NO se autorrecarga en Rails dev. Cualquier cambio en
-  `lib/dispatch_policy/*` requiere reiniciar foreman.
-- Foreman pone `PORT=5000` por defecto. En macOS el puerto 5000
-  es AirPlay → 403. El Procfile tiene `-p 3000` literal.
+- The layout reuses Turbo (re-added after the meta-refresh
+  collision). The user added an auto-refresh picker in
+  sessionStorage. If you mess with `Turbo.visit`, remember the
+  vanilla `setTimeout` can race the visit — there's an in-flight
+  guard for that.
+- `lib/` does NOT autoload in Rails dev. Any change under
+  `lib/dispatch_policy/*` requires restarting foreman.
+- Foreman defaults `PORT=5000`. On macOS port 5000 is AirPlay → 403.
+  The Procfile pins `-p 3000`.
 
-## Cómo desarrollar
+## How to develop
 
 ```bash
-# Arrancar dummy app (web + worker + tick) con foreman
-bin/dummy setup good_job        # crea DB y migra
+# Start the dummy app (web + worker + tick) with foreman
+bin/dummy setup good_job        # creates the DB and migrates
 DUMMY_ADAPTER=good_job bundle exec foreman start
 
-# Endpoints útiles
-http://localhost:3000/                       # forms para encolar
+# Useful endpoints
+http://localhost:3000/                       # forms to enqueue
 http://localhost:3000/dispatch_policy        # dashboard
 
 # Tests
-bundle exec rake test                        # 61 runs / 137 asserts
+bundle exec rake test                        # 101 runs / 225 asserts
 
-# Si añades una columna o tabla:
-#   1. Edita db/migrate/20260501000001_create_dispatch_policy_tables.rb
-#   2. Edita lib/generators/.../create_dispatch_policy_tables.rb.tt
-#   3. Para el dummy en vivo, ALTER TABLE manualmente (no hay migración
-#      incremental porque el v0.1 es una sola migración)
-#   4. test/integration/repository_test.rb#schema_present? detecta drift
-#      por columnas conocidas; añade la nueva al check.
+# When you add a column or table:
+#   1. Edit db/migrate/20260501000001_create_dispatch_policy_tables.rb
+#   2. Edit lib/generators/.../create_dispatch_policy_tables.rb.tt
+#   3. For the live dummy app, ALTER TABLE manually (no incremental
+#      migrations because v0.1 ships a single migration)
+#   4. test/integration/repository_test.rb#schema_present? detects
+#      drift via known columns; add the new one to the check.
 ```
 
-## Queries de debug útiles
+## Useful debug queries
 
 ```sql
--- Distribución de partitions por policy/shard, con pending y lifetime
+-- Distribution of partitions per policy/shard with pending and lifetime
 SELECT policy_name, shard, status, count(*) AS partitions,
        sum(pending_count) AS pending, sum(total_admitted) AS lifetime
 FROM dispatch_policy_partitions
 GROUP BY policy_name, shard, status
 ORDER BY pending DESC;
 
--- Particiones en backoff ahora mismo
+-- Partitions currently in backoff
 SELECT policy_name, partition_key,
        gate_state -> 'throttle' ->> 'tokens' AS tokens,
        (next_eligible_at - now()) AS time_left
 FROM dispatch_policy_partitions
 WHERE next_eligible_at > now();
 
--- Tick samples del último minuto
+-- Tick samples for the last minute
 SELECT policy_name, count(*) AS ticks, sum(jobs_admitted) AS admitted,
        avg(duration_ms)::int AS avg_ms
 FROM dispatch_policy_tick_samples
@@ -210,21 +208,22 @@ WHERE sampled_at > now() - interval '1 minute'
 GROUP BY policy_name;
 ```
 
-## Qué hay en `ideas.md`
+## What's in `ideas.md`
 
-Cosas detectadas pero aplazadas con su razonamiento. Léelo antes de
-proponer una mejora "nueva" — probablemente ya está anotada.
+Detected items, deferred with their rationale. Read it before
+proposing a "new" improvement — likely it's already noted.
 
-Hoy contiene:
-- Sweeper más agresivo de particiones huérfanas con `pending=0`
-- Revisar acoplamiento entre `inflight_heartbeat_interval`,
-  `inflight_stale_after` y `sweep_every_ticks`
+Currently:
+- More aggressive sweeper for orphan partitions with `pending=0`
+- Revisit the coupling between `inflight_heartbeat_interval`,
+  `inflight_stale_after` and `sweep_every_ticks`
 
-## Convenciones del repo
+## Repo conventions
 
-- Tests unit en `test/unit/`, integration (con Postgres) en
-  `test/integration/`. Los integration se skipean si no hay DB.
-- Mensajes de commit en inglés, en cuerpo se explica el **por qué**
-  no solo el qué. Co-Author tag al final.
-- El usuario edita la dummy app (jobs de stress, layout) entre mis
-  commits — respeta sus modificaciones.
+- Unit tests in `test/unit/`, integration (with Postgres) in
+  `test/integration/`. Integration tests skip when no DB is
+  available.
+- Commit messages in English; the body explains the **why**, not
+  just the what. Co-Author tag at the end.
+- The user edits the dummy app (stress jobs, layout) between my
+  commits — respect those modifications.
