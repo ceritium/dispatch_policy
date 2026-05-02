@@ -9,7 +9,8 @@ class HomeController < ApplicationController
     "retry_flaky"       => RetryFlakyJob,
     "high_concurrency"  => HighConcurrencyJob,
     "high_throttle"     => HighThrottleJob,
-    "sharded"           => ShardedJob
+    "sharded"           => ShardedJob,
+    "fairness_demo"     => FairnessDemoJob
   }.freeze
 
   def index
@@ -45,5 +46,29 @@ class HomeController < ApplicationController
     end
 
     redirect_to root_path, notice: "Enqueued #{count} × #{job_class}."
+  end
+
+  # Builds an intentionally uneven backlog so the in-tick fairness
+  # ordering is visible. One tenant gets `hot_count` jobs; four others
+  # get `cold_count` each. With FairnessDemoJob's tick_admission_budget,
+  # cold tenants drain in 1-2 ticks while the hot one progresses at the
+  # capped rate.
+  def fairness_demo_flood
+    hot_count  = Integer(params.fetch(:hot_count, 500))
+    cold_count = Integer(params.fetch(:cold_count, 10))
+
+    plan = [["hot", hot_count]] +
+           %w[cold-1 cold-2 cold-3 cold-4].map { |t| [t, cold_count] }
+
+    plan.each do |tenant, n|
+      jobs = n.times.map { |i| FairnessDemoJob.new("tenant" => tenant, "seq" => i) }
+      ActiveJob.perform_all_later(jobs)
+    end
+
+    total = hot_count + cold_count * 4
+    redirect_to root_path,
+                notice: "Enqueued #{total} FairnessDemoJob across 5 tenants " \
+                        "(1 × #{hot_count} hot + 4 × #{cold_count} cold). " \
+                        "Watch /dispatch_policy/policies/fairness_demo."
   end
 end
