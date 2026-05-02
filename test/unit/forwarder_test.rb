@@ -37,29 +37,25 @@ class ForwarderTest < Minitest::Test
   end
 
   def test_dispatch_uses_perform_all_later_for_immediate_rows
+    # We assert "one perform_all_later call" by adding a native
+    # enqueue_all to the adapter — ActiveJob's perform_all_later prefers
+    # enqueue_all when present. Without it, the fallback loops per-job
+    # enqueue and we'd have no way to distinguish "one bulk call" from
+    # N per-row calls.
     received_bulk = []
-    received_single = []
-    original_bulk = ActiveJob.singleton_class.instance_method(:perform_all_later)
-    ActiveJob.singleton_class.define_method(:perform_all_later) do |jobs|
+    FwdGoodJob.queue_adapter.singleton_class.define_method(:enqueue_all) do |jobs|
       received_bulk << [DispatchPolicy::Bypass.active?, jobs.map(&:class).map(&:name)]
       jobs.each { |j| j.successfully_enqueued = true if j.respond_to?(:successfully_enqueued=) }
-      jobs
-    end
-    FwdGoodJob.queue_adapter.singleton_class.alias_method(:__orig_enqueue, :enqueue)
-    FwdGoodJob.queue_adapter.singleton_class.define_method(:enqueue) do |job|
-      received_single << job.class.name
-      __orig_enqueue(job)
+      jobs.size
     end
 
     rows = [staged_row(FwdGoodJob, "a"), staged_row(FwdGoodJob, "b")]
     DispatchPolicy::Forwarder.dispatch(rows)
 
-    assert_equal 1, received_bulk.size, "all immediate rows must go through one perform_all_later call"
+    assert_equal 1, received_bulk.size, "all immediate rows must go through one bulk enqueue_all call"
     assert_equal [true, ["ForwarderTest::GoodJob", "ForwarderTest::GoodJob"]], received_bulk.first
-    assert_empty received_single, "no per-row enqueue should be called for immediate rows"
   ensure
-    ActiveJob.singleton_class.define_method(:perform_all_later, original_bulk)
-    FwdGoodJob.queue_adapter.singleton_class.alias_method(:enqueue, :__orig_enqueue) if FwdGoodJob.queue_adapter.singleton_class.method_defined?(:__orig_enqueue)
+    FwdGoodJob.queue_adapter.singleton_class.send(:remove_method, :enqueue_all) if FwdGoodJob.queue_adapter.singleton_class.method_defined?(:enqueue_all)
   end
 
   def test_dispatch_uses_per_row_enqueue_for_scheduled_rows
@@ -85,32 +81,46 @@ class ForwarderTest < Minitest::Test
   # the surrounding admission TX can roll back. There is no per-row failure
   # return value anymore — compensation (unclaim, delete inflight) is gone
   # because TX rollback handles it for free.
-  def test_dispatch_propagates_bulk_raise_to_caller
-    original_bulk = ActiveJob.singleton_class.instance_method(:perform_all_later)
-    ActiveJob.singleton_class.define_method(:perform_all_later) { |_jobs| raise "boom" }
+  #
+  # We deliberately stub the adapter (not ActiveJob.perform_all_later
+  # itself). Stubbing the singleton method on the ActiveJob module via
+  # define_method interacts badly with the prepended BulkEnqueue module:
+  # `instance_method` after the prepend returns BulkEnqueue's body, and
+  # restoring it with `define_method` shadows the gem's original on the
+  # singleton class, breaking the super chain for subsequent tests.
+  def test_dispatch_propagates_per_row_failures_to_caller
+    FwdBoomJob.queue_adapter.singleton_class.alias_method(:__orig_enqueue, :enqueue)
+    FwdBoomJob.queue_adapter.singleton_class.define_method(:enqueue) { |_job| raise "boom" }
 
     rows = [staged_row(FwdBoomJob, "ajid-99")]
+    # ActiveJob.perform_all_later (the version BulkEnqueue delegates to
+    # via super under Bypass) loops adapter.enqueue. A non-EnqueueError
+    # propagates out; that's what we want callers to see.
     err = assert_raises(RuntimeError) { DispatchPolicy::Forwarder.dispatch(rows) }
     assert_equal "boom", err.message
   ensure
-    ActiveJob.singleton_class.define_method(:perform_all_later, original_bulk)
+    FwdBoomJob.queue_adapter.singleton_class.alias_method(:enqueue, :__orig_enqueue) if FwdBoomJob.queue_adapter.singleton_class.method_defined?(:__orig_enqueue)
   end
 
   def test_dispatch_raises_when_bulk_soft_fails_some_jobs
-    original_bulk = ActiveJob.singleton_class.instance_method(:perform_all_later)
-    ActiveJob.singleton_class.define_method(:perform_all_later) do |jobs|
-      # Simulate an adapter that returns without raising but only enqueued
-      # the first job — perform_all_later's documented contract.
-      jobs.first.successfully_enqueued = true if jobs.first.respond_to?(:successfully_enqueued=)
-      jobs.last.successfully_enqueued  = false if jobs.last.respond_to?(:successfully_enqueued=)
-      jobs
+    # Adapter raises EnqueueError on the second call. ActiveJob's
+    # perform_all_later catches EnqueueError per-row and sets
+    # successfully_enqueued? = false on the affected job, returning
+    # without raising. Forwarder must detect and convert that into
+    # EnqueueFailed so the admission TX rolls back.
+    call_count = 0
+    FwdGoodJob.queue_adapter.singleton_class.alias_method(:__orig_enqueue, :enqueue)
+    FwdGoodJob.queue_adapter.singleton_class.define_method(:enqueue) do |job|
+      call_count += 1
+      raise ActiveJob::EnqueueError, "second slot full" if call_count == 2
+      __orig_enqueue(job)
     end
 
     rows = [staged_row(FwdGoodJob, "ok"), staged_row(FwdGoodJob, "nope")]
     err = assert_raises(DispatchPolicy::EnqueueFailed) { DispatchPolicy::Forwarder.dispatch(rows) }
     assert_match(/1\/2/, err.message)
   ensure
-    ActiveJob.singleton_class.define_method(:perform_all_later, original_bulk)
+    FwdGoodJob.queue_adapter.singleton_class.alias_method(:enqueue, :__orig_enqueue) if FwdGoodJob.queue_adapter.singleton_class.method_defined?(:__orig_enqueue)
   end
 
   def test_dispatch_no_op_on_empty

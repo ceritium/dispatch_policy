@@ -19,7 +19,7 @@ Ver `README.md` para la API y los ejemplos.
 v0.1 (en master). Todo el flujo principal está implementado y testeado.
 Lo pendiente está en `ideas.md` con su porqué.
 
-69 tests / 163 assertions. `bundle exec rake test` desde la raíz.
+86 tests / 199 assertions. `bundle exec rake test` desde la raíz.
 
 ## Arquitectura — 4 tablas
 
@@ -105,6 +105,27 @@ dispatch_policy_tick_samples     una fila por Tick.run para métricas
   la key del gate (coarse, agrega cross-staged-partition); sin
   concurrency, la `partition_key` del staged. La UI cuenta por
   `policy_name` y siempre da un valor real.
+- **Fairness intra-tick = orden + cap, NO se mezcla con la
+  selección.** `claim_partitions` sigue ordenando por
+  `last_checked_at NULLS FIRST, id` (anti-stagnation: cada partición
+  con pending se procesa cada ⌈N/B⌉ ticks). Una vez claimed, el Tick
+  las reordena en memoria por `decayed_admits ASC` (EWMA con
+  half_life = 60s default) y aplica `fair_share = ceil(tick_cap / N)`
+  como techo per partición. **No reintroduzcas decayed_admits en el
+  ORDER BY del SELECT FOR UPDATE** — eso rompe la garantía
+  anti-stagnation cuando hay > batch_size particiones frescas.
+- **El cap global del tick gana al floor anti-stagnation per-tick.**
+  Si `tick_admission_budget < N_claimed`, algunas particiones admiten
+  0 en este tick. NO se les fuerza un floor de 1 (eso rompería el
+  cap). La fairness viene de claim_partitions: como sus
+  `last_checked_at` se bumpean al ser claimed, el siguiente tick las
+  pone al frente.
+- **El decay update se hace en la misma TX que el admit.** En
+  `record_partition_admit!`, si `half_life_seconds` está fijado, el
+  UPDATE incluye `decayed_admits = decayed_admits * exp(-Δt/τ) +
+  admitted` y `decayed_admits_at = now()`. Mismo lock de fila que ya
+  teníamos. `bulk_record_partition_denies!` NO toca el decay (en
+  deny no hubo admisión).
 - **`claim_staged_jobs!` requiere `limit > 0`** (ahora es la
   vía solo-admit). El path de deny puro va por
   `Repository.bulk_record_partition_denies!`: el Tick acumula

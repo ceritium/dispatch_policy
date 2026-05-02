@@ -6,6 +6,18 @@
 
 <% in_backoff = @partition.next_eligible_at && @partition.next_eligible_at > Time.current %>
 <% age_seconds = @partition.last_checked_at && (Time.current - @partition.last_checked_at) %>
+<% half_life = (DispatchPolicy.registry.fetch(@partition.policy_name)&.fairness_half_life_seconds || DispatchPolicy.config.fairness_half_life_seconds).to_f %>
+<%
+  decayed_now =
+    if @partition.decayed_admits_at && half_life.positive?
+      tau = half_life / Math.log(2)
+      elapsed = [Time.current.to_f - @partition.decayed_admits_at.to_f, 0.0].max
+      @partition.decayed_admits.to_f * Math.exp(-elapsed / tau)
+    else
+      @partition.decayed_admits.to_f
+    end
+  admits_per_min_estimate = decayed_now * (Math.log(2) / half_life) * 60.0 if half_life.positive?
+%>
 
 <section class="dp-stats">
   <div class="dp-stat"><span class="dp-stat-label">Policy</span><span class="dp-stat-value"><%= @partition.policy_name %></span></div>
@@ -16,6 +28,23 @@
   <div class="dp-stat"><span class="dp-stat-label">Lifetime admitted</span><span class="dp-stat-value"><%= format_count(@partition.total_admitted) %></span></div>
   <div class="dp-stat"><span class="dp-stat-label">Round-trip age</span><span class="dp-stat-value"><%= age_seconds ? format_duration_seconds(age_seconds) : "never" %></span></div>
   <div class="dp-stat"><span class="dp-stat-label">Backoff</span><span class="dp-stat-value <%= "dp-warn" if in_backoff %>"><%= in_backoff ? "until #{format_time(@partition.next_eligible_at)}" : "—" %></span></div>
+  <div class="dp-stat">
+    <span class="dp-stat-label">Recent admits (EWMA)</span>
+    <span class="dp-stat-value"><%= format("%.2f", decayed_now) %></span>
+  </div>
+  <% if admits_per_min_estimate %>
+    <div class="dp-stat">
+      <span class="dp-stat-label">≈ admits/min</span>
+      <span class="dp-stat-value"><%= format("%.1f", admits_per_min_estimate) %></span>
+    </div>
+  <% end %>
+</section>
+
+<section class="dp-hint">
+  <strong>Recent admits (EWMA)</strong> is an exponentially weighted count of admissions for this partition,
+  with a half-life of <%= half_life.to_i %>s. The Tick reorders claimed partitions by this value ASC, so the
+  least-recently-active ones get first crack at the tick budget. The "≈ admits/min" line reads it as the
+  steady-state admission rate.
 </section>
 
 <section class="dp-section">

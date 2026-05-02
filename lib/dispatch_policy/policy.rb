@@ -5,10 +5,12 @@ module DispatchPolicy
     DEFAULT_SHARD = "default"
 
     attr_reader :name, :context_proc, :gates, :retry_strategy, :queue_name,
-                :admission_batch_size, :shard_by_proc
+                :admission_batch_size, :shard_by_proc,
+                :fairness_half_life_seconds, :tick_admission_budget
 
     def initialize(name:, context_proc:, gates:, retry_strategy: :restage,
-                   queue_name: nil, admission_batch_size: nil, shard_by_proc: nil)
+                   queue_name: nil, admission_batch_size: nil, shard_by_proc: nil,
+                   fairness_half_life_seconds: nil, tick_admission_budget: nil)
       @name                 = name.to_s
       @context_proc         = context_proc
       @gates                = gates.freeze
@@ -16,6 +18,8 @@ module DispatchPolicy
       @queue_name           = queue_name
       @admission_batch_size = admission_batch_size
       @shard_by_proc        = shard_by_proc
+      @fairness_half_life_seconds = fairness_half_life_seconds
+      @tick_admission_budget = tick_admission_budget
 
       validate!
     end
