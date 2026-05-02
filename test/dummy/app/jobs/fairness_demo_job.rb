@@ -4,7 +4,7 @@
 #
 # Three things make the contrast visible:
 #
-#   1. partition_by: ->(ctx) { ctx[:tenant] }
+#   1. partition_by ->(ctx) { ctx[:tenant] }
 #      Several partitions in the same policy.
 #
 #   2. tick_admission_budget 30

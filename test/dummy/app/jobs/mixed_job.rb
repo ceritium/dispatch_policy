@@ -17,14 +17,14 @@ class MixedJob < ApplicationJob
       }
     }
 
-    gate :throttle,
-         rate:         ->(c) { c[:rate] },
-         per:          60,
-         partition_by: ->(c) { c[:endpoint_id] }
+    # partition_by combines endpoint and account so both gates enforce
+    # against the same canonical scope. If you wanted "throttle per
+    # endpoint AND concurrency per account" with different scopes,
+    # split into two policies and chain them.
+    partition_by ->(c) { "ep:#{c[:endpoint_id]}|acct:#{c[:account_id]}" }
 
-    gate :concurrency,
-         max:          ->(c) { c[:max] },
-         partition_by: ->(c) { c[:account_id] }
+    gate :throttle,    rate: ->(c) { c[:rate] }, per: 60
+    gate :concurrency, max:  ->(c) { c[:max] }
   end
 
   def perform(attrs = {})

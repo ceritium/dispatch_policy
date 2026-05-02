@@ -55,10 +55,10 @@ class FairnessIntegrationTest < Minitest::Test
     DispatchPolicy.reset_registry!
     policy = DispatchPolicy::PolicyDSL.build("fair_test") do
       context ->(args) { (args.first || {}).to_h }
-      gate :throttle,
-           rate:         10_000, # high enough that the throttle never
-           per:          60,     # binds; we want fair_share to be the
-           partition_by: ->(c) { c["key"] || c[:key] || "default" }
+      partition_by ->(c) { c["key"] || c[:key] || "default" }
+      # rate high enough that the throttle never binds — fair_share is
+      # the only thing capping admissions per partition.
+      gate :throttle, rate: 10_000, per: 60
     end
     DispatchPolicy.registry.register(policy)
     TestFairJob.dispatch_policy_name = "fair_test"

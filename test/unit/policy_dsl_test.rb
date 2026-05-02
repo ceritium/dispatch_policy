@@ -10,14 +10,14 @@ class PolicyDSLTest < Minitest::Test
         { endpoint_id: event[:endpoint_id], rate_limit: event[:rate_limit] }
       }
 
+      partition_by ->(c) { c[:endpoint_id] }
+
       gate :throttle,
-           rate:         ->(c) { c[:rate_limit] },
-           per:          60,
-           partition_by: ->(c) { c[:endpoint_id] }
+           rate: ->(c) { c[:rate_limit] },
+           per:  60
 
       gate :concurrency,
-           max:          ->(c) { c[:max_per_account] || 5 },
-           partition_by: ->(c) { "acct:#{c[:account_id]}" }
+           max: ->(c) { c[:max_per_account] || 5 }
 
       retry_strategy :bypass
       queue_name :default
@@ -32,20 +32,24 @@ class PolicyDSLTest < Minitest::Test
     assert_equal "default", policy.queue_name
   end
 
-  def test_partition_key_concatenates_per_gate_partition_by
+  def test_partition_key_uses_policy_partition_by
     policy = DispatchPolicy::PolicyDSL.build("p") do
-      context ->(args) { { ep: args.first, acct: 7 } }
-      gate :throttle,    rate: 5, per: 60, partition_by: ->(c) { "ep:#{c[:ep]}" }
-      gate :concurrency, max: 3,           partition_by: ->(c) { "acct:#{c[:acct]}" }
+      context ->(args) { { ep: args.first } }
+      partition_by ->(c) { "ep:#{c[:ep]}" }
+      gate :throttle,    rate: 5, per: 60
+      gate :concurrency, max: 3
     end
 
     ctx = policy.build_context(["foo"])
-    assert_equal "throttle=ep:foo|concurrency=acct:7", policy.partition_key_for(ctx)
+    assert_equal "ep:foo", policy.partition_key_for(ctx),
+                 "the staged partition_key is the policy's canonical partition value"
+    assert_equal "ep:foo", policy.partition_for(ctx)
   end
 
   def test_unknown_gate_raises
     assert_raises(DispatchPolicy::UnknownGate) do
       DispatchPolicy::PolicyDSL.build("p") do
+        partition_by ->(_c) { "k" }
         gate :nope, foo: 1
       end
     end
@@ -54,7 +58,8 @@ class PolicyDSLTest < Minitest::Test
   def test_invalid_retry_strategy_raises
     assert_raises(DispatchPolicy::InvalidPolicy) do
       DispatchPolicy::PolicyDSL.build("p") do
-        gate :throttle, rate: 1, per: 1, partition_by: ->(_c) { "k" }
+        partition_by ->(_c) { "k" }
+        gate :throttle, rate: 1, per: 1
         retry_strategy :foo
       end
     end
@@ -62,13 +67,25 @@ class PolicyDSLTest < Minitest::Test
 
   def test_no_gates_raises
     assert_raises(DispatchPolicy::InvalidPolicy) do
-      DispatchPolicy::PolicyDSL.build("p")
+      DispatchPolicy::PolicyDSL.build("p") do
+        partition_by ->(_c) { "k" }
+      end
     end
+  end
+
+  def test_missing_partition_by_raises
+    err = assert_raises(DispatchPolicy::InvalidPolicy) do
+      DispatchPolicy::PolicyDSL.build("p") do
+        gate :throttle, rate: 1, per: 60
+      end
+    end
+    assert_match(/partition_by required/, err.message)
   end
 
   def test_default_shard_when_no_shard_by_declared
     policy = DispatchPolicy::PolicyDSL.build("p") do
-      gate :throttle, rate: 1, per: 60, partition_by: ->(_c) { "k" }
+      partition_by ->(_c) { "k" }
+      gate :throttle, rate: 1, per: 60
     end
     ctx = policy.build_context([])
     assert_equal "default", policy.shard_for(ctx)
@@ -76,7 +93,8 @@ class PolicyDSLTest < Minitest::Test
 
   def test_shard_by_proc_can_use_queue_name_from_enriched_context
     policy = DispatchPolicy::PolicyDSL.build("p") do
-      gate :throttle, rate: 1, per: 60, partition_by: ->(_c) { "k" }
+      partition_by ->(_c) { "k" }
+      gate :throttle, rate: 1, per: 60
       shard_by ->(c) { c[:queue_name] }
     end
 
@@ -87,43 +105,16 @@ class PolicyDSLTest < Minitest::Test
 
   def test_shard_by_falls_back_to_default_when_proc_returns_nil
     policy = DispatchPolicy::PolicyDSL.build("p") do
-      gate :throttle, rate: 1, per: 60, partition_by: ->(_c) { "k" }
+      partition_by ->(_c) { "k" }
+      gate :throttle, rate: 1, per: 60
       shard_by ->(_c) { nil }
     end
     assert_equal "default", policy.shard_for(policy.build_context([]))
   end
 
-  # ----- policy-level partition_by ----------------------------------------
+  # ----- policy-level partition_by canonical scope ------------------------
 
-  def test_policy_level_partition_by_replaces_concatenation
-    policy = DispatchPolicy::PolicyDSL.build("p") do
-      context ->(args) { { tenant: args.first } }
-      partition_by ->(c) { "tenant:#{c[:tenant]}" }
-      gate :throttle,    rate: 10, per: 60
-      gate :concurrency, max:  5
-    end
-
-    ctx = policy.build_context(["acme"])
-    assert_equal "tenant:acme", policy.partition_key_for(ctx),
-                 "policy-level partition_by must produce a single canonical key"
-    assert_equal "tenant:acme", policy.partition_for(ctx)
-  end
-
-  def test_policy_level_partition_by_winning_emits_warning_when_gates_also_set_one
-    captured = StringIO.new
-    DispatchPolicy.config.logger = Logger.new(captured)
-
-    DispatchPolicy::PolicyDSL.build("p") do
-      partition_by    ->(c) { c[:tenant] }
-      gate :throttle, rate: 1, per: 60, partition_by: ->(_c) { "ignored" }
-    end
-
-    assert_match(/policy-level value wins/, captured.string)
-  ensure
-    DispatchPolicy.reset_config!
-  end
-
-  def test_policy_level_partition_by_used_for_concurrency_inflight_key
+  def test_policy_partition_by_used_for_concurrency_inflight_key
     DispatchPolicy.reset_registry!
     policy = DispatchPolicy::PolicyDSL.build("p") do
       context ->(args) { { tenant: args.first } }
@@ -140,10 +131,12 @@ class PolicyDSLTest < Minitest::Test
     DispatchPolicy.reset_registry!
   end
 
-  def test_partition_for_returns_nil_when_policy_level_partition_by_unset
+  def test_partition_for_returns_nil_partition_value_when_proc_returns_nil
     policy = DispatchPolicy::PolicyDSL.build("p") do
-      gate :throttle, rate: 1, per: 60, partition_by: ->(_c) { "k" }
+      partition_by ->(_c) { nil }
+      gate :throttle, rate: 1, per: 60
     end
-    assert_nil policy.partition_for(policy.build_context([]))
+    assert_equal "", policy.partition_for(policy.build_context([])),
+                 "nil partition_by result is coerced to empty string"
   end
 end

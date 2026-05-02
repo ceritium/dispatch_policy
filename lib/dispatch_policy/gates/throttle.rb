@@ -8,11 +8,16 @@ module DispatchPolicy
     #   "tokens"      => Float,   # current tokens, capped at bucket size
     #   "refilled_at" => Float    # epoch seconds, last refill
     # }
+    #
+    # The partition scope this gate enforces against is the policy's
+    # `partition_by` (declared in the policy DSL block, not on the gate).
+    # The bucket lives on the staged partition row — one row per
+    # `policy.partition_for(ctx)` value, one bucket per row, no dilution.
     class Throttle < Gate
       attr_reader :rate_proc, :per
 
-      def initialize(rate:, per:, partition_by: nil)
-        super(partition_by: partition_by)
+      def initialize(rate:, per:)
+        super()
         @rate_proc = rate.respond_to?(:call) ? rate : ->(_ctx) { rate }
         @per       = duration_seconds(per)
         raise ArgumentError, "throttle :per must be > 0 (got #{@per})" unless @per.positive?

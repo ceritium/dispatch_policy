@@ -9,7 +9,8 @@ class RetryFlakyJob < ApplicationJob
 
   dispatch_policy :flaky do
     context ->(args) { { key: (args.first || {})["key"] || "default" } }
-    gate :throttle, rate: 5, per: 60, partition_by: ->(c) { c[:key] }
+    partition_by ->(c) { c[:key] }
+    gate :throttle, rate: 5, per: 60
     retry_strategy :restage
   end
 

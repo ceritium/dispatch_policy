@@ -3,6 +3,21 @@
 require_relative "../../test_helper"
 
 class ConcurrencyGateTest < Minitest::Test
+  def setup
+    super
+    # The concurrency gate looks up the policy's partition_for(ctx) via
+    # the registry. These unit tests build the gate in isolation, so we
+    # register a minimal stub policy named "p" with a fixed
+    # partition_by — same name as the partition rows below.
+    DispatchPolicy.reset_registry!
+    DispatchPolicy.registry.register(
+      DispatchPolicy::PolicyDSL.build("p") do
+        partition_by ->(_c) { "k" }
+        gate :concurrency, max: 1
+      end
+    )
+  end
+
   def stub_repo_count(value)
     DispatchPolicy::Repository.singleton_class.send(:alias_method, :__orig_count, :count_inflight) unless DispatchPolicy::Repository.singleton_class.method_defined?(:__orig_count)
     DispatchPolicy::Repository.singleton_class.define_method(:count_inflight) { |**| value }
@@ -12,6 +27,7 @@ class ConcurrencyGateTest < Minitest::Test
     if DispatchPolicy::Repository.singleton_class.method_defined?(:__orig_count)
       DispatchPolicy::Repository.singleton_class.send(:alias_method, :count_inflight, :__orig_count)
     end
+    DispatchPolicy.reset_registry!
   end
 
   def partition
@@ -20,14 +36,14 @@ class ConcurrencyGateTest < Minitest::Test
 
   def test_admits_up_to_remaining
     stub_repo_count(2)
-    gate = DispatchPolicy::Gates::Concurrency.new(max: 5, partition_by: ->(_c) { "acct:1" })
+    gate = DispatchPolicy::Gates::Concurrency.new(max: 5)
     d = gate.evaluate(DispatchPolicy::Context.wrap({}), partition, 100)
     assert_equal 3, d.allowed
   end
 
   def test_full_returns_zero_with_retry_after_to_prevent_busy_loop
     stub_repo_count(5)
-    gate = DispatchPolicy::Gates::Concurrency.new(max: 5, partition_by: ->(_c) { "acct:1" })
+    gate = DispatchPolicy::Gates::Concurrency.new(max: 5)
     d = gate.evaluate(DispatchPolicy::Context.wrap({}), partition, 100)
     assert_equal 0, d.allowed
     assert d.retry_after && d.retry_after.positive?, "concurrency-full must back off via retry_after"
@@ -35,14 +51,14 @@ class ConcurrencyGateTest < Minitest::Test
 
   def test_custom_full_backoff
     stub_repo_count(5)
-    gate = DispatchPolicy::Gates::Concurrency.new(max: 5, partition_by: ->(_c) { "k" }, full_backoff: 7.5)
+    gate = DispatchPolicy::Gates::Concurrency.new(max: 5, full_backoff: 7.5)
     d = gate.evaluate(DispatchPolicy::Context.wrap({}), partition, 100)
     assert_in_delta 7.5, d.retry_after, 0.001
   end
 
   def test_dynamic_max_changes_between_calls
     stub_repo_count(0)
-    gate = DispatchPolicy::Gates::Concurrency.new(max: ->(c) { c[:max] }, partition_by: ->(_c) { "k" })
+    gate = DispatchPolicy::Gates::Concurrency.new(max: ->(c) { c[:max] })
 
     d1 = gate.evaluate(DispatchPolicy::Context.wrap({ max: 3 }), partition, 100)
     assert_equal 3, d1.allowed
@@ -55,14 +71,14 @@ class ConcurrencyGateTest < Minitest::Test
 
   def test_admit_budget_caps_allowed
     stub_repo_count(0)
-    gate = DispatchPolicy::Gates::Concurrency.new(max: 100, partition_by: ->(_c) { "k" })
+    gate = DispatchPolicy::Gates::Concurrency.new(max: 100)
     d = gate.evaluate(DispatchPolicy::Context.wrap({}), partition, 5)
     assert_equal 5, d.allowed
   end
 
   def test_zero_max_denies
     stub_repo_count(0)
-    gate = DispatchPolicy::Gates::Concurrency.new(max: 0, partition_by: ->(_c) { "k" })
+    gate = DispatchPolicy::Gates::Concurrency.new(max: 0)
     d = gate.evaluate(DispatchPolicy::Context.wrap({}), partition, 100)
     assert_equal 0, d.allowed
   end

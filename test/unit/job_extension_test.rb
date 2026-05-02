@@ -22,7 +22,8 @@ class JobExtensionTest < Minitest::Test
 
       dispatch_policy :testpolicy do
         context ->(args) { { key: args.first } }
-        gate :throttle, rate: 5, per: 60, partition_by: ->(c) { c[:key] }
+        partition_by ->(c) { c[:key] }
+        gate :throttle, rate: 5, per: 60
       end
 
       def perform(_arg); end
@@ -43,7 +44,7 @@ class JobExtensionTest < Minitest::Test
     assert_equal 1, Recorder.rows.size
     row = Recorder.rows.first
     assert_equal "testpolicy", row[:policy_name]
-    assert_equal "throttle=hello", row[:partition_key]
+    assert_equal "hello", row[:partition_key]
     assert_equal "JobExtensionTestJob", row[:job_class]
     # Context is enriched with the job's queue_name so shard_by/gates can use it.
     assert_equal "hello",   row[:context]["key"]
@@ -76,7 +77,7 @@ class JobExtensionTest < Minitest::Test
 
     assert_equal 3, captured.size
     keys = captured.map { |r| r[:partition_key] }
-    assert_equal %w[throttle=a throttle=b throttle=c], keys
+    assert_equal %w[a b c], keys
     assert captured.all? { |r| r[:policy_name] == "testpolicy" }
   ensure
     repo.send(:alias_method, :stage_many!, :__orig_stage_many) if repo.method_defined?(:__orig_stage_many)
@@ -144,7 +145,7 @@ class JobExtensionTest < Minitest::Test
 
     assert_equal 1, Recorder.rows.size, "the deserialized job must stage once"
     row = Recorder.rows.first
-    assert_equal "throttle=alpha", row[:partition_key],
+    assert_equal "alpha", row[:partition_key],
                  "context proc must see the materialized 'alpha', not [] (which would yield throttle=)"
   end
 
@@ -168,7 +169,7 @@ class JobExtensionTest < Minitest::Test
     ActiveJob.perform_all_later(rebuilt)
 
     assert_equal 2, captured.size
-    assert_equal %w[throttle=alpha throttle=beta], captured.map { |r| r[:partition_key] },
+    assert_equal %w[alpha beta], captured.map { |r| r[:partition_key] },
                  "BulkEnqueue must materialize arguments before reading them, otherwise context proc sees []"
   ensure
     repo.send(:alias_method, :stage_many!, :__orig_stage_many) if repo.method_defined?(:__orig_stage_many)

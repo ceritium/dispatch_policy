@@ -31,10 +31,9 @@ class ShardedJob < ApplicationJob
     # queue_as above, so shard == queue. This is the canonical "tick and
     # workers share one queue per shard" pattern.
     shard_by ->(c) { c[:queue_name] }
+    partition_by ->(c) { "acct:#{c[:account_id]}" }
 
-    gate :concurrency,
-         max:          ->(c) { c[:max] },
-         partition_by: ->(c) { "acct:#{c[:account_id]}" }
+    gate :concurrency, max: ->(c) { c[:max] }
   end
 
   def perform(attrs = {})

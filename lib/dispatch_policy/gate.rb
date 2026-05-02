@@ -2,21 +2,8 @@
 
 module DispatchPolicy
   class Gate
-    attr_reader :partition_proc
-
-    def initialize(partition_by: nil)
-      @partition_proc = partition_by
-    end
-
     def name
       raise NotImplementedError
-    end
-
-    def partition_for(ctx)
-      return "" if @partition_proc.nil?
-
-      value = @partition_proc.call(ctx)
-      value.nil? ? "" : value.to_s
     end
 
     # @param ctx [DispatchPolicy::Context]

@@ -76,7 +76,8 @@ class FairnessUnitTest < Minitest::Test
 
   def test_policy_dsl_records_fairness_overrides
     policy = DispatchPolicy::PolicyDSL.build("p") do
-      gate :throttle, rate: 1, per: 60, partition_by: ->(_c) { "k" }
+      partition_by ->(_c) { "k" }
+      gate :throttle, rate: 1, per: 60
       fairness half_life: 30
       tick_admission_budget 200
     end
@@ -86,7 +87,8 @@ class FairnessUnitTest < Minitest::Test
 
   def test_policy_dsl_defaults_fairness_to_nil
     policy = DispatchPolicy::PolicyDSL.build("p") do
-      gate :throttle, rate: 1, per: 60, partition_by: ->(_c) { "k" }
+      partition_by ->(_c) { "k" }
+      gate :throttle, rate: 1, per: 60
     end
     assert_nil policy.fairness_half_life_seconds
     assert_nil policy.tick_admission_budget

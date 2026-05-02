@@ -19,9 +19,8 @@ class HighConcurrencyJob < ApplicationJob
       }
     }
 
-    gate :concurrency,
-         max:          ->(c) { c[:max] },
-         partition_by: ->(c) { "bucket:#{c[:bucket]}" }
+    partition_by ->(c) { "bucket:#{c[:bucket]}" }
+    gate :concurrency, max: ->(c) { c[:max] }
   end
 
   def perform(attrs = {})

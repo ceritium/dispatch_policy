@@ -14,9 +14,8 @@ class BulkAccountJob < ApplicationJob
       }
     }
 
-    gate :concurrency,
-         max:          ->(c) { c[:max_per_account] },
-         partition_by: ->(c) { "acct:#{c[:account_id]}" }
+    partition_by ->(c) { "acct:#{c[:account_id]}" }
+    gate :concurrency, max: ->(c) { c[:max_per_account] }
   end
 
   def perform(attrs = {})

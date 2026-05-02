@@ -64,12 +64,11 @@ module DispatchPolicy
       @tick_admission_budget = Integer(value)
     end
 
-    # Defines the partition scope at the POLICY level — every gate in
-    # this policy uses this single proc to compute its scope. Set this
-    # instead of per-gate `partition_by:` to avoid the throttle-rate
-    # dilution that comes from gates having different scopes (the
-    # token bucket lives in the staged-partition row, so a finer
-    # combined partition_key splits the bucket N ways).
+    # Defines the partition scope. Required — every policy declares
+    # exactly one. Every gate in the policy uses this proc to compute
+    # the scope it enforces against (the staged_jobs row, the throttle
+    # bucket on that row, and the concurrency gate's inflight rows all
+    # share the same canonical key).
     #
     #   dispatch_policy :endpoints do
     #     partition_by ->(ctx) { ctx[:endpoint_id] }
@@ -77,15 +76,9 @@ module DispatchPolicy
     #     gate :concurrency, max: 5
     #   end
     #
-    # When set, the staged_jobs row and the inflight_jobs row both use
-    # the same canonical key, so the throttle rate and the concurrency
-    # cap are enforced at exactly the scope you declare.
-    #
-    # Per-gate `partition_by:` still works for backwards compatibility
-    # (and stays useful when gates need genuinely different scopes —
-    # though the throttle dilution caveat applies). When both are set,
-    # the policy-level wins; gates' own partition_by is ignored and a
-    # warning is emitted at policy build time.
+    # If you need different scopes per gate (e.g. throttle by endpoint
+    # AND concurrency by account), use two policies and let one chain
+    # into the other.
     def partition_by(callable = nil, &block)
       @partition_by_proc = callable || block
     end

@@ -39,19 +39,15 @@ module DispatchPolicy
     end
 
     def partition_key_for(ctx)
-      if @partition_by_proc
-        partition_for(ctx)
-      else
-        gates.map { |gate| "#{gate.name}=#{gate.partition_for(ctx)}" }.join("|")
-      end
+      partition_for(ctx)
     end
 
-    # Policy-level partition scope (canonical when set). Both the
-    # staged_jobs row and the concurrency gate's inflight_jobs row use
-    # this single value as their partition_key, so all gates enforce
-    # their state at exactly the same scope.
+    # Policy-level partition scope. Both the staged_jobs row and the
+    # concurrency gate's inflight_jobs row use this single canonical
+    # value as their partition_key, so all gates enforce their state
+    # at exactly the same scope. Required: validate! raises if the
+    # policy is built without one.
     def partition_for(ctx)
-      return nil unless @partition_by_proc
       value = @partition_by_proc.call(ctx)
       value.nil? ? "" : value.to_s
     end
@@ -79,17 +75,9 @@ module DispatchPolicy
     def validate!
       raise InvalidPolicy, "policy name required" if @name.empty?
       raise InvalidPolicy, "at least one gate required" if @gates.empty?
+      raise InvalidPolicy, "partition_by required" unless @partition_by_proc
       unless %i[restage bypass].include?(@retry_strategy)
         raise InvalidPolicy, "retry_strategy must be :restage or :bypass"
-      end
-
-      if @partition_by_proc && @gates.any? { |g| g.partition_proc }
-        gate_names = @gates.select { |g| g.partition_proc }.map(&:name).map(&:to_s).join(", ")
-        DispatchPolicy.config.logger&.warn(
-          "[dispatch_policy] policy #{@name.inspect}: partition_by is set at the " \
-          "policy level AND on gates (#{gate_names}). The policy-level value wins; " \
-          "gates' own partition_by is ignored."
-        )
       end
     end
   end
