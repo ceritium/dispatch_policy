@@ -160,13 +160,56 @@ FetchEndpointJob.perform_later(event)
 ActiveJob.perform_all_later(events.map { |e| FetchEndpointJob.new(e) })
 ```
 
+### Available gates
+
+- **`:throttle`** — token bucket per partition. `rate: N, per: 60` admits
+  up to N admissions per partition per 60s. State lives on the
+  partition row (`gate_state.throttle.tokens`).
+
+- **`:concurrency`** — fixed cap on in-flight jobs per partition.
+  Counts rows in `dispatch_policy_inflight_jobs` keyed by the
+  policy's canonical partition.
+
+- **`:adaptive_concurrency`** — self-tuning cap per partition. Starts
+  at `initial_max`, grows on quiet periods (no queue lag), shrinks on
+  saturation (lag > target). AIMD loop persisted in
+  `dispatch_policy_adaptive_concurrency_stats`.
+
+  ```ruby
+  dispatch_policy :endpoints do
+    partition_by ->(c) { c[:endpoint_id] }
+    gate :adaptive_concurrency,
+         initial_max:   3,        # starting cap per partition
+         target_lag_ms: 1000,     # acceptable queue wait
+         min:           1         # floor; partition can't lock out
+  end
+  ```
+
+  Feedback signal is `queue_lag_ms = perform_start - admitted_at` —
+  the time the job spent waiting in the adapter after admission.
+  Pure saturation signal: slow performs in the downstream service
+  don't punish admissions if workers still drain the queue quickly.
+
+  Update rule applied after each perform:
+  - Success + ewma lag ≤ target → `current_max += 1`
+  - Success + ewma lag > target → `current_max *= 0.95`
+  - Failure                     → `current_max *= 0.5`
+
+  Always clamped to ≥ `min`. The algorithm self-limits via
+  `target_lag_ms`; no hard ceiling needed.
+
+  Picking `target_lag_ms`: roughly `worker_threads × avg_perform_ms`.
+  E.g. 5 workers × 200ms perform = 1000ms means "queue depth up to
+  1s is fine, anything worse and back off". Too low (10–50ms) and the
+  gate overcorrects; too high (30s) and the queue grows without
+  pushback.
+
 ### How the gates compose
 
-Each gate declares a `partition_by` proc. The staged-job partition key is the
-canonical concatenation of all gate partitions: `throttle=ep:42|concurrency=acct:7`.
-This means a single `endpoint+account` combination has its own staged-jobs
-queue, and the `concurrency` gate's partition (`acct:7`) is shared across all
-staged partitions that map to the same account.
+When a policy has multiple gates, the pipeline runs them in order
+and admits `min(allowed)` across all of them. All gates share the
+policy's `partition_by` — there's one canonical scope per partition,
+so throttle's bucket and concurrency's count line up.
 
 ### `partitions.context` is refreshed on every enqueue
 

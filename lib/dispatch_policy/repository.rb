@@ -14,6 +14,7 @@ module DispatchPolicy
     PARTITIONS_TABLE  = "dispatch_policy_partitions"
     INFLIGHT_TABLE    = "dispatch_policy_inflight_jobs"
     SAMPLES_TABLE     = "dispatch_policy_tick_samples"
+    ADAPTIVE_TABLE    = "dispatch_policy_adaptive_concurrency_stats"
 
     module_function
 
@@ -570,6 +571,77 @@ module DispatchPolicy
         p95_age_seconds:    row["p95_age_seconds"]&.to_f
       }
     end
+
+    # ----- adaptive_concurrency stats -----------------------------------------
+
+    # Insert a fresh stats row for the given partition if none exists.
+    # Idempotent — runs as `INSERT … ON CONFLICT DO NOTHING`. Cheap to
+    # call on every admission so the gate's evaluate path can read
+    # current_max safely without checking for existence first.
+    def adaptive_seed!(policy_name:, partition_key:, initial_max:)
+      connection.exec_query(
+        <<~SQL.squish,
+          INSERT INTO #{ADAPTIVE_TABLE}
+            (policy_name, partition_key, current_max, ewma_latency_ms,
+             sample_count, created_at, updated_at)
+          VALUES ($1, $2, $3, 0, 0, now(), now())
+          ON CONFLICT (policy_name, partition_key) DO NOTHING
+        SQL
+        "adaptive_seed",
+        [policy_name, partition_key, initial_max.to_i]
+      )
+    end
+
+    # Fetch the AIMD-tuned cap for a partition. Returns nil when the
+    # row doesn't exist yet — caller should fall back to initial_max.
+    def adaptive_current_max(policy_name:, partition_key:)
+      result = connection.exec_query(
+        "SELECT current_max FROM #{ADAPTIVE_TABLE} WHERE policy_name = $1 AND partition_key = $2 LIMIT 1",
+        "adaptive_current_max",
+        [policy_name, partition_key]
+      )
+      row = result.first
+      row && row["current_max"].to_i
+    end
+
+    # Single-statement EWMA + AIMD update. Concurrent workers can call
+    # this in any order without read-modify-write races: every clause
+    # reads the row's current value at the start of the UPDATE.
+    #
+    # ewma_latency_ms_new = ewma_latency_ms * (1 - α) + α * queue_lag_ms
+    # current_max_new     = GREATEST(min,
+    #                         FAILED?         FLOOR(current_max * fail_factor)
+    #                         OVERLOADED?     FLOOR(current_max * slow_factor)
+    #                         else            current_max + 1)
+    def adaptive_record!(policy_name:, partition_key:, queue_lag_ms:, succeeded:,
+                         alpha:, target_lag_ms:, fail_factor:, slow_factor:, min:)
+      connection.exec_query(
+        <<~SQL.squish,
+          UPDATE #{ADAPTIVE_TABLE}
+          SET
+            ewma_latency_ms = ewma_latency_ms * (1 - $3::double precision)
+                              + $3::double precision * $4::double precision,
+            sample_count    = sample_count + 1,
+            current_max     = GREATEST($5::int, CASE
+              WHEN $6::boolean = FALSE
+                THEN FLOOR(current_max * $7::double precision)::int
+              WHEN (ewma_latency_ms * (1 - $3::double precision)
+                    + $3::double precision * $4::double precision) > $8::double precision
+                THEN FLOOR(current_max * $9::double precision)::int
+              ELSE current_max + 1
+            END),
+            last_observed_at = now(),
+            updated_at       = now()
+          WHERE policy_name = $1 AND partition_key = $2
+        SQL
+        "adaptive_record",
+        [policy_name, partition_key, alpha.to_f, queue_lag_ms.to_f,
+         min.to_i, succeeded ? true : false,
+         fail_factor.to_f, target_lag_ms.to_f, slow_factor.to_f]
+      )
+    end
+
+    # ----- tick samples sweep -------------------------------------------------
 
     def sweep_old_tick_samples!(cutoff_seconds:)
       connection.exec_query(

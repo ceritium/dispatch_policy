@@ -28,14 +28,8 @@ module DispatchPolicy
       policy = DispatchPolicy.registry.fetch(policy_name)
       return yield unless policy
 
-      ctx              = policy.build_context(job.arguments, queue_name: job.queue_name&.to_s)
-      concurrency_gate = policy.gates.find { |g| g.name == :concurrency }
-
-      partition_key = if concurrency_gate
-        concurrency_gate.inflight_partition_key(policy.name, ctx)
-      else
-        policy.partition_key_for(ctx)
-      end
+      ctx           = policy.build_context(job.arguments, queue_name: job.queue_name&.to_s)
+      partition_key = policy.partition_key_for(ctx)
 
       Repository.insert_inflight!([{
         policy_name:    policy.name,
@@ -43,17 +37,78 @@ module DispatchPolicy
         active_job_id:  job.job_id
       }])
 
+      adaptive_gates = policy.gates.select { |g| g.name == :adaptive_concurrency }
+      admitted_at    = adaptive_gates.any? ? lookup_admitted_at(job.job_id) : nil
+      perform_start  = Time.current
+
       heartbeat = start_heartbeat(job.job_id)
 
+      succeeded = false
       begin
         yield
+        succeeded = true
       ensure
         stop_heartbeat(heartbeat)
+
+        record_adaptive_observations(
+          policy:        policy,
+          gates:         adaptive_gates,
+          partition_key: partition_key,
+          admitted_at:   admitted_at,
+          perform_start: perform_start,
+          succeeded:     succeeded
+        )
+
         begin
           Repository.delete_inflight!(active_job_id: job.job_id)
         rescue StandardError => e
           DispatchPolicy.config.logger&.warn("[dispatch_policy] failed to delete inflight row #{job.job_id}: #{e.class}: #{e.message}")
         end
+      end
+    end
+
+    # Reads the admitted_at column from the inflight row that the Tick
+    # pre-inserted. Used as the start-of-queue-wait reference for the
+    # adaptive_concurrency feedback signal (queue_lag = perform_start
+    # - admitted_at). nil if the row vanished or the lookup fails —
+    # the observation is then skipped.
+    def self.lookup_admitted_at(active_job_id)
+      result = ActiveRecord::Base.connection.exec_query(
+        "SELECT admitted_at FROM dispatch_policy_inflight_jobs WHERE active_job_id = $1 LIMIT 1",
+        "lookup_admitted_at",
+        [active_job_id]
+      )
+      row = result.first
+      return nil unless row
+      ts = row["admitted_at"]
+      ts.is_a?(Time) ? ts : Time.parse(ts.to_s)
+    rescue StandardError
+      nil
+    end
+
+    def self.record_adaptive_observations(policy:, gates:, partition_key:, admitted_at:, perform_start:, succeeded:)
+      return if gates.empty?
+
+      queue_lag_ms = if admitted_at
+        ((perform_start - admitted_at) * 1000).to_i
+      else
+        # No admitted_at means we can't measure queue wait. Treat as 0
+        # so the observation still increments sample_count and the
+        # cap can grow if everything else is healthy.
+        0
+      end
+
+      gates.each do |gate|
+        gate.record_observation(
+          policy_name:   policy.name,
+          partition_key: partition_key,
+          queue_lag_ms:  queue_lag_ms,
+          succeeded:     succeeded
+        )
+      rescue StandardError => e
+        DispatchPolicy.config.logger&.warn(
+          "[dispatch_policy] adaptive observation failed for #{policy.name}/#{partition_key}: #{e.class}: #{e.message}"
+        )
       end
     end
 

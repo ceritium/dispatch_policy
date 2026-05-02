@@ -80,5 +80,24 @@ class CreateDispatchPolicyTables < ActiveRecord::Migration[7.1]
               order: { sampled_at: :desc }
     add_index :dispatch_policy_tick_samples, :sampled_at,
               name: "idx_dp_tick_samples_sweep"
+
+    # adaptive_concurrency stats: one row per (policy_name, partition_key)
+    # for partitions whose policy declares an :adaptive_concurrency gate.
+    # Holds the AIMD-tuned current_max plus the EWMA queue-lag signal it
+    # adapts on. Populated by Repository.adaptive_seed! on first admission
+    # and updated by Repository.adaptive_record! after each perform.
+    create_table :dispatch_policy_adaptive_concurrency_stats do |t|
+      t.string   :policy_name,      null: false
+      t.string   :partition_key,    null: false
+      t.integer  :current_max,      null: false
+      t.float    :ewma_latency_ms,  null: false, default: 0.0
+      t.integer  :sample_count,     null: false, default: 0
+      t.datetime :last_observed_at
+      t.timestamps
+    end
+    add_index :dispatch_policy_adaptive_concurrency_stats,
+              [:policy_name, :partition_key],
+              unique: true,
+              name:   "idx_dp_adaptive_concurrency_lookup"
   end
 end

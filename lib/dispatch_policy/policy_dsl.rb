@@ -3,8 +3,9 @@
 module DispatchPolicy
   class PolicyDSL
     GATE_TYPES = {
-      throttle:    Gates::Throttle,
-      concurrency: Gates::Concurrency
+      throttle:             Gates::Throttle,
+      concurrency:          Gates::Concurrency,
+      adaptive_concurrency: Gates::AdaptiveConcurrency
     }.freeze
 
     def self.build(name, &block)

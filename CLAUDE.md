@@ -19,19 +19,20 @@ See `README.md` for the API and examples.
 v0.1 (on master). The whole main flow is implemented and tested.
 What's pending lives in `IDEAS.md` with the rationale.
 
-101 tests / 225 assertions. `bundle exec rake test` from the root.
+119 tests / 263 assertions. `bundle exec rake test` from the root.
 
-## Architecture — 4 tables
+## Architecture — 5 tables
 
 ```
-dispatch_policy_staged_jobs      intercepted jobs awaiting admission
-dispatch_policy_partitions       one row per (policy, partition_key)
-                                 — gate_state (token bucket), shard,
-                                 last_checked_at, next_eligible_at, …
-dispatch_policy_inflight_jobs    admitted jobs currently running
-                                 — heartbeat_at refreshed by a thread
-dispatch_policy_tick_samples     one row per Tick.run for metrics
-                                 (operator decisions panel)
+dispatch_policy_staged_jobs                   intercepted jobs awaiting admission
+dispatch_policy_partitions                    one row per (policy, partition_key)
+                                              — gate_state (token bucket), shard,
+                                              last_checked_at, next_eligible_at, …
+dispatch_policy_inflight_jobs                 admitted jobs currently running
+                                              — heartbeat_at refreshed by a thread
+dispatch_policy_tick_samples                  one row per Tick.run for metrics
+dispatch_policy_adaptive_concurrency_stats    AIMD-tuned current_max + EWMA lag
+                                              per partition for adaptive gates
 ```
 
 ## Flow
@@ -113,10 +114,30 @@ dispatch_policy_tick_samples     one row per Tick.run for metrics
   `connected_to(role:)` when set. Staging tables and the adapter's
   table must live in the same DB for atomicity to hold.
 - **Every admitted job creates a row in `inflight_jobs`**, whether or
-  not there's a concurrency gate. The key changes: with concurrency,
-  the gate's key (coarse, aggregates cross-staged-partition); without,
-  the staged `partition_key`. The UI counts by `policy_name` and
-  always reports a real value.
+  not there's a concurrency gate. The key is always
+  `policy.partition_for(ctx)` (same canonical scope as the staged
+  partition_key), since `partition_by` is policy-level. The UI counts
+  by `policy_name` and always reports a real value.
+- **`:adaptive_concurrency` updates `current_max` in a single SQL
+  statement.** The UPDATE in `Repository.adaptive_record!` uses the
+  POST-update `ewma_latency_ms` value in its CASE expression — so
+  one observation can simultaneously raise the EWMA AND trigger a
+  shrink against the new value. Concurrent workers can call it in
+  any order without read-modify-write races. The gate also seeds
+  the row on every evaluate AND every record_observation (idempotent
+  ON CONFLICT DO NOTHING) to keep both paths self-sufficient.
+- **`:adaptive_concurrency` safety valve.** When `in_flight == 0`
+  the gate floors `remaining` at `initial_max` regardless of what
+  `current_max` says. Reason: AIMD can shrink the cap during a slow
+  burst; if the partition then idles, no observations fire to grow
+  it back. Without the floor a partition fossilizes at `min`.
+- **Adaptive's feedback signal is `queue_lag = perform_start -
+  admitted_at`.** Measured in `InflightTracker.track` BEFORE
+  `block.call` so perform duration doesn't pollute the signal.
+  `admitted_at` is read from the inflight_jobs row pre-INSERTed by
+  the Tick — that timestamp is the canonical "moment of admission".
+  If the lookup fails (row missing, parse error) the observation is
+  recorded with `queue_lag_ms = 0` — the cap can still grow.
 - **In-tick fairness = ordering + cap, NOT mixed with selection.**
   `claim_partitions` still orders by `last_checked_at NULLS FIRST,
   id` (anti-stagnation: each partition with pending is processed
