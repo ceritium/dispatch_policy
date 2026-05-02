@@ -152,3 +152,66 @@ hard contractual rate, (b) tick durations are highly variable, or
 (c) cross-shard sharing of a single cap matters. Until those needs
 land in real workloads, the per-tick budget plus operator
 monitoring is the simpler tool.
+
+## Staging-time `dedupe_key`
+
+**Symptom / what's missing.** Upstream had a `dedupe_key` DSL that
+collapsed enqueues sharing an identity (e.g. "one summary email per
+member per day", "one check per monitor while a previous one is
+still pending"). v2 dropped it: every `perform_later` stages a row,
+and dedupe is the host's responsibility — either via
+`good_job_control_concurrency_with` (GoodJob only) or via the
+schedule that enqueues (cron with a unique key, idempotent inner
+perform guarded by a digest, etc.).
+
+The two real cases observed in opstasks:
+
+- `SendDailySummaryEmailJob` relied on `dedupe_key
+  "member:#{id}:date:#{today}"`. Workaround: the daily cron has a
+  unique cron_key per (member, day), so it cannot double-enqueue.
+- `MonitorCheckV2Job` relied on `dedupe_key "monitor:#{id}"` to
+  drop a second enqueue while the first was pending. Workaround:
+  `check_digest` already gates the inner perform, so the duplicate
+  is admitted and its perform is a no-op.
+
+Both have natural workarounds, but the workaround leaks into the
+host (cron config, perform-side guard) what was a one-line
+declaration in the policy.
+
+**Possible design.**
+
+```ruby
+dispatch_policy :send_daily_summary_email do
+  partition_by ->(c) { c[:account_id] }
+  dedupe_key   ->(args) { "member:#{args.first.id}:#{Date.current}" }
+  gate :throttle, rate: 100, per: 1.minute
+end
+```
+
+Schema: a nullable `dedupe_key` column on `dispatch_policy_staged_jobs`
+plus a partial unique index `(policy_name, dedupe_key) WHERE
+dedupe_key IS NOT NULL`. Stage path uses `INSERT … ON CONFLICT DO
+NOTHING`, returning whether the row was inserted. The job's
+`successfully_enqueued = true` regardless (the caller wanted
+"happen", and an existing row satisfies that).
+
+Open questions when designing this for real:
+
+- Should `dedupe_key` also block when an inflight row exists with
+  the same key? Probably yes (the upstream semantics) — a second
+  index/check on `inflight_jobs` would handle it. Cost: another
+  unique index on a hot table.
+- Replacement vs ignore: when a duplicate arrives with a later
+  `scheduled_at`, do we update or drop? Upstream dropped silently;
+  some users may want "extend the deadline". Default to drop, add
+  `dedupe_key replace: true` only if a real case appears.
+- Interaction with `Bypass`: bypass should skip dedupe entirely
+  (caller explicitly opted out of staging).
+
+**Why deferred.** Two data points, both with clean workarounds, and
+GoodJob users already have the feature at the adapter level.
+Staging-time dedupe adds a column, a unique index on a write-heavy
+table, and a small but real semantic decision (replace vs ignore,
+inflight vs staged). If a third case lands that doesn't fit a cron
+key or a digest guard, that's the trigger to design this for real
+instead of speculating about edge cases now.
