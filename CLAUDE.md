@@ -17,7 +17,7 @@ See `README.md` for the API and examples.
 ## Status
 
 v0.1 (on master). The whole main flow is implemented and tested.
-What's pending lives in `ideas.md` with the rationale.
+What's pending lives in `IDEAS.md` with the rationale.
 
 101 tests / 225 assertions. `bundle exec rake test` from the root.
 
@@ -208,7 +208,7 @@ WHERE sampled_at > now() - interval '1 minute'
 GROUP BY policy_name;
 ```
 
-## What's in `ideas.md`
+## What's in `IDEAS.md`
 
 Detected items, deferred with their rationale. Read it before
 proposing a "new" improvement — likely it's already noted.
