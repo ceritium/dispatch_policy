@@ -26,10 +26,18 @@ class AdaptiveDemoJob < ApplicationJob
     }
     partition_by ->(c) { "tenant:#{c[:tenant]}" }
 
+    # Self-tuning concurrency cap per tenant (current_max).
     gate :adaptive_concurrency,
          initial_max:   3,
          target_lag_ms: 500,
          min:           1
+
+    # In-tick fairness: half-life short so the demo reacts visibly
+    # within seconds. fair_share = ceil(tick_admission_budget / N)
+    # caps each claimed partition per tick — composes with the
+    # adaptive cap as `min(fair_share, current_max - in_flight)`.
+    fairness half_life: 20.seconds
+    tick_admission_budget 30
   end
 
   def perform(attrs = {})

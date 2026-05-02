@@ -19,7 +19,7 @@ See `README.md` for the API and examples.
 v0.1 (on master). The whole main flow is implemented and tested.
 What's pending lives in `IDEAS.md` with the rationale.
 
-119 tests / 263 assertions. `bundle exec rake test` from the root.
+124 tests / 284 assertions. `bundle exec rake test` from the root.
 
 ## Architecture — 5 tables
 
@@ -131,6 +131,16 @@ dispatch_policy_adaptive_concurrency_stats    AIMD-tuned current_max + EWMA lag
   `current_max` says. Reason: AIMD can shrink the cap during a slow
   burst; if the partition then idles, no observations fire to grow
   it back. Without the floor a partition fossilizes at `min`.
+- **`:adaptive_concurrency` composes with fairness**. The two
+  layers don't share state: fairness writes
+  `partitions.decayed_admits` (in the admit TX), adaptive writes
+  `dispatch_policy_adaptive_concurrency_stats.current_max` (in the
+  worker's around_perform). Tables and locks are distinct. The
+  per-partition admit_count is
+  `min(fair_share, current_max - in_flight)` per tick, with the
+  safety valve `max(remaining, initial_max)` when `in_flight=0`.
+  Integration test:
+  `test/integration/adaptive_with_fairness_test.rb`.
 - **Adaptive's feedback signal is `queue_lag = perform_start -
   admitted_at`.** Measured in `InflightTracker.track` BEFORE
   `block.call` so perform duration doesn't pollute the signal.
