@@ -56,7 +56,7 @@ class RepositoryIntegrationTest < Minitest::Test
 
     # Detect schema drift (e.g. new column added in a migration update).
     cols = conn.columns("dispatch_policy_partitions").map(&:name)
-    return false unless %w[total_admitted shard].all? { |c| cols.include?(c) }
+    return false unless %w[total_admitted shard decayed_admits decayed_admits_at].all? { |c| cols.include?(c) }
 
     true
   end

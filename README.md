@@ -235,6 +235,49 @@ DispatchTickLoopJob.perform_later("notifications")
 Each job uses `good_job_control_concurrency_with` (or
 `limits_concurrency`) so only one tick is active per policy at a time.
 
+## Fairness within a tick
+
+When several partitions are competing for admission inside the same tick,
+`dispatch_policy` reorders them by **least-recently-active first** so a
+hot partition with thousands of pending jobs cannot starve a cold one
+that just woke up.
+
+Each partition keeps an exponentially weighted moving average of its
+recent admissions (`decayed_admits`), updated atomically inside the
+admit transaction. The half-life is configurable; with the default 60s,
+a partition that admitted 100 jobs is "weighted as 50" 60s later, "25"
+two minutes later, and so on. Inside the tick, claimed partitions are
+sorted by this value ASC and processed in that order.
+
+Optionally, you can set a global cap on admissions per tick. When set,
+`fair_share = ceil(cap / claimed_partitions)` becomes the per-partition
+ceiling, and any leftover from partitions that didn't fill their share
+is redistributed in a second pass — still in least-recently-active
+order.
+
+```ruby
+DispatchPolicy.configure do |c|
+  c.fairness_half_life_seconds = 60   # default; tune per workload
+  c.tick_admission_budget      = nil  # default = no global cap
+end
+
+# Per-policy overrides:
+class FetchEndpointJob < ApplicationJob
+  dispatch_policy :endpoints do
+    fairness half_life: 30.seconds       # snappier rebalance for this policy
+    tick_admission_budget 200             # cap admissions/tick globally
+    gate :throttle, rate: ->(c) { c[:rate] }, per: 60, partition_by: ->(c) { c[:endpoint_id] }
+  end
+end
+```
+
+**Anti-stagnation guarantee.** The decayed-admits ordering only
+applies to the partitions already claimed in this tick. The selection
+itself (`claim_partitions`) still uses `last_checked_at NULLS FIRST`,
+so every partition with pending is visited in at most
+⌈active_partitions / partition_batch_size⌉ ticks regardless of how hot
+or cold it is.
+
 ## Configuration
 
 ```ruby
@@ -247,10 +290,13 @@ DispatchPolicy.configure do |c|
   c.partition_inactive_after  = 86_400   # GC partitions idle this long
   c.inflight_stale_after      = 300      # GC inflight rows whose worker stopped heartbeating
   c.sweep_every_ticks         = 50       # how often to run sweepers
+  c.fairness_half_life_seconds = 60      # EWMA half-life for in-tick reorder
+  c.tick_admission_budget      = nil     # global cap on admissions per tick (nil = none)
 end
 ```
 
-You can override `admission_batch_size` per policy via the DSL.
+You can override `admission_batch_size`, `fairness_half_life_seconds`,
+and `tick_admission_budget` per policy via the DSL.
 
 ## UI
 

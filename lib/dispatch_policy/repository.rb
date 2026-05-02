@@ -191,7 +191,8 @@ module DispatchPolicy
     # through `bulk_record_partition_denies!` instead, which collapses
     # many partitions into a single UPDATE…FROM(VALUES…) at the end of
     # the tick.
-    def claim_staged_jobs!(policy_name:, partition_key:, limit:, gate_state_patch:, retry_after:)
+    def claim_staged_jobs!(policy_name:, partition_key:, limit:, gate_state_patch:, retry_after:,
+                           half_life_seconds: nil)
       raise ArgumentError, "claim_staged_jobs! requires limit > 0" unless limit.positive?
 
       sql_select = <<~SQL.squish
@@ -211,11 +212,12 @@ module DispatchPolicy
       rows = connection.exec_query(sql_select, "claim_staged_jobs", [policy_name, partition_key, limit]).to_a
 
       record_partition_admit!(
-        policy_name:      policy_name,
-        partition_key:    partition_key,
-        admitted:         rows.size,
-        gate_state_patch: gate_state_patch,
-        retry_after:      retry_after
+        policy_name:       policy_name,
+        partition_key:     partition_key,
+        admitted:          rows.size,
+        gate_state_patch:  gate_state_patch,
+        retry_after:       retry_after,
+        half_life_seconds: half_life_seconds
       )
 
       rows.map { |r| normalize_staged(r) }
@@ -225,9 +227,37 @@ module DispatchPolicy
     # admission TX alongside the DELETE, so pending_count / total_admitted
     # / gate_state changes commit atomically with the claim and the
     # adapter handoff. For the deny case use `bulk_record_partition_denies!`.
-    def record_partition_admit!(policy_name:, partition_key:, admitted:, gate_state_patch:, retry_after:)
+    #
+    # When `half_life_seconds` is non-nil, the row's EWMA decayed_admits
+    # counter is also refreshed in the same UPDATE: previous value
+    # decays exponentially based on the elapsed wall time since the
+    # last update, then `admitted` is added on top. This keeps fairness
+    # state atomic with the admit (no separate write, no race) and
+    # leaves the partitions row's lock undisturbed.
+    def record_partition_admit!(policy_name:, partition_key:, admitted:, gate_state_patch:,
+                                retry_after:, half_life_seconds: nil)
       next_eligible_sql, next_eligible_params = next_eligible_clause(retry_after)
       gate_state_json = JSON.dump(gate_state_patch || {})
+
+      params = [policy_name, partition_key, admitted, gate_state_json, *next_eligible_params]
+
+      if half_life_seconds && half_life_seconds.to_f.positive?
+        # decay constant τ such that exp(-Δt/τ) halves every half_life:
+        # τ = half_life / ln(2). NULLIF guards a degenerate τ=0.
+        decay_idx        = params.size + 1
+        admitted_idx_for_ewma = 3
+        decay_tau        = half_life_seconds.to_f / Math.log(2)
+        params << decay_tau
+        decay_sql = <<~SQL.squish
+          decayed_admits     = decayed_admits *
+                                exp(- COALESCE(EXTRACT(EPOCH FROM (now() - decayed_admits_at)), 0)
+                                     / NULLIF($#{decay_idx}::double precision, 0))
+                              + $#{admitted_idx_for_ewma},
+          decayed_admits_at  = now(),
+        SQL
+      else
+        decay_sql = ""
+      end
 
       connection.exec_query(
         <<~SQL.squish,
@@ -237,11 +267,12 @@ module DispatchPolicy
               last_admit_at    = CASE WHEN $3 > 0 THEN now() ELSE last_admit_at END,
               gate_state       = gate_state || $4::jsonb,
               next_eligible_at = #{next_eligible_sql},
+              #{decay_sql}
               updated_at       = now()
           WHERE policy_name = $1 AND partition_key = $2
         SQL
         "record_partition_admit",
-        [policy_name, partition_key, admitted, gate_state_json, *next_eligible_params]
+        params
       )
     end
 

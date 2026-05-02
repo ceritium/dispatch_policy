@@ -33,6 +33,8 @@ class CreateDispatchPolicyTables < ActiveRecord::Migration[<%= Rails::VERSION::S
       t.datetime :last_admit_at
       t.datetime :next_eligible_at
       t.jsonb    :gate_state,         null: false, default: {}
+      t.float    :decayed_admits,     null: false, default: 0.0
+      t.datetime :decayed_admits_at
       t.timestamps
     end
     add_index :dispatch_policy_partitions,

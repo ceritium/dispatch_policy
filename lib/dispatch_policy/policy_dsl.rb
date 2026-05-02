@@ -21,6 +21,8 @@ module DispatchPolicy
       @queue_name           = nil
       @admission_batch_size = nil
       @shard_by_proc        = nil
+      @fairness_half_life_seconds = nil
+      @tick_admission_budget = nil
     end
 
     def context(callable = nil, &block)
@@ -42,6 +44,23 @@ module DispatchPolicy
 
     def admission_batch_size(size)
       @admission_batch_size = Integer(size)
+    end
+
+    # Per-policy override for the EWMA half-life used to weigh recent
+    # admissions when reordering claimed partitions inside the tick.
+    # Accepts a Numeric (seconds) or any object responding to `to_f`
+    # (so ActiveSupport durations like `30.seconds` work too).
+    #   fairness half_life: 30.seconds
+    def fairness(half_life: nil)
+      @fairness_half_life_seconds = Float(half_life) if half_life
+    end
+
+    # Per-policy override for the global tick admission cap. nil
+    # (default) means use config.tick_admission_budget; if that's also
+    # nil, no global cap is enforced and per-partition admission_batch_size
+    # is the only ceiling.
+    def tick_admission_budget(value)
+      @tick_admission_budget = Integer(value)
     end
 
     # Routes a partition to a specific shard. The proc receives the
@@ -70,7 +89,9 @@ module DispatchPolicy
         retry_strategy:       @retry_strategy,
         queue_name:           @queue_name,
         admission_batch_size: @admission_batch_size,
-        shard_by_proc:        @shard_by_proc
+        shard_by_proc:        @shard_by_proc,
+        fairness_half_life_seconds: @fairness_half_life_seconds,
+        tick_admission_budget: @tick_admission_budget
       )
     end
   end
