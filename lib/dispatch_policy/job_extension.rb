@@ -35,6 +35,15 @@ module DispatchPolicy
         return block.call
       end
 
+      # `klass.deserialize(payload)` (used elsewhere — see Forwarder, retries)
+      # only sets @serialized_arguments. ActiveJob defers the actual
+      # arguments deserialization to perform_now via the private
+      # deserialize_arguments_if_needed. If something deserializes a job
+      # and re-enqueues it without going through perform_now (e.g. a
+      # custom retry path), `job.arguments` would be []. Guard against
+      # that here so the context proc always sees the real args.
+      ensure_arguments_materialized!(job)
+
       queue_name    = job.queue_name&.to_s || policy.queue_name
       ctx           = policy.build_context(job.arguments, queue_name: queue_name)
       partition_key = policy.partition_key_for(ctx)
@@ -71,6 +80,17 @@ module DispatchPolicy
       nil
     end
 
+    # ActiveJob's `arguments` getter is a plain attr_accessor that returns
+    # the in-memory @arguments. After `klass.deserialize(payload)`, that
+    # array is empty until perform_now triggers
+    # `deserialize_arguments_if_needed` (a private method). Anywhere we
+    # read `job.arguments` outside of perform we must materialize first,
+    # or the context proc receives [] and falls back to its defaults.
+    def self.ensure_arguments_materialized!(job)
+      return unless job.respond_to?(:deserialize_arguments_if_needed, true)
+      job.send(:deserialize_arguments_if_needed)
+    end
+
     # ---- perform_all_later support -------------------------------------------
 
     # Rails 7.1+ exposes ActiveJob.perform_all_later. We override it to route
@@ -80,6 +100,13 @@ module DispatchPolicy
       def perform_all_later(*jobs)
         flat = jobs.flatten
         return super if flat.empty?
+        # Critical: respect Bypass exactly like the per-job around_enqueue
+        # does. Forwarder.dispatch deserializes admitted jobs and calls
+        # ActiveJob.perform_all_later under Bypass.with — without this
+        # check, BulkEnqueue would re-stage them, creating an infinite
+        # admission loop with the wrong context (job.arguments is still []
+        # at that point because ActiveJob defers deserialization).
+        return super if DispatchPolicy::Bypass.active?
         return super unless DispatchPolicy.registry.size.positive?
 
         with_policy, without_policy = flat.partition do |j|
@@ -93,6 +120,10 @@ module DispatchPolicy
         rows = with_policy.filter_map do |job|
           policy = DispatchPolicy.registry.fetch(job.class.dispatch_policy_name)
           next unless policy
+
+          # See JobExtension.ensure_arguments_materialized! — we need this
+          # for the same reason as the single-enqueue path.
+          JobExtension.ensure_arguments_materialized!(job)
 
           queue_name    = job.queue_name&.to_s || policy.queue_name
           ctx           = policy.build_context(job.arguments, queue_name: queue_name)
