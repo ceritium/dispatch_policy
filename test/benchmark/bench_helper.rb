@@ -16,6 +16,7 @@
 #   Bench.print_report
 
 require "json"
+require "securerandom"
 require "active_record"
 require "active_job"
 ActiveJob::Base.queue_adapter = :test
@@ -92,11 +93,14 @@ module Bench
       SQL
     end
 
-    # Staged: N × staged_per_partition rows.
+    # Staged: N × staged_per_partition rows. job_id MUST be a real UUID
+    # — good_job stores it on a uuid-typed column, and a non-uuid value
+    # is silently dropped to NULL on insert (which then fails the
+    # successfully_enqueued? check Forwarder uses).
     staged_values = []
     n_partitions.times do |i|
-      staged_per_partition.times do |j|
-        job_id = "p#{i}-#{j}"
+      staged_per_partition.times do |_j|
+        job_id = SecureRandom.uuid
         job_data = {
           job_id:     job_id,
           job_class:  "BenchJob",
