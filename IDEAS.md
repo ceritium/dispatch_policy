@@ -70,3 +70,85 @@ The relationships that should hold:
 bug where it stopped refreshing during the perform (the 5min
 sweeper killed inflight rows of legitimately long-running jobs).
 Once that's fixed, this is defaults tuning and monitoring.
+
+## `gate :global_cap` — rate-limit shared across all partitions
+
+**Symptom / what's missing.** Today we have `tick_admission_budget`
+as a per-tick cap at the policy level: it caps total admissions per
+tick, distributed via `fair_share` across the claimed partitions.
+That works as a global rate limit when the TickLoop runs at a
+predictable cadence (cap=50 with idle_pause=0.5s ≈ 100/sec total),
+but it has three blind spots:
+
+- **Sensitive to tick rate.** Faster ticks under load admit more
+  per second than slow ticks, even with the same cap.
+- **No persistent token bucket.** The cap resets every tick. An
+  external system that cares about request-per-time intervals
+  (e.g. a contractual rate ceiling on a paid API) sees burstier
+  traffic than the configured rate.
+- **Per-shard, not cross-shard.** With 4 shards × `tick_admission_budget = 50`
+  the system admits up to 200/tick globally. A true global cap
+  would be shared across shards.
+
+**Possible design.**
+
+A new gate type:
+
+```ruby
+dispatch_policy :foo do
+  partition_by ->(c) { c[:tenant] }
+  gate :global_cap, rate: 5000, per: 60   # 5000/min globally
+  gate :throttle,   rate: 100,  per: 60   # plus per-tenant rate
+end
+```
+
+State lives in a single shared row, not per-partition:
+
+- Option A: a row in `dispatch_policy_partitions` with a sentinel
+  key like `partition_key = "__global__"` keyed off
+  `(policy_name, "__global__")`. Reuses the existing
+  `gate_state` jsonb column and the partition lock semantics.
+- Option B: a new table `dispatch_policy_global_buckets` keyed by
+  `(policy_name, gate_name)`. Cleaner schema; one extra table.
+
+Option A is the lighter touch — same UPSERT machinery, same
+`SELECT … FOR UPDATE` semantics, no migration cost. The only quirk
+is making `claim_partitions` skip the sentinel row so it doesn't
+appear in the operator UI as a fake "partition".
+
+**Tick integration.** The `:global_cap` gate runs FIRST in the
+pipeline (before `:throttle` and `:concurrency`) so its budget caps
+all subsequent gates. Each tick, the gate:
+
+1. Reads the global bucket state from the sentinel row.
+2. Refills based on elapsed time: `tokens = min(rate, tokens + Δt × refill_rate)`.
+3. Returns `allowed = floor(tokens)` to the pipeline (capped by
+   `admit_budget` from the previous gate).
+4. After admission, persists the consumed tokens via UPSERT in the
+   same TX as the per-partition admit. The single sentinel row
+   becomes a hot lock — only one tick worker (or shard) writes to
+   it per admission. Acceptable as long as the TX time stays low.
+
+**Cross-shard contention.** This is the cost. Multiple shard
+workers admitting simultaneously serialize on the global bucket
+row's `FOR UPDATE`. Mitigations:
+
+- Keep the global TX short (the bucket math is O(1), microseconds).
+- Add a soft tier: the gate optimistically reads the bucket without
+  locking, returns its allowed count, and only locks during the
+  per-partition admit to consume. Risk: two ticks see the same
+  tokens and over-admit by one batch each. Bound is `2 × admission_batch_size`,
+  acceptable for soft caps. Document as the trade-off.
+
+**Operator visibility.** The dashboard shows the live token count
+of each `:global_cap` gate (read from the sentinel row's
+`gate_state`) plus the recent admit rate as a percentage of the
+configured `rate`. `OperatorHints` fires when admits ≥ 80% of the
+cap.
+
+**Why deferred.** `tick_admission_budget` covers the 95% case.
+A real `:global_cap` gate is justified when (a) the host needs a
+hard contractual rate, (b) tick durations are highly variable, or
+(c) cross-shard sharing of a single cap matters. Until those needs
+land in real workloads, the per-tick budget plus operator
+monitoring is the simpler tool.
