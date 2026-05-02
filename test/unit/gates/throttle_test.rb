@@ -23,7 +23,7 @@ class ThrottleGateTest < Minitest::Test
   end
 
   def test_first_call_admits_full_capacity
-    gate = DispatchPolicy::Gates::Throttle.new(rate: 10, per: 60, partition_by: ->(_c) { "x" })
+    gate = DispatchPolicy::Gates::Throttle.new(rate: 10, per: 60)
     decision = gate.evaluate(DispatchPolicy::Context.wrap({}), empty_partition, 100)
 
     assert_equal 10, decision.allowed
@@ -31,7 +31,7 @@ class ThrottleGateTest < Minitest::Test
   end
 
   def test_admit_budget_caps_allowed
-    gate = DispatchPolicy::Gates::Throttle.new(rate: 10, per: 60, partition_by: ->(_c) { "x" })
+    gate = DispatchPolicy::Gates::Throttle.new(rate: 10, per: 60)
     decision = gate.evaluate(DispatchPolicy::Context.wrap({}), empty_partition, 3)
 
     assert_equal 3, decision.allowed
@@ -39,7 +39,7 @@ class ThrottleGateTest < Minitest::Test
   end
 
   def test_no_tokens_returns_retry_after
-    gate = DispatchPolicy::Gates::Throttle.new(rate: 10, per: 60, partition_by: ->(_c) { "x" })
+    gate = DispatchPolicy::Gates::Throttle.new(rate: 10, per: 60)
 
     state = { "gate_state" => { "throttle" => { "tokens" => 0.0, "refilled_at" => @clock_now.to_f } } }
     partition = empty_partition.merge(state)
@@ -52,7 +52,7 @@ class ThrottleGateTest < Minitest::Test
   end
 
   def test_refill_after_elapsed_time
-    gate = DispatchPolicy::Gates::Throttle.new(rate: 10, per: 60, partition_by: ->(_c) { "x" })
+    gate = DispatchPolicy::Gates::Throttle.new(rate: 10, per: 60)
 
     state = { "gate_state" => { "throttle" => { "tokens" => 0.0, "refilled_at" => @clock_now.to_f } } }
     partition = empty_partition.merge(state)
@@ -65,8 +65,7 @@ class ThrottleGateTest < Minitest::Test
   def test_dynamic_rate_uses_ctx_value
     gate = DispatchPolicy::Gates::Throttle.new(
       rate: ->(c) { c[:rate_limit] },
-      per:  60,
-      partition_by: ->(_c) { "x" }
+      per:  60
     )
 
     decision = gate.evaluate(
@@ -78,14 +77,14 @@ class ThrottleGateTest < Minitest::Test
   end
 
   def test_zero_rate_denies
-    gate = DispatchPolicy::Gates::Throttle.new(rate: 0, per: 60, partition_by: ->(_c) { "x" })
+    gate = DispatchPolicy::Gates::Throttle.new(rate: 0, per: 60)
     decision = gate.evaluate(DispatchPolicy::Context.wrap({}), empty_partition, 100)
     assert_equal 0, decision.allowed
   end
 
   def test_zero_per_raises_on_construction
     assert_raises(ArgumentError) do
-      DispatchPolicy::Gates::Throttle.new(rate: 5, per: 0, partition_by: ->(_c) { "x" })
+      DispatchPolicy::Gates::Throttle.new(rate: 5, per: 0)
     end
   end
 end

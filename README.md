@@ -104,15 +104,12 @@ use the same canonical key (`ctx[:endpoint_id]`). Throttle's bucket
 sits on a single partition row per endpoint; concurrency counts inflight
 under that same key. No dilution.
 
-You can still set `partition_by:` per gate (for backwards
-compatibility), but the throttle gate's bucket lives in the staged
-partition row, so if you give two gates different `partition_by:`
-lambdas the staged partition_key becomes their concatenation, which
-splits the throttle bucket N ways. Symptom: the rate limit is
-"`rate × N_other_partition_values`" instead of "`rate`".
-
-→ Use one `partition_by` at the policy level. If you need different
-gate scopes, **split into separate policies**.
+`partition_by` is **required** on every policy — `dispatch_policy`
+raises `InvalidPolicy` at boot if the block doesn't declare one. If
+you need genuinely different scopes per gate (throttle by endpoint
+AND concurrency by account, with each enforcing at its own scope),
+**split into two policies** and chain them: the first staging policy
+admits, its perform_later inside the worker enqueues the second.
 
 ## Declaring a policy
 
@@ -131,14 +128,14 @@ class FetchEndpointJob < ApplicationJob
       }
     }
 
+    partition_by ->(ctx) { ctx[:endpoint_id] }
+
     gate :throttle,
-         rate:         ->(ctx) { ctx[:rate_limit] },
-         per:          1.minute,
-         partition_by: ->(ctx) { "ep:#{ctx[:endpoint_id]}" }
+         rate: ->(ctx) { ctx[:rate_limit] },
+         per:  1.minute
 
     gate :concurrency,
-         max:          ->(ctx) { ctx[:max_per_account] || 5 },
-         partition_by: ->(ctx) { "acct:#{ctx[:account_id]}" }
+         max: ->(ctx) { ctx[:max_per_account] || 5 }
 
     retry_strategy :restage      # default; alternative: :bypass
   end
@@ -210,11 +207,10 @@ class EventsJob < ApplicationJob
 
   dispatch_policy :events do
     context ->(args) { { account_id: args.first["account_id"] } }
-    shard_by ->(ctx) { ctx[:queue_name] }     # use the queue itself
+    shard_by     ->(ctx) { ctx[:queue_name] }   # use the queue itself
+    partition_by ->(ctx) { "acct:#{ctx[:account_id]}" }
 
-    gate :concurrency,
-         max:          50,
-         partition_by: ->(c) { "acct:#{c[:account_id]}" }
+    gate :concurrency, max: 50
   end
 end
 ```
@@ -356,10 +352,10 @@ end
 # Per-policy overrides:
 class FetchEndpointJob < ApplicationJob
   dispatch_policy :endpoints do
+    partition_by ->(c) { c[:endpoint_id] }
     fairness half_life: 30.seconds   # snappier rebalance for this policy
     tick_admission_budget 200         # cap admissions/tick globally
-    gate :throttle, rate: ->(c) { c[:rate] }, per: 60,
-                    partition_by: ->(c) { c[:endpoint_id] }
+    gate :throttle, rate: ->(c) { c[:rate] }, per: 60
   end
 end
 ```

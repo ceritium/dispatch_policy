@@ -52,7 +52,8 @@ class TickAtomicAdmissionTest < Minitest::Test
     DispatchPolicy.reset_registry!
     policy = DispatchPolicy::PolicyDSL.build("atomic_test") do
       context ->(_args) { {} }
-      gate :throttle, rate: 100, per: 60, partition_by: ->(_c) { "k" }
+      partition_by ->(_c) { "k" }
+      gate :throttle, rate: 100, per: 60
     end
     DispatchPolicy.registry.register(policy)
     TestTickJob.dispatch_policy_name = "atomic_test"
@@ -165,7 +166,8 @@ class TickAtomicAdmissionTest < Minitest::Test
           attrs = args.first || {}
           { endpoint: attrs[:endpoint] || attrs["endpoint"] || "FALLBACK" }
         }
-        gate :throttle, rate: 1000, per: 60, partition_by: ->(c) { "ep:#{c[:endpoint]}" }
+        partition_by ->(c) { "ep:#{c[:endpoint]}" }
+        gate :throttle, rate: 1000, per: 60
       end
     )
 
@@ -173,7 +175,7 @@ class TickAtomicAdmissionTest < Minitest::Test
 
     assert_equal 1, DispatchPolicy::StagedJob.count
     partition = DispatchPolicy::Partition.first
-    assert_equal "throttle=ep:real-value", partition.partition_key,
+    assert_equal "ep:real-value", partition.partition_key,
                  "stage path must read kwargs, not fallback"
 
     begin
@@ -185,8 +187,8 @@ class TickAtomicAdmissionTest < Minitest::Test
     assert_equal 1, received.size, "the adapter must receive exactly one enqueue (no loop)"
     assert_equal 0, DispatchPolicy::StagedJob.count,
                  "if staged_jobs > 0 here, Forwarder re-staged the job under Bypass — the regression"
-    assert_equal 1, DispatchPolicy::Partition.where(partition_key: "throttle=ep:real-value").count
-    refute DispatchPolicy::Partition.exists?(partition_key: "throttle=ep:FALLBACK"),
+    assert_equal 1, DispatchPolicy::Partition.where(partition_key: "ep:real-value").count
+    refute DispatchPolicy::Partition.exists?(partition_key: "ep:FALLBACK"),
            "the FALLBACK partition would only appear if BulkEnqueue read the empty @arguments after deserialize"
   end
 end

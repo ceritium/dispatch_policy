@@ -42,7 +42,8 @@ module DispatchPolicy
             4) Declare a policy in any ActiveJob:
                  dispatch_policy :name do
                    context ->(args) { { ... } }
-                   gate :throttle, rate: 10, per: 60, partition_by: ->(c) { c[:key] }
+                   partition_by ->(c) { c[:key] }
+                   gate :throttle, rate: 10, per: 60
                  end
 
         MSG

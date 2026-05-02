@@ -19,10 +19,8 @@ class HighThrottleJob < ApplicationJob
       }
     }
 
-    gate :throttle,
-         rate:         ->(c) { c[:rate] },
-         per:          60,
-         partition_by: ->(c) { "ep:#{c[:endpoint]}" }
+    partition_by ->(c) { "ep:#{c[:endpoint]}" }
+    gate :throttle, rate: ->(c) { c[:rate] }, per: 60
   end
 
   def perform(attrs = {})

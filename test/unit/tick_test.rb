@@ -8,7 +8,8 @@ class TickPipelineSmokeTest < Minitest::Test
   def test_pipeline_combines_gates
     policy = DispatchPolicy::PolicyDSL.build("p") do
       context ->(args) { { rate: args.first || 5 } }
-      gate :throttle, rate: ->(c) { c[:rate] }, per: 60, partition_by: ->(_c) { "k" }
+      partition_by ->(_c) { "k" }
+      gate :throttle, rate: ->(c) { c[:rate] }, per: 60
     end
 
     pipeline = DispatchPolicy::Pipeline.new(policy)

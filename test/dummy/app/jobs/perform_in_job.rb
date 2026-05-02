@@ -7,7 +7,8 @@ class PerformInJob < ApplicationJob
 
   dispatch_policy :perform_in_demo do
     context ->(args) { { key: (args.first || {})["key"] || "default" } }
-    gate :throttle, rate: 30, per: 60, partition_by: ->(c) { c[:key] }
+    partition_by ->(c) { c[:key] }
+    gate :throttle, rate: 30, per: 60
   end
 
   def perform(attrs = {})

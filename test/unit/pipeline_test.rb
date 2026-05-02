@@ -6,7 +6,7 @@ class PipelineTest < Minitest::Test
   class FakeGate < DispatchPolicy::Gate
     attr_reader :evaluations
     def initialize(name:, decision:)
-      super(partition_by: ->(_c) { name.to_s })
+      super()
       @gate_name  = name
       @decision   = decision
       @evaluations = 0
@@ -22,10 +22,11 @@ class PipelineTest < Minitest::Test
 
   def make_policy(gates)
     DispatchPolicy::Policy.new(
-      name:         "p",
-      context_proc: ->(_a) { {} },
-      gates:        gates,
-      retry_strategy: :restage
+      name:              "p",
+      context_proc:      ->(_a) { {} },
+      gates:             gates,
+      retry_strategy:    :restage,
+      partition_by_proc: ->(_c) { "k" }
     )
   end
 
