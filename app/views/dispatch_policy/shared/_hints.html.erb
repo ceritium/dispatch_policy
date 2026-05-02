@@ -1,0 +1,13 @@
+<% if hints.any? %>
+  <section class="dp-section">
+    <h2>Hints</h2>
+    <ul class="dp-list dp-hint-list">
+      <% hints.each do |hint| %>
+        <li class="dp-hint-<%= hint.level %>">
+          <span class="dp-hint-badge"><%= hint.level.to_s.upcase %></span>
+          <%= hint.message %>
+        </li>
+      <% end %>
+    </ul>
+  </section>
+<% end %>

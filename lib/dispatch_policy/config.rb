@@ -16,7 +16,8 @@ module DispatchPolicy
                   :metrics_retention,
                   :database_role,
                   :fairness_half_life_seconds,
-                  :tick_admission_budget
+                  :tick_admission_budget,
+                  :adapter_throughput_target
 
     def initialize
       @tick_max_duration         = 25
@@ -44,6 +45,12 @@ module DispatchPolicy
       # fair_share = ceil(cap / partitions_seen) is the per-partition
       # ceiling, with redistribution of leftover budget after pass-1.
       @tick_admission_budget     = nil
+      # Operator-supplied "ceiling" of the underlying adapter, in jobs
+      # per second. The dashboard renders the live admit rate as a
+      # percentage of this and fires a hint when we're closing on it.
+      # nil = no ceiling reference (just shows the absolute rate).
+      # Measured locally against good_job: ~3500 jobs/sec per worker.
+      @adapter_throughput_target = nil
     end
 
     def now

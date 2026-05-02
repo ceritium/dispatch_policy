@@ -50,6 +50,32 @@ module DispatchPolicy
       @denied_reasons = Repository.denied_reasons_summary(policy_name: @policy_name, since: now - 15 * 60)
       @round_trip     = Repository.partition_round_trip_stats(policy_name: @policy_name)
       @sparkline      = Repository.tick_samples_buckets(policy_name: @policy_name, since: now - 30 * 60, bucket_seconds: 60)
+      @pending_trend  = Repository.trend_direction(@sparkline.map { |b| b[:pending_total] })
+
+      cfg = DispatchPolicy.config
+      @capacity = {
+        admitted_per_minute:  @windows["1m"][:jobs_admitted],
+        adapter_target_jps:   cfg.adapter_throughput_target,
+        avg_tick_ms:          @windows["1m"][:avg_duration_ms],
+        max_tick_ms:          @windows["1m"][:max_duration_ms],
+        tick_max_duration_ms: cfg.tick_max_duration.to_i * 1000
+      }
+
+      @hints = OperatorHints.for(
+        tick_max_duration_ms: @capacity[:tick_max_duration_ms],
+        avg_tick_ms:          @capacity[:avg_tick_ms],
+        max_tick_ms:          @capacity[:max_tick_ms],
+        pending_total:        @totals[:pending],
+        admitted_per_minute:  @capacity[:admitted_per_minute],
+        forward_failures:     @windows["1m"][:forward_failures],
+        jobs_admitted:        @windows["1m"][:jobs_admitted],
+        active_partitions:    @round_trip[:active_partitions],
+        never_checked:        @round_trip[:never_checked],
+        in_backoff:           @round_trip[:in_backoff],
+        total_partitions:     @totals[:partitions],
+        adapter_target_jps:   @capacity[:adapter_target_jps],
+        pending_trend:        @pending_trend
+      )
     end
 
     def pause

@@ -127,6 +127,26 @@ h2 { font-size: 15px; margin: 24px 0 10px; font-weight: 600; color: #374151; tex
   background: #1d2330; color: #f6f7fa; padding: 2px 8px; letter-spacing: 1px;
 }
 
+.dp-hint-list { padding-left: 0; list-style: none; }
+.dp-hint-list li {
+  margin: 8px 0; padding: 10px 14px;
+  border-left: 4px solid #cfd5df; background: #fafbfd;
+  border-radius: 0 4px 4px 0;
+  font-size: 13px; line-height: 1.5;
+}
+.dp-hint-list li.dp-hint-info     { border-left-color: #1f4ed8; background: #eff4ff; }
+.dp-hint-list li.dp-hint-warn     { border-left-color: #b45309; background: #fff7e6; }
+.dp-hint-list li.dp-hint-critical { border-left-color: #b91c1c; background: #fbe7e6; }
+.dp-hint-badge {
+  display: inline-block; margin-right: 8px; padding: 1px 7px;
+  font-size: 10.5px; font-weight: 700; letter-spacing: 0.5px;
+  border-radius: 3px; color: #fff; background: #6b7280;
+  vertical-align: 1px;
+}
+.dp-hint-info     .dp-hint-badge { background: #1f4ed8; }
+.dp-hint-warn     .dp-hint-badge { background: #b45309; }
+.dp-hint-critical .dp-hint-badge { background: #b91c1c; }
+
 .dp-pagination {
   display: flex; justify-content: space-between; align-items: center;
   padding: 14px 0; gap: 12px; flex-wrap: wrap;
