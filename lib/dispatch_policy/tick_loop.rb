@@ -19,6 +19,14 @@ module DispatchPolicy
       loop do
         break if stop_when.call
 
+        unless DispatchPolicy.config.enabled
+          # Master switch off: stop polling. The job that drives
+          # TickLoop.run will re-schedule itself; we exit cleanly so
+          # the next iteration sees the flag and stops too.
+          logger&.info("[dispatch_policy] TickLoop exiting because config.enabled = false")
+          break
+        end
+
         names = policy_names(policy_name)
         if names.empty?
           sleep(config.idle_pause)
