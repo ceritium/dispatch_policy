@@ -37,15 +37,18 @@ class FairnessDemoJob < ApplicationJob
       { tenant: attrs["tenant"] || attrs[:tenant] || "unknown" }
     }
 
+    # Single canonical partition scope at the policy level. Both the
+    # throttle bucket (lives in partitions.gate_state) and any
+    # concurrency cap (would read inflight_jobs by the same key) share
+    # this scope — no rate dilution.
+    partition_by ->(c) { "tenant:#{c[:tenant]}" }
+
     # rate high enough that the throttle never binds — the only thing
     # gating admission is fair_share + tick_admission_budget.
-    gate :throttle,
-         rate:         10_000,
-         per:          60,
-         partition_by: ->(c) { "tenant:#{c[:tenant]}" }
+    gate :throttle, rate: 10_000, per: 60
 
     fairness half_life: 30.seconds
-    tick_admission_budget 30
+    # tick_admission_budget 30
   end
 
   def perform(attrs = {})

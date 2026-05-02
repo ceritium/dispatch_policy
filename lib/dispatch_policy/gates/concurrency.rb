@@ -46,10 +46,24 @@ module DispatchPolicy
       end
 
       # Stable key used by InflightTracker (write) and #evaluate (read).
-      # Includes the gate name so multiple gates of the same name (future)
-      # could coexist; for now there is only one concurrency gate per policy.
-      def inflight_partition_key(_policy_name, ctx)
-        "concurrency=#{partition_for(ctx)}"
+      #
+      # When the policy declares its own `partition_by` (the recommended
+      # form), the inflight key matches the staged_jobs partition_key
+      # exactly — same canonical scope for all gates, no dilution.
+      #
+      # Without a policy-level partition_by, falls back to the gate's
+      # own partition_for(ctx) prefixed with the gate name. This keeps
+      # the legacy per-gate `partition_by:` working: inflight is keyed
+      # by `"concurrency=<account>"` independent of the staged
+      # partition_key, so concurrency caps are still enforced at the
+      # gate's intended scope.
+      def inflight_partition_key(policy_name, ctx)
+        policy = DispatchPolicy.registry.fetch(policy_name)
+        if policy&.partition_by_proc
+          policy.partition_for(ctx)
+        else
+          "concurrency=#{partition_for(ctx)}"
+        end
       end
 
       private

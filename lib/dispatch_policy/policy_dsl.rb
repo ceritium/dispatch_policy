@@ -21,6 +21,7 @@ module DispatchPolicy
       @queue_name           = nil
       @admission_batch_size = nil
       @shard_by_proc        = nil
+      @partition_by_proc    = nil
       @fairness_half_life_seconds = nil
       @tick_admission_budget = nil
     end
@@ -63,6 +64,32 @@ module DispatchPolicy
       @tick_admission_budget = Integer(value)
     end
 
+    # Defines the partition scope at the POLICY level — every gate in
+    # this policy uses this single proc to compute its scope. Set this
+    # instead of per-gate `partition_by:` to avoid the throttle-rate
+    # dilution that comes from gates having different scopes (the
+    # token bucket lives in the staged-partition row, so a finer
+    # combined partition_key splits the bucket N ways).
+    #
+    #   dispatch_policy :endpoints do
+    #     partition_by ->(ctx) { ctx[:endpoint_id] }
+    #     gate :throttle,    rate: 60, per: 60
+    #     gate :concurrency, max: 5
+    #   end
+    #
+    # When set, the staged_jobs row and the inflight_jobs row both use
+    # the same canonical key, so the throttle rate and the concurrency
+    # cap are enforced at exactly the scope you declare.
+    #
+    # Per-gate `partition_by:` still works for backwards compatibility
+    # (and stays useful when gates need genuinely different scopes —
+    # though the throttle dilution caveat applies). When both are set,
+    # the policy-level wins; gates' own partition_by is ignored and a
+    # warning is emitted at policy build time.
+    def partition_by(callable = nil, &block)
+      @partition_by_proc = callable || block
+    end
+
     # Routes a partition to a specific shard. The proc receives the
     # enriched Context (which includes :queue_name from the job) and
     # returns a string. Tick loops can be scoped per-shard so multiple
@@ -90,6 +117,7 @@ module DispatchPolicy
         queue_name:           @queue_name,
         admission_batch_size: @admission_batch_size,
         shard_by_proc:        @shard_by_proc,
+        partition_by_proc:    @partition_by_proc,
         fairness_half_life_seconds: @fairness_half_life_seconds,
         tick_admission_budget: @tick_admission_budget
       )

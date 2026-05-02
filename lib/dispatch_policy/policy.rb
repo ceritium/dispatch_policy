@@ -5,11 +5,12 @@ module DispatchPolicy
     DEFAULT_SHARD = "default"
 
     attr_reader :name, :context_proc, :gates, :retry_strategy, :queue_name,
-                :admission_batch_size, :shard_by_proc,
+                :admission_batch_size, :shard_by_proc, :partition_by_proc,
                 :fairness_half_life_seconds, :tick_admission_budget
 
     def initialize(name:, context_proc:, gates:, retry_strategy: :restage,
                    queue_name: nil, admission_batch_size: nil, shard_by_proc: nil,
+                   partition_by_proc: nil,
                    fairness_half_life_seconds: nil, tick_admission_budget: nil)
       @name                 = name.to_s
       @context_proc         = context_proc
@@ -18,6 +19,7 @@ module DispatchPolicy
       @queue_name           = queue_name
       @admission_batch_size = admission_batch_size
       @shard_by_proc        = shard_by_proc
+      @partition_by_proc    = partition_by_proc
       @fairness_half_life_seconds = fairness_half_life_seconds
       @tick_admission_budget = tick_admission_budget
 
@@ -37,7 +39,21 @@ module DispatchPolicy
     end
 
     def partition_key_for(ctx)
-      gates.map { |gate| "#{gate.name}=#{gate.partition_for(ctx)}" }.join("|")
+      if @partition_by_proc
+        partition_for(ctx)
+      else
+        gates.map { |gate| "#{gate.name}=#{gate.partition_for(ctx)}" }.join("|")
+      end
+    end
+
+    # Policy-level partition scope (canonical when set). Both the
+    # staged_jobs row and the concurrency gate's inflight_jobs row use
+    # this single value as their partition_key, so all gates enforce
+    # their state at exactly the same scope.
+    def partition_for(ctx)
+      return nil unless @partition_by_proc
+      value = @partition_by_proc.call(ctx)
+      value.nil? ? "" : value.to_s
     end
 
     # The shard a partition belongs to. Stable per (policy, partition_key)
@@ -65,6 +81,15 @@ module DispatchPolicy
       raise InvalidPolicy, "at least one gate required" if @gates.empty?
       unless %i[restage bypass].include?(@retry_strategy)
         raise InvalidPolicy, "retry_strategy must be :restage or :bypass"
+      end
+
+      if @partition_by_proc && @gates.any? { |g| g.partition_proc }
+        gate_names = @gates.select { |g| g.partition_proc }.map(&:name).map(&:to_s).join(", ")
+        DispatchPolicy.config.logger&.warn(
+          "[dispatch_policy] policy #{@name.inspect}: partition_by is set at the " \
+          "policy level AND on gates (#{gate_names}). The policy-level value wins; " \
+          "gates' own partition_by is ignored."
+        )
       end
     end
   end

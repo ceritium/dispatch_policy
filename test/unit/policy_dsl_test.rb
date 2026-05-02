@@ -92,4 +92,58 @@ class PolicyDSLTest < Minitest::Test
     end
     assert_equal "default", policy.shard_for(policy.build_context([]))
   end
+
+  # ----- policy-level partition_by ----------------------------------------
+
+  def test_policy_level_partition_by_replaces_concatenation
+    policy = DispatchPolicy::PolicyDSL.build("p") do
+      context ->(args) { { tenant: args.first } }
+      partition_by ->(c) { "tenant:#{c[:tenant]}" }
+      gate :throttle,    rate: 10, per: 60
+      gate :concurrency, max:  5
+    end
+
+    ctx = policy.build_context(["acme"])
+    assert_equal "tenant:acme", policy.partition_key_for(ctx),
+                 "policy-level partition_by must produce a single canonical key"
+    assert_equal "tenant:acme", policy.partition_for(ctx)
+  end
+
+  def test_policy_level_partition_by_winning_emits_warning_when_gates_also_set_one
+    captured = StringIO.new
+    DispatchPolicy.config.logger = Logger.new(captured)
+
+    DispatchPolicy::PolicyDSL.build("p") do
+      partition_by    ->(c) { c[:tenant] }
+      gate :throttle, rate: 1, per: 60, partition_by: ->(_c) { "ignored" }
+    end
+
+    assert_match(/policy-level value wins/, captured.string)
+  ensure
+    DispatchPolicy.reset_config!
+  end
+
+  def test_policy_level_partition_by_used_for_concurrency_inflight_key
+    DispatchPolicy.reset_registry!
+    policy = DispatchPolicy::PolicyDSL.build("p") do
+      context ->(args) { { tenant: args.first } }
+      partition_by ->(c) { "tenant:#{c[:tenant]}" }
+      gate :concurrency, max: 5
+    end
+    DispatchPolicy.registry.register(policy)
+
+    concurrency = policy.gates.find { |g| g.name == :concurrency }
+    ctx = policy.build_context(["acme"])
+    # Inflight key matches the staged partition_key — same canonical scope.
+    assert_equal "tenant:acme", concurrency.inflight_partition_key("p", ctx)
+  ensure
+    DispatchPolicy.reset_registry!
+  end
+
+  def test_partition_for_returns_nil_when_policy_level_partition_by_unset
+    policy = DispatchPolicy::PolicyDSL.build("p") do
+      gate :throttle, rate: 1, per: 60, partition_by: ->(_c) { "k" }
+    end
+    assert_nil policy.partition_for(policy.build_context([]))
+  end
 end
