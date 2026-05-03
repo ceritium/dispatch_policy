@@ -26,6 +26,7 @@ require_relative "dispatch_policy/tick"
 require_relative "dispatch_policy/tick_loop"
 require_relative "dispatch_policy/job_extension"
 require_relative "dispatch_policy/operator_hints"
+require_relative "dispatch_policy/assets"
 
 module DispatchPolicy
   class Error < StandardError; end

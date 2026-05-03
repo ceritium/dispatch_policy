@@ -19,4 +19,6 @@ DispatchPolicy::Engine.routes.draw do
   end
 
   resources :staged_jobs, only: %i[show]
+
+  get "assets/turbo-:digest.js", to: "assets#turbo", as: :turbo_asset
 end
