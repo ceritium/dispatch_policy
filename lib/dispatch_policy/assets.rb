@@ -17,9 +17,13 @@ module DispatchPolicy
   #
   # No other code change is required — TURBO_DIGEST is content-addressed.
   module Assets
-    ROOT = Pathname.new(File.expand_path("../../app/assets/javascripts/dispatch_policy", __dir__))
+    JS_ROOT    = Pathname.new(File.expand_path("../../app/assets/javascripts/dispatch_policy", __dir__))
+    IMAGE_ROOT = Pathname.new(File.expand_path("../../app/assets/images/dispatch_policy", __dir__))
 
-    TURBO_BODY   = ROOT.join("turbo.es2017-umd.min.js").read.freeze
+    TURBO_BODY   = JS_ROOT.join("turbo.es2017-umd.min.js").read.freeze
     TURBO_DIGEST = Digest::SHA1.hexdigest(TURBO_BODY)[0, 12].freeze
+
+    LOGO_BODY   = IMAGE_ROOT.join("logo.svg").read.freeze
+    LOGO_DIGEST = Digest::SHA1.hexdigest(LOGO_BODY)[0, 12].freeze
   end
 end

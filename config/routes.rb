@@ -20,5 +20,6 @@ DispatchPolicy::Engine.routes.draw do
 
   resources :staged_jobs, only: %i[show]
 
-  get "assets/turbo-:digest.js", to: "assets#turbo", as: :turbo_asset
+  get "assets/turbo-:digest.js",  to: "assets#turbo", as: :turbo_asset
+  get "assets/logo-:digest.svg",  to: "assets#logo",  as: :logo_asset
 end
