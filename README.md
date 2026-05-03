@@ -61,20 +61,31 @@ sparklines:
 
 ![Admin index](https://raw.githubusercontent.com/ceritium/dispatch_policy/master/screenshots/admin-index.png)
 
-A policy detail page — totals, EWMA queue-lag chart, watched
-partitions, and a searchable list of all partitions:
+A policy detail page — totals, EWMA queue-lag chart, throughput
+window, and a searchable list of all partitions:
 
-![Policy detail](https://raw.githubusercontent.com/ceritium/dispatch_policy/master/screenshots/admin-policy-tenant_work_job.png)
+![Policy detail](https://raw.githubusercontent.com/ceritium/dispatch_policy/master/screenshots/admin-policy-fairness_demo.png)
 
 Other per-policy pages:
-[email_job](https://raw.githubusercontent.com/ceritium/dispatch_policy/master/screenshots/admin-policy-email_job.png) ·
-[report_job](https://raw.githubusercontent.com/ceritium/dispatch_policy/master/screenshots/admin-policy-report_job.png) ·
-[webhook_delivery_job](https://raw.githubusercontent.com/ceritium/dispatch_policy/master/screenshots/admin-policy-webhook_delivery_job.png) ·
-[maintenance_job](https://raw.githubusercontent.com/ceritium/dispatch_policy/master/screenshots/admin-policy-maintenance_job.png).
+[adaptive_demo](https://raw.githubusercontent.com/ceritium/dispatch_policy/master/screenshots/admin-policy-adaptive_demo.png) ·
+[high_throttle](https://raw.githubusercontent.com/ceritium/dispatch_policy/master/screenshots/admin-policy-high_throttle.png) ·
+[high_concurrency](https://raw.githubusercontent.com/ceritium/dispatch_policy/master/screenshots/admin-policy-high_concurrency.png) ·
+[mixed](https://raw.githubusercontent.com/ceritium/dispatch_policy/master/screenshots/admin-policy-mixed.png) ·
+[policies index](https://raw.githubusercontent.com/ceritium/dispatch_policy/master/screenshots/policies-index.png) ·
+[partitions index](https://raw.githubusercontent.com/ceritium/dispatch_policy/master/screenshots/partitions-index.png).
 
-Screenshots are captured against
-[ceritium/dispatch_policy_demo](https://github.com/ceritium/dispatch_policy_demo),
-a separate Rails app set up to exercise every gate.
+Regenerate everything against the dummy app with:
+
+```bash
+bin/screenshots
+```
+
+The script seeds realistic state (ticks admit some, GoodJob drains
+inline, then a few fresh jobs are left pending) and drives Capybara
+with headless Chrome through the admin pages. Stop `bin/dummy
+good_job` (or any running tick loop) first so the seeding isn't
+racing a live worker — Selenium Manager auto-downloads chromedriver,
+you only need Chrome installed locally.
 
 ## Install
 
