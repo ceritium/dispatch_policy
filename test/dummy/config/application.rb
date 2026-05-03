@@ -33,6 +33,11 @@ module DummyApp
 
     config.active_job.queue_adapter = ADAPTER.to_sym
 
+    # The gem's railtie does NOT auto-merge `db/migrate/` into host
+    # paths (avoids DuplicateMigrationNameError on cutovers). The dummy
+    # app is internal and has no such conflict, so opt in explicitly.
+    config.paths["db/migrate"] << File.expand_path("../../../db/migrate", __dir__)
+
     if config.respond_to?(:assets)
       config.assets.compile  = true
       config.assets.debug    = false
