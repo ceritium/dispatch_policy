@@ -4,6 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width,initial-scale=1">
     <title>dispatch_policy</title>
+    <link rel="icon" type="image/svg+xml" href="<%= logo_asset_path(digest: DispatchPolicy::Assets::LOGO_DIGEST) %>">
     <%= csrf_meta_tags %>
     <%# Same-URL Turbo.visit (used by the auto-refresh) is treated as a "page %>
     <%# refresh"; with these two meta tags Turbo morphs the body in place and %>
@@ -95,7 +96,10 @@
   <body>
     <header class="dp-header">
       <div class="dp-brand">
-        <%= link_to "dispatch_policy", root_path, class: "dp-logo" %>
+        <%= link_to root_path, class: "dp-logo" do %>
+          <%= DispatchPolicy::Assets::LOGO_BODY.html_safe %>
+          <span class="dp-logo-text">dispatch_policy</span>
+        <% end %>
       </div>
       <nav class="dp-nav">
         <%= link_to "Dashboard",  root_path %>

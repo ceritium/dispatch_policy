@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="https://raw.githubusercontent.com/ceritium/dispatch_policy/master/app/assets/images/dispatch_policy/logo.svg" alt="dispatch_policy" width="120" height="120">
+</p>
+
 # DispatchPolicy
 
 > **Pre-1.0.** Published on RubyGems but the API, schema, and

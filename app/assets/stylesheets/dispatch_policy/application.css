@@ -24,7 +24,14 @@ code { font-family: "SFMono-Regular", Menlo, monospace; font-size: 13px; backgro
   border-bottom: 1px solid #0e1218;
 }
 .dp-header a { color: #f6f7fa; }
-.dp-logo { font-weight: 600; font-size: 16px; letter-spacing: 0.4px; }
+.dp-logo {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  text-decoration: none;
+}
+.dp-logo svg { display: block; width: 28px; height: 28px; flex: 0 0 auto; }
+.dp-logo-text { font-weight: 600; font-size: 16px; letter-spacing: 0.4px; }
 .dp-nav { flex: 1; }
 .dp-nav a { margin-left: 22px; opacity: 0.85; }
 .dp-nav a:hover { opacity: 1; text-decoration: none; }
