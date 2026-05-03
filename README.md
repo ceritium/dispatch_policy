@@ -57,6 +57,29 @@ The dummy ships ten purpose-built jobs covering throttle, concurrency,
 mixed gates, scheduling, retries, stress tests, sharding, fairness, and
 adaptive concurrency. See `test/dummy/app/jobs/`.
 
+## Screenshots
+
+The admin UI lives at `/dispatch_policy` once the engine is mounted.
+Live throughput, capacity hints, denial reasons, and per-partition
+sparklines:
+
+![Admin index](https://raw.githubusercontent.com/ceritium/dispatch_policy/master/screenshots/admin-index.png)
+
+A policy detail page — totals, EWMA queue-lag chart, watched
+partitions, and a searchable list of all partitions:
+
+![Policy detail](https://raw.githubusercontent.com/ceritium/dispatch_policy/master/screenshots/admin-policy-tenant_work_job.png)
+
+Other per-policy pages:
+[email_job](https://raw.githubusercontent.com/ceritium/dispatch_policy/master/screenshots/admin-policy-email_job.png) ·
+[report_job](https://raw.githubusercontent.com/ceritium/dispatch_policy/master/screenshots/admin-policy-report_job.png) ·
+[webhook_delivery_job](https://raw.githubusercontent.com/ceritium/dispatch_policy/master/screenshots/admin-policy-webhook_delivery_job.png) ·
+[maintenance_job](https://raw.githubusercontent.com/ceritium/dispatch_policy/master/screenshots/admin-policy-maintenance_job.png).
+
+Screenshots are captured against
+[ceritium/dispatch_policy_demo](https://github.com/ceritium/dispatch_policy_demo),
+a separate Rails app set up to exercise every gate.
+
 ## Install
 
 Add to your `Gemfile`:

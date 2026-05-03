@@ -23,7 +23,8 @@ Gem::Specification.new do |spec|
     "config/**/*",
     "db/**/*",
     "MIT-LICENSE",
-    "README.md"
+    "README.md",
+    "CHANGELOG.md"
   ]
   spec.require_paths = ["lib"]
 
