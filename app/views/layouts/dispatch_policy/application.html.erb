@@ -11,7 +11,7 @@
     <meta name="turbo-refresh-method" content="morph">
     <meta name="turbo-refresh-scroll" content="preserve">
     <style><%= DispatchPolicy::Engine.root.join("app/assets/stylesheets/dispatch_policy/application.css").read.html_safe %></style>
-    <script src="https://cdn.jsdelivr.net/npm/@hotwired/turbo@8.0.4/dist/turbo.es2017-umd.min.js"></script>
+    <script src="<%= turbo_asset_path(digest: DispatchPolicy::Assets::TURBO_DIGEST) %>"></script>
     <script>
       (function () {
         var KEY = "dispatch_policy:refresh-interval";
