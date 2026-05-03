@@ -1,12 +1,8 @@
 # DispatchPolicy
 
-> **⚠️ Experimental v2 branch.** This is the `v2` branch of
-> [ceritium/dispatch_policy](https://github.com/ceritium/dispatch_policy)
-> — an alternative cut: TX-atomic admission, in-tick fairness as a
-> layer (not a gate), and a single canonical partition scope per
-> policy. API, schema, and defaults can change between any two
-> commits. The `master` branch of the same repo is the original
-> design and is what the published gem (when one ships) tracks.
+> **Pre-1.0.** Published on RubyGems but the API, schema, and
+> defaults can still shift between minor versions. See `CHANGELOG.md`
+> before upgrading.
 >
 > **PostgreSQL only.** Staging, admission, and adaptive stats lean on
 > `jsonb`, partial indexes, `FOR UPDATE SKIP LOCKED`, `ON CONFLICT`,
@@ -85,9 +81,7 @@ a separate Rails app set up to exercise every gate.
 Add to your `Gemfile`:
 
 ```ruby
-gem "dispatch_policy",
-    git:    "https://github.com/ceritium/dispatch_policy",
-    branch: "v2"
+gem "dispatch_policy", "~> 0.3"
 ```
 
 Generate the install bundle (migration + initializer + tick loop job):
