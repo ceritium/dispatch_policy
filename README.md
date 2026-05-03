@@ -538,10 +538,46 @@ Integration tests skip when no Postgres is reachable (default DB
 `dispatch_policy_test`; override via `DB_NAME`, `DB_HOST`,
 `DB_USER`, `DB_PASS`).
 
+## Releasing
+
+Cutting a new version is driven by `bin/release`. Steps:
+
+1. Bump `DispatchPolicy::VERSION` in
+   `lib/dispatch_policy/version.rb`.
+2. Add a `## <VERSION>` section in `CHANGELOG.md` describing the
+   release. The script extracts that section verbatim as the
+   GitHub release notes, so anything missing here will be missing
+   on GitHub.
+3. Commit both on `master` and push so `origin/master` matches
+   local.
+4. Run the script from the repo root:
+
+   ```bash
+   bin/release
+   ```
+
+The script:
+
+- Refuses to run unless you are on `master`, the working tree is
+  clean, the local branch matches `origin/master`, and the tag
+  `v<VERSION>` does not yet exist.
+- Asks for a `y` confirmation before doing anything.
+- Hands off to `bundle exec rake release` (builds the gem, creates
+  the `v<VERSION>` tag, pushes the tag to GitHub, pushes the gem to
+  RubyGems.org).
+- Creates a GitHub release for `v<VERSION>` using the matching
+  CHANGELOG section as the body. Requires the `gh` CLI; if it is
+  missing, the gem ships but you'll need to create the GitHub
+  release manually with `gh release create v<VERSION> --notes-file
+  CHANGELOG.md`.
+
+Prerequisites: a configured `~/.gem/credentials` for RubyGems push
+and `gh auth login` for the GitHub release.
+
 ## Status
 
-Greenfield, no released gem yet. API may shift. The set of features
-that ship today:
+Published on RubyGems. API may still shift between minors until
+1.0. The set of features that ship today:
 
 - Gates: `:throttle`, `:concurrency`, `:adaptive_concurrency`.
 - Fairness: in-tick EWMA reorder + optional `tick_admission_budget`.
