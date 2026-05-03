@@ -39,4 +39,6 @@ Gem::Specification.new do |spec|
   spec.add_development_dependency "puma", ">= 6.0"
   spec.add_development_dependency "foreman", ">= 0.87"
   spec.add_development_dependency "debug"
+  spec.add_development_dependency "capybara", ">= 3.40"
+  spec.add_development_dependency "selenium-webdriver", ">= 4.20"
 end

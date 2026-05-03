@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# Capture admin UI screenshots into <gem_root>/screenshots/.
+#
+# Boots the dummy app under good_job, seeds the gem's tables with
+# realistic state, drives Capybara + headless Chrome through the
+# admin pages, and writes PNGs.
+#
+# Requires: Chrome installed locally (chromedriver auto-managed by
+# Selenium Manager) and a working Postgres with the dummy DB created
+# (run `bin/dummy setup good_job` first).
+
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+
+export DUMMY_ADAPTER="${DUMMY_ADAPTER:-good_job}"
+
+cd test/dummy
+exec bin/rails screenshots:capture
