@@ -1,12 +1,8 @@
 # DispatchPolicy
 
-> **⚠️ Experimental v2 branch.** This is the `v2` branch of
-> [ceritium/dispatch_policy](https://github.com/ceritium/dispatch_policy)
-> — an alternative cut: TX-atomic admission, in-tick fairness as a
-> layer (not a gate), and a single canonical partition scope per
-> policy. API, schema, and defaults can change between any two
-> commits. The `master` branch of the same repo is the original
-> design and is what the published gem (when one ships) tracks.
+> **Pre-1.0.** Published on RubyGems but the API, schema, and
+> defaults can still shift between minor versions. See `CHANGELOG.md`
+> before upgrading.
 >
 > **PostgreSQL only.** Staging, admission, and adaptive stats lean on
 > `jsonb`, partial indexes, `FOR UPDATE SKIP LOCKED`, `ON CONFLICT`,
@@ -57,14 +53,35 @@ The dummy ships ten purpose-built jobs covering throttle, concurrency,
 mixed gates, scheduling, retries, stress tests, sharding, fairness, and
 adaptive concurrency. See `test/dummy/app/jobs/`.
 
+## Screenshots
+
+The admin UI lives at `/dispatch_policy` once the engine is mounted.
+Live throughput, capacity hints, denial reasons, and per-partition
+sparklines:
+
+![Admin index](https://raw.githubusercontent.com/ceritium/dispatch_policy/master/screenshots/admin-index.png)
+
+A policy detail page — totals, EWMA queue-lag chart, watched
+partitions, and a searchable list of all partitions:
+
+![Policy detail](https://raw.githubusercontent.com/ceritium/dispatch_policy/master/screenshots/admin-policy-tenant_work_job.png)
+
+Other per-policy pages:
+[email_job](https://raw.githubusercontent.com/ceritium/dispatch_policy/master/screenshots/admin-policy-email_job.png) ·
+[report_job](https://raw.githubusercontent.com/ceritium/dispatch_policy/master/screenshots/admin-policy-report_job.png) ·
+[webhook_delivery_job](https://raw.githubusercontent.com/ceritium/dispatch_policy/master/screenshots/admin-policy-webhook_delivery_job.png) ·
+[maintenance_job](https://raw.githubusercontent.com/ceritium/dispatch_policy/master/screenshots/admin-policy-maintenance_job.png).
+
+Screenshots are captured against
+[ceritium/dispatch_policy_demo](https://github.com/ceritium/dispatch_policy_demo),
+a separate Rails app set up to exercise every gate.
+
 ## Install
 
 Add to your `Gemfile`:
 
 ```ruby
-gem "dispatch_policy",
-    git:    "https://github.com/ceritium/dispatch_policy",
-    branch: "v2"
+gem "dispatch_policy", "~> 0.3"
 ```
 
 Generate the install bundle (migration + initializer + tick loop job):
