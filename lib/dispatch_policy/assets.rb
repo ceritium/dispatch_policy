@@ -23,7 +23,13 @@ module DispatchPolicy
     TURBO_BODY   = JS_ROOT.join("turbo.es2017-umd.min.js").read.freeze
     TURBO_DIGEST = Digest::SHA1.hexdigest(TURBO_BODY)[0, 12].freeze
 
-    LOGO_BODY   = IMAGE_ROOT.join("logo.svg").read.freeze
-    LOGO_DIGEST = Digest::SHA1.hexdigest(LOGO_BODY)[0, 12].freeze
+    # The "small" mark is used in the admin header (rendered ≤ 32px) and as
+    # the SVG favicon. It's themable: the accent chevron uses
+    # `currentColor`, so wrapping it with a `style="color: …"` swaps the
+    # state color (ok/info/neutral/warn/error). The "large" mark (≥ 48px)
+    # has the full 3-chevron metaphor and ships alongside for any future
+    # surface that wants it.
+    LOGO_SMALL_BODY   = IMAGE_ROOT.join("logo-small.svg").read.freeze
+    LOGO_SMALL_DIGEST = Digest::SHA1.hexdigest(LOGO_SMALL_BODY)[0, 12].freeze
   end
 end

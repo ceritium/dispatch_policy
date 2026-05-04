@@ -12,7 +12,7 @@ module DispatchPolicy
     end
 
     def logo
-      serve(Assets::LOGO_BODY, Assets::LOGO_DIGEST, "image/svg+xml")
+      serve(Assets::LOGO_SMALL_BODY, Assets::LOGO_SMALL_DIGEST, "image/svg+xml")
     end
 
     private
