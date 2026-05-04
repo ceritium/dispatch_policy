@@ -30,7 +30,7 @@ code { font-family: "SFMono-Regular", Menlo, monospace; font-size: 13px; backgro
   gap: 10px;
   text-decoration: none;
 }
-.dp-logo svg { display: block; width: 28px; height: 28px; flex: 0 0 auto; }
+.dp-logo svg { display: block; width: 44px; height: 44px; flex: 0 0 auto; }
 .dp-logo-text {
   font-family: ui-monospace, "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace;
   font-weight: 700;
