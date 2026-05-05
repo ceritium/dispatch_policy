@@ -11,6 +11,18 @@
     <%# preserves scroll position. %>
     <meta name="turbo-refresh-method" content="morph">
     <meta name="turbo-refresh-scroll" content="preserve">
+    <%# Apply the stored theme synchronously before the stylesheet renders, %>
+    <%# otherwise users with explicit dark mode would see a light-mode flash. %>
+    <script>
+      (function () {
+        try {
+          var t = localStorage.getItem("dispatch_policy:theme");
+          if (t === "dark" || t === "light") {
+            document.documentElement.setAttribute("data-theme", t);
+          }
+        } catch (e) { /* localStorage unavailable; fall through to auto */ }
+      })();
+    </script>
     <style><%= DispatchPolicy::Engine.root.join("app/assets/stylesheets/dispatch_policy/application.css").read.html_safe %></style>
     <script src="<%= turbo_asset_path(digest: DispatchPolicy::Assets::TURBO_DIGEST) %>"></script>
     <script>
@@ -91,6 +103,58 @@
           }
         });
       })();
+
+      // Theme controls (auto / light / dark). Persists to localStorage so
+      // it survives across sessions; the early script in <head> applies
+      // the stored theme before paint to avoid FOUC.
+      (function () {
+        var KEY = "dispatch_policy:theme";
+
+        function getTheme() {
+          try { return localStorage.getItem(KEY) || "auto"; }
+          catch (e) { return "auto"; }
+        }
+
+        function applyTheme(theme) {
+          if (theme === "light" || theme === "dark") {
+            document.documentElement.setAttribute("data-theme", theme);
+          } else {
+            document.documentElement.removeAttribute("data-theme");
+          }
+        }
+
+        function setTheme(theme) {
+          try { localStorage.setItem(KEY, theme); } catch (e) { /* ignore */ }
+          applyTheme(theme);
+          syncControls();
+        }
+
+        function syncControls() {
+          var current = getTheme();
+          document.querySelectorAll("[data-dp-theme]").forEach(function (btn) {
+            if (btn.getAttribute("data-dp-theme") === current) {
+              btn.classList.add("dp-control-active");
+            } else {
+              btn.classList.remove("dp-control-active");
+            }
+          });
+        }
+
+        function bindControls() {
+          document.querySelectorAll("[data-dp-theme]").forEach(function (btn) {
+            if (btn.dataset.bound) return;
+            btn.dataset.bound = "1";
+            btn.addEventListener("click", function (e) {
+              e.preventDefault();
+              setTheme(btn.getAttribute("data-dp-theme"));
+            });
+          });
+          syncControls();
+        }
+
+        document.addEventListener("DOMContentLoaded", bindControls);
+        document.addEventListener("turbo:load",       bindControls);
+      })();
     </script>
   </head>
   <body>
@@ -106,12 +170,20 @@
         <%= link_to "Policies",   policies_path %>
         <%= link_to "Partitions", partitions_path %>
       </nav>
-      <div class="dp-refresh">
-        <span class="dp-refresh-label">Auto-refresh</span>
-        <button type="button" class="dp-refresh-btn" data-dp-refresh="0">off</button>
-        <button type="button" class="dp-refresh-btn" data-dp-refresh="2">2s</button>
-        <button type="button" class="dp-refresh-btn" data-dp-refresh="5">5s</button>
-        <button type="button" class="dp-refresh-btn" data-dp-refresh="10">10s</button>
+      <div class="dp-controls">
+        <div class="dp-refresh">
+          <span class="dp-refresh-label">Auto-refresh</span>
+          <button type="button" class="dp-refresh-btn" data-dp-refresh="0">off</button>
+          <button type="button" class="dp-refresh-btn" data-dp-refresh="2">2s</button>
+          <button type="button" class="dp-refresh-btn" data-dp-refresh="5">5s</button>
+          <button type="button" class="dp-refresh-btn" data-dp-refresh="10">10s</button>
+        </div>
+        <div class="dp-control">
+          <span class="dp-control-label">Theme</span>
+          <button type="button" class="dp-control-btn" data-dp-theme="auto">auto</button>
+          <button type="button" class="dp-control-btn" data-dp-theme="light">light</button>
+          <button type="button" class="dp-control-btn" data-dp-theme="dark">dark</button>
+        </div>
       </div>
     </header>
     <% if flash[:notice] %><div class="dp-flash dp-flash-ok"><%= flash[:notice] %></div><% end %>
