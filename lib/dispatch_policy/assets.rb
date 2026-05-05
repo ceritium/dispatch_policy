@@ -17,9 +17,22 @@ module DispatchPolicy
   #
   # No other code change is required — TURBO_DIGEST is content-addressed.
   module Assets
-    ROOT = Pathname.new(File.expand_path("../../app/assets/javascripts/dispatch_policy", __dir__))
+    JS_ROOT    = Pathname.new(File.expand_path("../../app/assets/javascripts/dispatch_policy", __dir__))
+    IMAGE_ROOT = Pathname.new(File.expand_path("../../app/assets/images/dispatch_policy", __dir__))
 
-    TURBO_BODY   = ROOT.join("turbo.es2017-umd.min.js").read.freeze
+    TURBO_BODY   = JS_ROOT.join("turbo.es2017-umd.min.js").read.freeze
     TURBO_DIGEST = Digest::SHA1.hexdigest(TURBO_BODY)[0, 12].freeze
+
+    # The "large" mark (≥ 48px) is used in the admin header — three
+    # chevrons with the rightmost one carrying state color via
+    # `currentColor`. The "small" mark (≤ 32px) is used as the SVG
+    # favicon, where the lanes get lost at downsampling. Both are
+    # themable: wrapping with `style="color: …"` swaps the state color
+    # (ok/info/neutral/warn/error).
+    LOGO_LARGE_BODY   = IMAGE_ROOT.join("logo-large.svg").read.freeze
+    LOGO_LARGE_DIGEST = Digest::SHA1.hexdigest(LOGO_LARGE_BODY)[0, 12].freeze
+
+    LOGO_SMALL_BODY   = IMAGE_ROOT.join("logo-small.svg").read.freeze
+    LOGO_SMALL_DIGEST = Digest::SHA1.hexdigest(LOGO_SMALL_BODY)[0, 12].freeze
   end
 end

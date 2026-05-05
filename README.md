@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="https://raw.githubusercontent.com/ceritium/dispatch_policy/master/app/assets/images/dispatch_policy/logo-lockup.svg" alt="dispatch_policy" width="360">
+</p>
+
 # DispatchPolicy
 
 > **Pre-1.0.** Published on RubyGems but the API, schema, and
@@ -618,6 +622,38 @@ Published on RubyGems. API may still shift between minors until
 Deferred ideas (with rationale) live in [`IDEAS.md`](IDEAS.md):
 `gate :global_cap`, smarter sweeper defaults, `sweep_every_seconds`
 instead of `sweep_every_ticks`.
+
+## Brand
+
+dispatch_policy uses a chevrons-and-gate mark. Three chevrons
+represent queued items being admitted past a dispatch gate; the
+rightmost (accent) chevron carries state color.
+
+Two versions, picked by **rendered size**, not by context:
+
+- **Large** (`logo-large-*.svg`) — 3 chevrons. Use ≥ 48px.
+- **Small** (`logo-small-*.svg`) — 1 chevron + post. Use ≤ 32px.
+
+State colors (the accent chevron):
+
+| State    | Color   | Hex       |
+|----------|---------|-----------|
+| ok       | green   | `#22c55e` |
+| info     | cyan    | `#06b6d4` |
+| neutral  | violet  | `#a78bfa` |
+| warn     | amber   | `#f59e0b` |
+| error    | red     | `#ef4444` |
+
+Two ways to render a state:
+
+- **Static**: use the per-state SVG (`logo-large-error.svg`).
+- **Dynamic**: use `logo-large.svg` / `logo-small.svg` (themable) and
+  set CSS `color:` — the accent chevron uses `currentColor`.
+
+All assets ship with the gem under
+`app/assets/images/dispatch_policy/`. Per-state 32px PNG favicons
+(`favicon-{state}-32.png`) are included for hosts that want to
+swap the favicon at runtime to reflect pipeline health.
 
 ## License
 
