@@ -1,5 +1,8 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/ceritium/dispatch_policy/master/arts/logo-lockup.svg" alt="dispatch_policy" width="360">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/ceritium/dispatch_policy/master/arts/logo-lockup-dark.svg">
+    <img src="https://raw.githubusercontent.com/ceritium/dispatch_policy/master/arts/logo-lockup.svg" alt="dispatch_policy" width="360">
+  </picture>
 </p>
 
 # DispatchPolicy
