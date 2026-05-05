@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/ceritium/dispatch_policy/master/app/assets/images/dispatch_policy/logo-lockup.svg" alt="dispatch_policy" width="360">
+  <img src="https://raw.githubusercontent.com/ceritium/dispatch_policy/master/arts/logo-lockup.svg" alt="dispatch_policy" width="360">
 </p>
 
 # DispatchPolicy
@@ -650,10 +650,15 @@ Two ways to render a state:
 - **Dynamic**: use `logo-large.svg` / `logo-small.svg` (themable) and
   set CSS `color:` — the accent chevron uses `currentColor`.
 
-All assets ship with the gem under
-`app/assets/images/dispatch_policy/`. Per-state 32px PNG favicons
-(`favicon-{state}-32.png`) are included for hosts that want to
-swap the favicon at runtime to reflect pipeline health.
+The gem package ships only the two themable masters
+(`logo-large.svg` and `logo-small.svg`) under
+`app/assets/images/dispatch_policy/` — those are what the admin
+header and the favicon route serve. The full design bundle (the
+five per-state SVGs in each size, the lockup, the multi-resolution
+`favicon.ico`, and the per-state 32px PNG favicons for runtime
+swap) lives in [`arts/`](arts/) at the repo root and is **not**
+packaged. Hosts that want a specific variant can grab it from
+there.
 
 ## License
 
