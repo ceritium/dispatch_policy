@@ -38,31 +38,48 @@ module DispatchPolicy
       }])
 
       adaptive_gates = policy.gates.select { |g| g.name == :adaptive_concurrency }
-      admitted_at    = adaptive_gates.any? ? lookup_admitted_at(job.job_id) : nil
+      # admitted_at lookup is gated on adaptive gates because it's only
+      # used as the AIMD feedback signal; we ALSO want it in the
+      # AS::Notifications payload regardless, so any subscriber (Signum
+      # metrics, Sentry breadcrumbs, custom code) can compute queue lag.
+      admitted_at    = lookup_admitted_at(job.job_id)
       perform_start  = Time.current
+      queue_lag_ms   = admitted_at ? ((perform_start - admitted_at) * 1000).to_i : nil
 
-      heartbeat = start_heartbeat(job.job_id)
+      payload = {
+        policy_name:    policy.name,
+        partition_key:  partition_key,
+        active_job_id:  job.job_id,
+        admitted_at:    admitted_at,
+        queue_lag_ms:   queue_lag_ms
+      }
 
-      succeeded = false
-      begin
-        yield
-        succeeded = true
-      ensure
-        stop_heartbeat(heartbeat)
+      ActiveSupport::Notifications.instrument("inflight.dispatch_policy", payload) do
+        heartbeat = start_heartbeat(job.job_id)
 
-        record_adaptive_observations(
-          policy:        policy,
-          gates:         adaptive_gates,
-          partition_key: partition_key,
-          admitted_at:   admitted_at,
-          perform_start: perform_start,
-          succeeded:     succeeded
-        )
-
+        succeeded = false
         begin
-          Repository.delete_inflight!(active_job_id: job.job_id)
-        rescue StandardError => e
-          DispatchPolicy.config.logger&.warn("[dispatch_policy] failed to delete inflight row #{job.job_id}: #{e.class}: #{e.message}")
+          yield
+          succeeded = true
+        ensure
+          stop_heartbeat(heartbeat)
+
+          record_adaptive_observations(
+            policy:        policy,
+            gates:         adaptive_gates,
+            partition_key: partition_key,
+            admitted_at:   admitted_at,
+            perform_start: perform_start,
+            succeeded:     succeeded
+          )
+
+          payload[:succeeded] = succeeded
+
+          begin
+            Repository.delete_inflight!(active_job_id: job.job_id)
+          rescue StandardError => e
+            DispatchPolicy.config.logger&.warn("[dispatch_policy] failed to delete inflight row #{job.job_id}: #{e.class}: #{e.message}")
+          end
         end
       end
     end

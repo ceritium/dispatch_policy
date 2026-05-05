@@ -21,6 +21,13 @@ module DispatchPolicy
     end
 
     def call
+      instrument_payload = { policy_name: @policy_name, shard: @shard }
+      ActiveSupport::Notifications.instrument("tick.dispatch_policy", instrument_payload) do
+        run_tick(instrument_payload)
+      end
+    end
+
+    def run_tick(instrument_payload)
       started_at         = monotonic_now_ms
       partitions_seen    = 0
       partitions_admitted = 0
@@ -143,6 +150,16 @@ module DispatchPolicy
         denied_reasons:      denied_reasons
       )
 
+      instrument_payload.merge!(
+        duration_ms:         duration_ms,
+        partitions_seen:     partitions_seen,
+        partitions_admitted: partitions_admitted,
+        partitions_denied:   partitions_denied,
+        jobs_admitted:       jobs_admitted,
+        forward_failures:    forward_failures,
+        denied_reasons:      denied_reasons
+      )
+
       Result.new(partitions_seen: partitions_seen, jobs_admitted: jobs_admitted)
     end
 
@@ -190,13 +207,21 @@ module DispatchPolicy
       # Defer the partition state UPDATE to the bulk flush at the end of
       # the tick instead of issuing a per-partition statement now.
       if result.admit_count.zero?
+        reasons = deduce_reasons(result)
+        ActiveSupport::Notifications.instrument(
+          "pipeline_deny.dispatch_policy",
+          policy_name:   @policy_name,
+          partition_key: partition["partition_key"],
+          reasons:       reasons,
+          retry_after:   result.retry_after
+        )
         pending_denies << {
           policy_name:      @policy_name,
           partition_key:    partition["partition_key"],
           gate_state_patch: result.gate_state_patch,
           retry_after:      result.retry_after
         }
-        return { admitted: 0, failures: 0, reasons: deduce_reasons(result) }
+        return { admitted: 0, failures: 0, reasons: reasons }
       end
 
       admitted = 0
@@ -252,8 +277,20 @@ module DispatchPolicy
       end
 
       if admitted.zero?
+        ActiveSupport::Notifications.instrument(
+          "pipeline_deny.dispatch_policy",
+          policy_name:   @policy_name,
+          partition_key: partition["partition_key"],
+          reasons:       ["no_rows_claimed"]
+        )
         { admitted: 0, failures: 0, reasons: ["no_rows_claimed"] }
       else
+        ActiveSupport::Notifications.instrument(
+          "pipeline_admit.dispatch_policy",
+          policy_name:   @policy_name,
+          partition_key: partition["partition_key"],
+          admitted:      admitted
+        )
         { admitted: admitted, failures: 0, reasons: [] }
       end
     rescue StandardError => e
