@@ -609,59 +609,6 @@ The script:
 Prerequisites: a configured `~/.gem/credentials` for RubyGems push
 and `gh auth login` for the GitHub release.
 
-## Status
-
-Published on RubyGems. API may still shift between minors until
-1.0. The set of features that ship today:
-
-- Gates: `:throttle`, `:concurrency`, `:adaptive_concurrency`.
-- Fairness: in-tick EWMA reorder + optional `tick_admission_budget`.
-- Sharding: `shard_by` + per-shard tick loops.
-- Bulk handoff: `ActiveJob.perform_all_later` collapses to one
-  adapter `INSERT` per tick when admissible.
-- Admin UI with capacity hints, pending trend, denial reasons.
-- Manual benchmark suite.
-
-Deferred ideas (with rationale) live in [`IDEAS.md`](IDEAS.md):
-`gate :global_cap`, smarter sweeper defaults, `sweep_every_seconds`
-instead of `sweep_every_ticks`.
-
-## Brand
-
-dispatch_policy uses a chevrons-and-gate mark. Three chevrons
-represent queued items being admitted past a dispatch gate; the
-rightmost (accent) chevron carries state color.
-
-Two versions, picked by **rendered size**, not by context:
-
-- **Large** (`logo-large-*.svg`) — 3 chevrons. Use ≥ 48px.
-- **Small** (`logo-small-*.svg`) — 1 chevron + post. Use ≤ 32px.
-
-State colors (the accent chevron):
-
-| State    | Color   | Hex       |
-|----------|---------|-----------|
-| ok       | green   | `#22c55e` |
-| info     | cyan    | `#06b6d4` |
-| neutral  | violet  | `#a78bfa` |
-| warn     | amber   | `#f59e0b` |
-| error    | red     | `#ef4444` |
-
-Two ways to render a state:
-
-- **Static**: use the per-state SVG (`logo-large-error.svg`).
-- **Dynamic**: use `logo-large.svg` / `logo-small.svg` (themable) and
-  set CSS `color:` — the accent chevron uses `currentColor`.
-
-The gem package ships only the two themable masters
-(`logo-large.svg` and `logo-small.svg`) under
-`app/assets/images/dispatch_policy/` — those are what the admin
-header and the favicon route serve. The full design bundle (the
-five per-state SVGs in each size, the lockup, the multi-resolution
-`favicon.ico`, and the per-state 32px PNG favicons for runtime
-swap) lives in [`arts/`](arts/) at the repo root and is **not**
-packaged. Hosts that want a specific variant can grab it from
-there.
 
 ## License
 
