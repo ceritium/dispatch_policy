@@ -16,6 +16,15 @@
   tick re-collided in a loop. The staged-side identity is
   `staged_jobs.id`; the active_job_id only needs to be unique at
   adapter-insert time.
+- `record_partition_admit!` clamps the EWMA decay exponent at -700
+  so `exp()` no longer raises `value out of range: underflow` when a
+  partition has been idle for many half-lives. Postgres throws this
+  error around `exp(-746)` on double precision, and a partition that
+  sat idle long enough (e.g. a few weeks with `half_life = 60s`)
+  produced a Δt/τ ratio past that threshold; the broken UPDATE rolled
+  back the whole admission TX every tick, so the partition could
+  never drain again. -700 still yields a finite ~9.86e-305, which is
+  effectively zero for the EWMA.
 
 ## 0.3.0
 
