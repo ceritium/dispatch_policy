@@ -336,6 +336,16 @@ module DispatchPolicy
         values_sql << "($#{base + 1}, $#{base + 2}, $#{base + 3}, now(), now())"
         params.push(row[:policy_name], row[:partition_key], row[:active_job_id])
       end
+      # ON CONFLICT (active_job_id) DO NOTHING covers two paths that
+      # the around_perform tracker exercises on its own:
+      #   1) the around_perform inflight insert runs even when the row
+      #      was already pre-inserted by Tick (concurrency-gated policies);
+      #   2) a stale row that survived a crash gets re-inserted by the
+      #      around_perform without colliding while the sweeper is still
+      #      catching up.
+      # Admission proper can no longer collide here: Tick regenerates
+      # active_job_id before this insert, so each admission contributes a
+      # fresh UUID.
       connection.exec_query(
         <<~SQL.squish,
           INSERT INTO #{INFLIGHT_TABLE}
