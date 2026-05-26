@@ -449,6 +449,37 @@ end
 `connected_to(role:)` when set. Staging tables and the adapter's
 table must live in the same DB for atomicity to hold.
 
+### Job identity across staging and adapter
+
+`Tick.admit_partition` regenerates the ActiveJob `job_id` for every
+claimed row immediately before pre-inserting `inflight_jobs` and
+handing the job to the adapter. So a job has two identities through
+its lifecycle:
+
+- **Pre-admission** — `staged_jobs.id` (the staged-side identity) and
+  `staged_jobs.job_data->>'job_id'` (the UUID `perform_later` returned
+  to the caller).
+- **Post-admission** — `inflight_jobs.active_job_id` and the adapter's
+  row id (`good_jobs.id` / `solid_queue_jobs.id`), both equal to the
+  newly generated UUID. This is also the `job_id` the worker observes
+  during perform.
+
+The two UUIDs are intentionally different. Adapters that use
+`active_job_id` as their PK (`good_job`, `solid_queue`) would
+otherwise collide on the adapter row when a previous admission of
+the same staged job left a residual row behind — most commonly a
+retry-restage whose original adapter row had not been finalized yet.
+
+The mapping is logged at debug level on every admission:
+
+```
+[dispatch_policy] admit staged_id=… policy=… partition=… active_job_id: <old> -> <new>
+```
+
+If you correlate jobs across the staging boundary from outside Rails,
+use `staged_jobs.id` as the stable handle pre-admission and the
+adapter row id (= `inflight_jobs.active_job_id`) post-admission.
+
 ## Running the tick
 
 `DispatchPolicy::TickLoop.run(policy_name:, shard:, stop_when:)` is
