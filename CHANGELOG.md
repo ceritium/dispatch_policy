@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.4.1
+
+### Fixed
+- Admission now regenerates `active_job_id` for each row before
+  pre-inserting `dispatch_policy_inflight_jobs` and handing the job
+  to the adapter. Adapters that use `active_job_id` as the PK of
+  their jobs table (`good_job`, `solid_queue`) would otherwise raise
+  `ActiveRecord::RecordNotUnique` on `good_jobs_pkey` /
+  `solid_queue_jobs_pkey` when a residual row from a previous
+  admission of the same staged job still existed — most commonly a
+  retry-restage (default `retry_strategy: :restage`) whose original
+  adapter row had not been finalized yet. The collision rolled back
+  the entire admission TX, the staged row returned, and the next
+  tick re-collided in a loop. The staged-side identity is
+  `staged_jobs.id`; the active_job_id only needs to be unique at
+  adapter-insert time.
+
 ## 0.3.0
 
 ### Added

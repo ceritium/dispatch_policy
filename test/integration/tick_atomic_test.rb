@@ -191,4 +191,44 @@ class TickAtomicAdmissionTest < Minitest::Test
     refute DispatchPolicy::Partition.exists?(partition_key: "ep:FALLBACK"),
            "the FALLBACK partition would only appear if BulkEnqueue read the empty @arguments after deserialize"
   end
+
+  # Regression test for the GoodJob/SolidQueue PK collision.
+  #
+  # Adapters that use active_job_id as the PK of their jobs table will
+  # raise RecordNotUnique if a previous admission of the same staged
+  # job (e.g. a retry-restage) left a residual row behind. Admission
+  # must hand the adapter a fresh active_job_id; the staged payload's
+  # job_id only identifies the row up to staging.
+  def test_admission_regenerates_active_job_id_for_adapter_handoff
+    stage_one_job!
+    staged_aj_id = DispatchPolicy::StagedJob.first.job_data["job_id"]
+    assert_equal "ajid-1", staged_aj_id
+
+    received_ids = []
+    AtomicTestJob.queue_adapter.singleton_class.alias_method(:__orig_enqueue, :enqueue)
+    AtomicTestJob.queue_adapter.singleton_class.define_method(:enqueue) do |job|
+      received_ids << job.job_id
+      __orig_enqueue(job)
+    end
+
+    begin
+      DispatchPolicy::Tick.run(policy_name: "atomic_test")
+    ensure
+      AtomicTestJob.queue_adapter.singleton_class.alias_method(:enqueue, :__orig_enqueue)
+    end
+
+    assert_equal 1, received_ids.size, "adapter must receive exactly one enqueue"
+    refute_equal staged_aj_id, received_ids.first,
+                 "Tick must hand the adapter a fresh active_job_id, not the staged payload's job_id"
+    assert_match(/\A[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\z/,
+                 received_ids.first, "regenerated id must be a UUID")
+
+    # Inflight row must use the new id, not the staged one, so the
+    # around_perform tracker's insert/delete by job.job_id matches.
+    inflight_ids = DispatchPolicy::InflightJob.pluck(:active_job_id)
+    assert_equal received_ids, inflight_ids,
+                 "inflight pre-insert must use the same regenerated id as the adapter row"
+    refute_includes inflight_ids, staged_aj_id,
+                    "no inflight row should be left under the original staged job_id"
+  end
 end
