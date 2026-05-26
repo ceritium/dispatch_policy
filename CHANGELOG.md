@@ -26,6 +26,30 @@
   never drain again. -700 still yields a finite ~9.86e-305, which is
   effectively zero for the EWMA.
 
+## 0.4.0
+
+### Added
+- Admin UI dark mode with an auto / light / dark selector in the
+  header that persists across pages.
+- Conceptual logo (chevrons + gate + admitted dot across 3
+  partitions), surfaced in the admin header and README. Theme-aware
+  lockup keeps the wordmark readable on both light and dark
+  backgrounds.
+- Vendored Turbo, served by the engine, so the admin UI no longer
+  depends on the host app shipping Turbo itself.
+- `screenshots` Rake task that regenerates all README screenshots
+  from the dummy app instead of importing static assets.
+
+### Changed
+- Slimmer brand bundle in the gem: only the two masters actually
+  used are shipped; the full art set stays in `arts/` for source.
+- README install section drops the obsolete v2-branch banner — the
+  gem now installs cleanly from RubyGems.
+
+### Fixed
+- Dummy app opts into the gem's `db/migrate` path so its setup
+  picks up new tables without manual copying.
+
 ## 0.3.0
 
 ### Added
