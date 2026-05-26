@@ -236,7 +236,23 @@ module DispatchPolicy
           # the row's job_data in place so both the inflight pre-insert
           # below and Forwarder.dispatch (via Serializer.deserialize)
           # observe the new id.
-          rows.each { |row| row["job_data"]["job_id"] = SecureRandom.uuid }
+          #
+          # Logs the (staged_job_id, original_active_job_id, new_active_job_id)
+          # mapping at debug level so operators can grep-bridge the two
+          # identities when troubleshooting — `perform_later` returns the
+          # original; the adapter row and the worker logs use the new one.
+          logger = DispatchPolicy.config.logger
+          rows.each do |row|
+            old_aj_id = row["job_data"]["job_id"]
+            new_aj_id = SecureRandom.uuid
+            row["job_data"]["job_id"] = new_aj_id
+
+            logger&.debug(
+              "[dispatch_policy] admit staged_id=#{row['id']} " \
+              "policy=#{@policy_name} partition=#{partition['partition_key']} " \
+              "active_job_id: #{old_aj_id} -> #{new_aj_id}"
+            )
+          end
 
           # Pre-insert an inflight row per admitted job so the concurrency
           # gate sees them immediately. With a concurrency gate, use its
