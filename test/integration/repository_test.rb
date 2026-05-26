@@ -430,4 +430,47 @@ class RepositoryIntegrationTest < Minitest::Test
       ActiveRecord::Base.connection_pool.checkin(other) rescue nil
     end
   end
+
+  # Regression test: a partition that has sat idle for many half-lives
+  # produces a Δt/τ ratio large enough to underflow `exp()` on double
+  # precision (Postgres throws `value out of range: underflow` around
+  # `exp(-746)`). Before the clamp, this broke every admission UPDATE
+  # on the partition forever — Tick rolled the TX back, the staged
+  # rows returned, and the partition never drained.
+  def test_record_partition_admit_survives_an_ancient_decayed_admits_at
+    DispatchPolicy::Repository.stage!(
+      policy_name:   "p_decay",
+      partition_key: "k",
+      queue_name:    nil,
+      job_class:     "MyJob",
+      job_data:      { "job_id" => "j1", "job_class" => "MyJob", "arguments" => [] },
+      context:       {},
+      scheduled_at:  nil,
+      priority:      0
+    )
+
+    # Push decayed_admits_at far enough into the past that
+    # exp(-Δt/τ) would underflow without the clamp. With half_life = 60s,
+    # τ ≈ 86.56; 30 days of idleness yields Δt/τ ≈ 30_000, well past the
+    # ~746 PG underflow threshold.
+    DispatchPolicy::Partition.where(policy_name: "p_decay").update_all(
+      decayed_admits:    1.0,
+      decayed_admits_at: 30.days.ago
+    )
+
+    DispatchPolicy::Repository.record_partition_admit!(
+      policy_name:       "p_decay",
+      partition_key:     "k",
+      admitted:          1,
+      gate_state_patch:  {},
+      retry_after:       nil,
+      half_life_seconds: 60
+    )
+
+    partition = DispatchPolicy::Partition.find_by(policy_name: "p_decay")
+    refute_nil partition, "partition row must still exist after the admit"
+    # The decay factor collapses to ~0, so decayed_admits ≈ admitted (1).
+    assert_in_delta 1.0, partition.decayed_admits, 1e-9,
+                    "very-stale partition admit must reset decayed_admits to ~admitted, not raise"
+  end
 end

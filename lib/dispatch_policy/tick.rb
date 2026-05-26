@@ -1,5 +1,7 @@
 # frozen_string_literal: true
 
+require "securerandom"
+
 module DispatchPolicy
   # One pass of admission for a single policy.
   #
@@ -218,6 +220,39 @@ module DispatchPolicy
           # actual DELETE returned zero rows (e.g. all staged rows are
           # scheduled in the future, or another tick raced us to them).
           next if rows.empty?
+
+          # Decouple the active_job_id we hand to the adapter from the
+          # staged payload's job_id. Adapters that use active_job_id as
+          # the PK of their jobs table (good_job, solid_queue) would
+          # otherwise collide when a residual row from a previous
+          # admission of the same job still exists — most commonly a
+          # retry-restage whose original adapter row has not been
+          # finalized yet. The collision raises RecordNotUnique inside
+          # the admission TX, rolls everything back, and the staged
+          # row keeps re-colliding on every subsequent tick.
+          #
+          # The staged-side identity is staged_jobs.id; active_job_id
+          # only needs to be unique at adapter-insert time. We mutate
+          # the row's job_data in place so both the inflight pre-insert
+          # below and Forwarder.dispatch (via Serializer.deserialize)
+          # observe the new id.
+          #
+          # Logs the (staged_job_id, original_active_job_id, new_active_job_id)
+          # mapping at debug level so operators can grep-bridge the two
+          # identities when troubleshooting — `perform_later` returns the
+          # original; the adapter row and the worker logs use the new one.
+          logger = DispatchPolicy.config.logger
+          rows.each do |row|
+            old_aj_id = row["job_data"]["job_id"]
+            new_aj_id = SecureRandom.uuid
+            row["job_data"]["job_id"] = new_aj_id
+
+            logger&.debug(
+              "[dispatch_policy] admit staged_id=#{row['id']} " \
+              "policy=#{@policy_name} partition=#{partition['partition_key']} " \
+              "active_job_id: #{old_aj_id} -> #{new_aj_id}"
+            )
+          end
 
           # Pre-insert an inflight row per admitted job so the concurrency
           # gate sees them immediately. With a concurrency gate, use its

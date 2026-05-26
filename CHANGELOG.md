@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.4.1
+
+### Fixed
+- Admission now regenerates `active_job_id` for each row before
+  pre-inserting `dispatch_policy_inflight_jobs` and handing the job
+  to the adapter. Adapters that use `active_job_id` as the PK of
+  their jobs table (`good_job`, `solid_queue`) would otherwise raise
+  `ActiveRecord::RecordNotUnique` on `good_jobs_pkey` /
+  `solid_queue_jobs_pkey` when a residual row from a previous
+  admission of the same staged job still existed — most commonly a
+  retry-restage (default `retry_strategy: :restage`) whose original
+  adapter row had not been finalized yet. The collision rolled back
+  the entire admission TX, the staged row returned, and the next
+  tick re-collided in a loop. The staged-side identity is
+  `staged_jobs.id`; the active_job_id only needs to be unique at
+  adapter-insert time.
+- `record_partition_admit!` clamps the EWMA decay exponent at -700
+  so `exp()` no longer raises `value out of range: underflow` when a
+  partition has been idle for many half-lives. Postgres throws this
+  error around `exp(-746)` on double precision, and a partition that
+  sat idle long enough (e.g. a few weeks with `half_life = 60s`)
+  produced a Δt/τ ratio past that threshold; the broken UPDATE rolled
+  back the whole admission TX every tick, so the partition could
+  never drain again. -700 still yields a finite ~9.86e-305, which is
+  effectively zero for the EWMA.
+
 ## 0.3.0
 
 ### Added

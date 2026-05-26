@@ -245,14 +245,27 @@ module DispatchPolicy
       if half_life_seconds && half_life_seconds.to_f.positive?
         # decay constant τ such that exp(-Δt/τ) halves every half_life:
         # τ = half_life / ln(2). NULLIF guards a degenerate τ=0.
+        #
+        # The GREATEST(..., -700) clamp keeps `exp()` from raising
+        # `value out of range: underflow` when a partition has been
+        # idle for many half-lives. Postgres throws around
+        # `exp(-746)` on double precision; -700 still yields a finite
+        # ~9.86e-305, which is effectively zero for the EWMA. Without
+        # the clamp, a partition idle long enough for Δt/τ to exceed
+        # ~746 breaks every subsequent admission UPDATE on it: Tick
+        # rolls back the whole TX, the staged rows return, and the
+        # partition never drains.
         decay_idx        = params.size + 1
         admitted_idx_for_ewma = 3
         decay_tau        = half_life_seconds.to_f / Math.log(2)
         params << decay_tau
         decay_sql = <<~SQL.squish
           decayed_admits     = decayed_admits *
-                                exp(- COALESCE(EXTRACT(EPOCH FROM (now() - decayed_admits_at)), 0)
-                                     / NULLIF($#{decay_idx}::double precision, 0))
+                                exp(GREATEST(
+                                  - COALESCE(EXTRACT(EPOCH FROM (now() - decayed_admits_at)), 0)
+                                    / NULLIF($#{decay_idx}::double precision, 0),
+                                  -700
+                                ))
                               + $#{admitted_idx_for_ewma},
           decayed_admits_at  = now(),
         SQL
@@ -336,6 +349,16 @@ module DispatchPolicy
         values_sql << "($#{base + 1}, $#{base + 2}, $#{base + 3}, now(), now())"
         params.push(row[:policy_name], row[:partition_key], row[:active_job_id])
       end
+      # ON CONFLICT (active_job_id) DO NOTHING covers two paths that
+      # the around_perform tracker exercises on its own:
+      #   1) the around_perform inflight insert runs even when the row
+      #      was already pre-inserted by Tick (concurrency-gated policies);
+      #   2) a stale row that survived a crash gets re-inserted by the
+      #      around_perform without colliding while the sweeper is still
+      #      catching up.
+      # Admission proper can no longer collide here: Tick regenerates
+      # active_job_id before this insert, so each admission contributes a
+      # fresh UUID.
       connection.exec_query(
         <<~SQL.squish,
           INSERT INTO #{INFLIGHT_TABLE}
