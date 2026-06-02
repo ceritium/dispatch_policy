@@ -67,15 +67,12 @@ module DispatchPolicy
     end
 
     def admit
-      count = Integer(params[:count] || 1)
-      rows = Repository.claim_staged_jobs!(
-        policy_name:      @partition.policy_name,
-        partition_key:    @partition.partition_key,
-        limit:            count,
-        gate_state_patch: {},
-        retry_after:      nil
+      count     = Integer(params[:count] || 1)
+      forwarded = ManualAdmission.force!(
+        policy_name:   @partition.policy_name,
+        partition_key: @partition.partition_key,
+        limit:         count
       )
-      forwarded = rows.size - Forwarder.dispatch(rows).size
       redirect_to partition_path(@partition), notice: "Forwarded #{forwarded} job(s)."
     end
 
@@ -97,17 +94,14 @@ module DispatchPolicy
       drained = 0
       while drained < DRAIN_MAX_PER_REQUEST
         batch_limit = [DRAIN_BATCH_SIZE, DRAIN_MAX_PER_REQUEST - drained].min
-        rows = Repository.claim_staged_jobs!(
-          policy_name:      partition.policy_name,
-          partition_key:    partition.partition_key,
-          limit:            batch_limit,
-          gate_state_patch: {},
-          retry_after:      nil
+        forwarded   = ManualAdmission.force!(
+          policy_name:   partition.policy_name,
+          partition_key: partition.partition_key,
+          limit:         batch_limit
         )
-        break if rows.empty?
+        break if forwarded.zero?
 
-        Forwarder.dispatch(rows)
-        drained += rows.size
+        drained += forwarded
       end
       remaining = partition.class.where(id: partition.id).pick(:pending_count) || 0
       [drained, remaining]
