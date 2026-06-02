@@ -1,5 +1,42 @@
 # Changelog
 
+## 0.4.2
+
+### Fixed
+- The engine UI's **"admit"** and **"drain"** buttons now claim and
+  forward jobs inside a single transaction, matching the Tick's
+  at-least-once guarantee. They previously ran
+  `Repository.claim_staged_jobs!` (a `DELETE … RETURNING` that
+  autocommits on its own) and then a bare `Forwarder.dispatch` in a
+  separate statement — so if the forward raised (deserialize, adapter,
+  network), the staged rows were already deleted and the jobs were
+  lost. The atomic primitive now lives in
+  `DispatchPolicy::ManualAdmission.force!` and both controller actions
+  delegate to it.
+- The same UI paths now regenerate `active_job_id` per row before the
+  adapter handoff, as the Tick admission path already did in 0.4.1.
+  Without it the manual buttons could raise
+  `ActiveRecord::RecordNotUnique` against a residual adapter row from a
+  previous admission — which, combined with the missing transaction,
+  both 500'd the request and lost the staged rows.
+- Fixes a latent `NoMethodError` in the `admit` action: the old
+  `rows.size - Forwarder.dispatch(rows).size` raised when the claim
+  came back empty (`dispatch` returns `nil`) and otherwise reported a
+  misleading forwarded count.
+- Tick pass-2 budget redistribution no longer double-spends the
+  `throttle` token bucket. When `tick_admission_budget` is set, pass-2
+  re-evaluates a partition's gates against the in-memory partition
+  hash; the throttle bucket lives in `partitions.gate_state`, which was
+  persisted to the DB in pass-1 but never mirrored back in memory. So
+  pass-2 re-read the pre-pass-1 token count, admitted again from a full
+  bucket (above the configured rate), and persisted a patch computed
+  off the stale base — silently dropping pass-1's consumption, so the
+  effective rate drifted upward tick after tick. The committed
+  `gate_state` patch is now shallow-merged back onto the in-memory
+  partition after each admit. (`concurrency` / `adaptive_concurrency`
+  were unaffected — they re-read their counts from the DB on every
+  evaluate.)
+
 ## 0.4.1
 
 ### Fixed
