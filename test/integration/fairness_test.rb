@@ -263,6 +263,48 @@ class FairnessIntegrationTest < Minitest::Test
            "tick_admission_budget=5 must hold even when partitions claimed = 20 (admitted=#{admitted_total})"
   end
 
+  # ----- pass-2 must not double-spend a stateful gate --------------------
+
+  def test_pass2_redistribution_does_not_double_spend_the_throttle_bucket
+    # Regression: pass-2 budget redistribution re-evaluates a partition's
+    # gates. The throttle's token bucket lives in partitions.gate_state and
+    # was persisted to the DB in pass-1, but NOT mirrored back onto the
+    # in-memory partition hash. Pass-2 therefore read the PRE-pass-1 token
+    # count and admitted again from a full bucket — exceeding the
+    # configured rate and overwriting pass-1's consumption.
+    #
+    # Setup: throttle capacity = 7. "small" has 1 pending (so pass-1 leaves
+    # budget for pass-2), "big" has 100. tick_admission_budget = 12, so
+    # fair_share = ceil(12/2) = 6. Pass-1 admits 6 from "big" (bucket -> 1).
+    # Pass-2 offers the 5 leftover budget to "big"; with the bucket
+    # correctly at 1 it may admit only 1 more — total 7 = capacity. The bug
+    # admitted 5 more (the full stale bucket), for 11.
+    DispatchPolicy.reset_registry!
+    DispatchPolicy.registry.register(
+      DispatchPolicy::PolicyDSL.build("fair_test") do
+        context ->(args) { (args.first || {}).to_h }
+        partition_by ->(c) { c["key"] || c[:key] || "default" }
+        gate :throttle, rate: 7, per: 60
+      end
+    )
+
+    stage_n!("small", 1)
+    stage_n!("big", 100)
+
+    DispatchPolicy.config.fairness_half_life_seconds = 60
+    DispatchPolicy.config.tick_admission_budget = 12
+
+    result = DispatchPolicy::Tick.run(policy_name: "fair_test")
+
+    big = DispatchPolicy::Partition.find_by(partition_key: "big")
+    assert_equal 7, big.total_admitted,
+                 "throttle capacity is 7/window; pass-2 must not admit beyond it"
+    assert_equal 93, big.pending_count
+    assert_operator big.gate_state.dig("throttle", "tokens").to_f, :<, 1.0,
+                    "the bucket must reflect BOTH passes' consumption (~0 left), not just pass-2's"
+    assert_equal 8, result.jobs_admitted, "1 from small + 7 from big"
+  end
+
   # ----- multi-shard isolation -------------------------------------------
 
   def test_fairness_state_is_per_partition_so_shards_dont_interfere

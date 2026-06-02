@@ -286,6 +286,20 @@ module DispatchPolicy
         end
       end
 
+      # Reflect the just-committed gate_state patch on the in-memory
+      # partition. `record_partition_admit!` persisted `gate_state || patch`
+      # inside the TX above; without mirroring it here, a pass-2 re-admit
+      # (Tick budget redistribution) would re-evaluate the gates against
+      # the STALE pre-pass-1 snapshot. For the throttle that means reading
+      # the token bucket at its original level and double-spending —
+      # admitting above the configured rate and overwriting pass-1's
+      # consumption. The shallow merge matches Postgres jsonb `||`.
+      # Only runs on a committed admit: if the TX raised we fall through to
+      # the rescue below and never touch the in-memory state.
+      if result.gate_state_patch&.any?
+        partition["gate_state"] = (partition["gate_state"] || {}).merge(result.gate_state_patch)
+      end
+
       if admitted.zero?
         { admitted: 0, failures: 0, reasons: ["no_rows_claimed"] }
       else
