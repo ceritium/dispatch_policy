@@ -9,10 +9,6 @@ module DispatchPolicy
     scope :active,     -> { where(status: "active") }
     scope :paused,     -> { where(status: "paused") }
     scope :pending,    -> { where("pending_count > 0") }
-    scope :stale_inactive, ->(cutoff) {
-      where("pending_count = 0 AND in_flight_count = 0")
-        .where("last_admit_at < ? OR (last_admit_at IS NULL AND created_at < ?)", cutoff, cutoff)
-    }
 
     def paused?
       status == "paused"
