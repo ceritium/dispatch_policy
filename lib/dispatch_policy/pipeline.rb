@@ -5,10 +5,28 @@ module DispatchPolicy
   # partition. Returns a value object describing how many jobs may be
   # admitted right now and which gate-state patches to persist.
   class Pipeline
-    Result = Struct.new(:admit_count, :retry_after, :gate_state_patch, :reasons, keyword_init: true)
+    Result = Struct.new(:admit_count, :retry_after, :gate_state_patch, :reasons, :decisions, keyword_init: true)
 
     def initialize(policy)
       @policy = policy
+    end
+
+    # Computes the gate_state patch to persist once the REAL admitted count
+    # is known (after the staging DELETE). Each gate's #consume settles its
+    # state against the actual number of jobs claimed — the throttle
+    # deducts that many tokens rather than the optimistic `allowed` it
+    # returned at evaluate time. Gates that keep no gate_state (concurrency,
+    # adaptive_concurrency — their state lives in their own tables) return
+    # nil from #consume and contribute nothing here.
+    #
+    # `decisions` is the [gate, decision] list carried on the Result.
+    def self.settle(decisions, admitted_count)
+      patch = {}
+      decisions.each do |gate, decision|
+        sub = gate.consume(decision, admitted_count)
+        patch.merge!(sub) if sub
+      end
+      patch
     end
 
     def call(ctx, partition, max_budget)
@@ -41,7 +59,8 @@ module DispatchPolicy
         admit_count:       admit_count,
         retry_after:       retry_after,
         gate_state_patch:  patch,
-        reasons:           reasons
+        reasons:           reasons,
+        decisions:         decisions
       )
     end
   end

@@ -192,8 +192,8 @@ module DispatchPolicy
     # through `bulk_record_partition_denies!` instead, which collapses
     # many partitions into a single UPDATE…FROM(VALUES…) at the end of
     # the tick.
-    def claim_staged_jobs!(policy_name:, partition_key:, limit:, gate_state_patch:, retry_after:,
-                           half_life_seconds: nil)
+    def claim_staged_jobs!(policy_name:, partition_key:, limit:, retry_after:,
+                           gate_state_patch: nil, half_life_seconds: nil)
       raise ArgumentError, "claim_staged_jobs! requires limit > 0" unless limit.positive?
 
       sql_select = <<~SQL.squish
@@ -212,11 +212,18 @@ module DispatchPolicy
       SQL
       rows = connection.exec_query(sql_select, "claim_staged_jobs", [policy_name, partition_key, limit]).to_a
 
+      # The gate_state patch may depend on how many rows we actually
+      # claimed (e.g. the throttle charges its bucket for jobs admitted,
+      # not for the optimistic `allowed`). When the caller passes a block
+      # it receives that real count and returns the patch to persist;
+      # gate-less callers pass a fixed `gate_state_patch:` instead.
+      patch = block_given? ? yield(rows.size) : (gate_state_patch || {})
+
       record_partition_admit!(
         policy_name:       policy_name,
         partition_key:     partition_key,
         admitted:          rows.size,
-        gate_state_patch:  gate_state_patch,
+        gate_state_patch:  patch,
         retry_after:       retry_after,
         half_life_seconds: half_life_seconds
       )

@@ -39,11 +39,19 @@ module DispatchPolicy
         elapsed     = [now - refilled_at, 0.0].max
         tokens      = [tokens + (elapsed * refill_rate), capacity.to_f].min
 
-        whole       = tokens.floor
+        # The patch records the post-refill bucket WITHOUT deducting yet.
+        # The actual deduction is deferred to #consume, which runs once
+        # the admission TX knows how many staged rows were really claimed.
+        # Deducting `allowed` here over-charges the bucket whenever fewer
+        # jobs are admitted than allowed — a later gate capping admit_count,
+        # future-scheduled rows skipped by the `scheduled_at <= now()`
+        # filter, or rows another tick grabbed under SKIP LOCKED.
+        patch = { "tokens" => tokens, "refilled_at" => now }
+
+        whole = tokens.floor
         if whole.zero?
           missing      = 1.0 - tokens
           retry_after  = missing / refill_rate
-          patch        = { "tokens" => tokens, "refilled_at" => now }
           return Decision.new(allowed: 0,
                               retry_after: retry_after,
                               gate_state_patch: { "throttle" => patch },
@@ -51,8 +59,20 @@ module DispatchPolicy
         end
 
         allowed = [whole, admit_budget].min
-        patch   = { "tokens" => tokens - allowed, "refilled_at" => now }
         Decision.new(allowed: allowed, gate_state_patch: { "throttle" => patch })
+      end
+
+      # Settles the bucket against the number of jobs actually admitted.
+      # `evaluate` recorded the post-refill token count in the decision's
+      # patch; here we subtract exactly `admitted_count` (≤ allowed), so
+      # the bucket is charged for jobs that really left, never for unspent
+      # budget. Called by Pipeline.settle after the claim.
+      def consume(decision, admitted_count)
+        st = decision.gate_state_patch && decision.gate_state_patch["throttle"]
+        return nil unless st
+
+        { "throttle" => { "tokens"      => st["tokens"].to_f - admitted_count,
+                          "refilled_at" => st["refilled_at"] } }
       end
 
       private
