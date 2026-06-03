@@ -12,16 +12,19 @@ module DispatchPolicy
       names          = (registry_names + db_names).uniq.sort
 
       in_flight_by_policy = InflightJob.where(policy_name: names).group(:policy_name).count
+      # One grouped query for pending / partition count / paused count
+      # across every policy instead of three per policy.
+      counts_by_policy    = Repository.partition_counts_by_policy
 
       @rows = names.map do |name|
-        partitions = Partition.for_policy(name)
+        counts = counts_by_policy[name] || {}
         {
           name:           name,
           registered:     registry_names.include?(name),
-          pending:        partitions.sum(:pending_count),
+          pending:        counts[:pending] || 0,
           in_flight:      in_flight_by_policy[name] || 0,
-          partitions:     partitions.count,
-          paused_count:   partitions.paused.count
+          partitions:     counts[:partitions] || 0,
+          paused_count:   counts[:paused] || 0
         }
       end
     end

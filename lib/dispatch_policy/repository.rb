@@ -650,6 +650,33 @@ module DispatchPolicy
       }
     end
 
+    # Per-policy partition counts in one grouped query, keyed by
+    # policy_name → { pending, partitions, paused }. Replaces calling
+    # Partition.for_policy(name).sum/.count/.paused.count once per policy on
+    # the policies index (3N queries → 1).
+    def partition_counts_by_policy
+      result = connection.exec_query(
+        <<~SQL.squish,
+          SELECT
+            policy_name,
+            COALESCE(SUM(pending_count), 0)::int                 AS pending,
+            COUNT(*)::int                                        AS partitions,
+            COUNT(*) FILTER (WHERE status = 'paused')::int       AS paused
+          FROM #{PARTITIONS_TABLE}
+          GROUP BY policy_name
+        SQL
+        "partition_counts_by_policy",
+        []
+      )
+      result.to_a.each_with_object({}) do |r, h|
+        h[r["policy_name"]] = {
+          pending:    r["pending"].to_i,
+          partitions: r["partitions"].to_i,
+          paused:     r["paused"].to_i
+        }
+      end
+    end
+
     # Per-policy round-trip stats in one grouped query, keyed by
     # policy_name. Only the fields the dashboard overview renders
     # (in_backoff, oldest/p95 age); use partition_round_trip_stats for the

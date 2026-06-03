@@ -367,6 +367,31 @@ class RepositoryIntegrationTest < Minitest::Test
     assert_equal ["tick_cap_exhausted", 1], top["b"]
   end
 
+  def test_partition_counts_by_policy_matches_per_policy_aggregates
+    %w[a a b].each_with_index do |name, i|
+      DispatchPolicy::Repository.stage!(
+        policy_name: name, partition_key: "k#{i}", queue_name: nil,
+        job_class: "J", job_data: { "job_id" => "#{name}#{i}", "job_class" => "J", "arguments" => [] },
+        context: {}, priority: 0
+      )
+    end
+    # Pause one of a's partitions.
+    DispatchPolicy::Partition.where(policy_name: "a", partition_key: "k0").update_all(status: "paused")
+
+    grouped = DispatchPolicy::Repository.partition_counts_by_policy
+
+    %w[a b].each do |name|
+      scope = DispatchPolicy::Partition.for_policy(name)
+      assert_equal scope.sum(:pending_count), grouped[name][:pending], "#{name} pending"
+      assert_equal scope.count,               grouped[name][:partitions], "#{name} partitions"
+      assert_equal scope.paused.count,        grouped[name][:paused], "#{name} paused"
+    end
+    assert_equal 2, grouped["a"][:partitions]
+    assert_equal 1, grouped["a"][:paused]
+    assert_equal 1, grouped["b"][:partitions]
+    assert_equal 0, grouped["b"][:paused]
+  end
+
   def test_partition_round_trip_stats_by_policy_matches_per_policy
     %w[a b].each do |name|
       DispatchPolicy::Repository.stage!(
