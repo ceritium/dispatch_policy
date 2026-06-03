@@ -1,5 +1,58 @@
 # Changelog
 
+## 0.4.3
+
+### Fixed
+- The `throttle` gate now charges its token bucket for the number of jobs
+  **actually admitted**, not for the optimistic `allowed` it computes at
+  evaluate time. The deduction moved from `#evaluate` to the `#consume`
+  hook (run after the staging DELETE, via `Pipeline.settle`), so the
+  bucket is no longer over-charged — and the effective rate no longer
+  drifts below the configured one — when fewer jobs are admitted than
+  allowed: future-scheduled rows skipped by the `scheduled_at <= now()`
+  filter, a downstream `concurrency` gate capping `admit_count`, or rows a
+  concurrent tick claimed under `SKIP LOCKED`.
+- Inflight rows for jobs that were admitted but have **not started
+  performing yet** (still waiting in the adapter's queue) are no longer
+  reaped at `inflight_stale_after`. Their heartbeat thread only starts in
+  `around_perform`, so under a deep adapter backlog the sweeper used to
+  delete still-valid admissions, making the concurrency gate under-count
+  and over-admit. `sweep_stale_inflight!` is now two-tier: rows
+  heartbeated past admission reap at `inflight_stale_after`; never-started
+  rows reap only past the new, generous `config.inflight_queued_stale_after`
+  (1 hour default).
+- `InflightTracker` now applies the same `job.queue_name || policy.queue_name`
+  fallback at perform time that the staging path uses, so a policy whose
+  `partition_by`/`shard_by` reads `queue_name` derives the same
+  `partition_key` at admission and at perform (otherwise the inflight row
+  and adaptive observations landed under the wrong scope).
+- `CursorPagination` rejects cursors whose value isn't a scalar or whose
+  id isn't an integer (the cursor is an attacker-controllable query
+  param), and ignores a value whose type can't compare against the sort
+  column instead of raising a `PG` error (a forged numeric value on a
+  timestamp sort). Falls back to the first page.
+- `PolicyDSL#tick_admission_budget(nil)` / `#admission_batch_size(nil)` are
+  no-ops that defer to config instead of raising in `Integer(nil)`,
+  matching how `fairness(half_life:)` already guards nil.
+
+### Changed
+- The admin UI's dashboard and policies index collapse their per-policy
+  `N+1` query loops into grouped `Repository` methods
+  (`tick_summaries_by_policy`, `top_denied_reason_by_policy`,
+  `partition_round_trip_stats_by_policy`, `partition_counts_by_policy`),
+  one query each instead of several per policy.
+
+### Added
+- `config.inflight_queued_stale_after` (default 1 hour) — the sweep cutoff
+  for inflight rows admitted but never started. Raise it if your adapter
+  backlog can exceed an hour.
+
+### Removed
+- The broken, unused `Partition.stale_inactive` scope — it filtered on an
+  `in_flight_count` column dropped back in 0.3.0, so any call raised
+  `PG::UndefinedColumn`. The real partition GC is
+  `Repository.sweep_inactive_partitions!`.
+
 ## 0.4.2
 
 ### Fixed
