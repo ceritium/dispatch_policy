@@ -7,5 +7,6 @@ DispatchPolicy.configure do |c|
   c.idle_pause                = 0.5     # seconds slept when no admissions happened
   c.partition_inactive_after  = 24 * 60 * 60 # GC partitions idle this long
   c.inflight_stale_after      = 5 * 60      # GC inflight rows whose worker stopped heartbeating
+  c.inflight_queued_stale_after = 60 * 60   # GC inflight rows admitted but never started (still queued)
   c.sweep_every_ticks         = 50          # how often to run the sweepers
 end
