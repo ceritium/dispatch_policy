@@ -403,14 +403,37 @@ module DispatchPolicy
       Integer(result.rows.first.first)
     end
 
-    def sweep_stale_inflight!(cutoff_seconds:)
+    # Reap inflight rows whose owner is gone. Two tiers, distinguished by
+    # whether the row was ever heartbeated past its admission:
+    #
+    #   heartbeat_at > admitted_at  → the worker started performing and the
+    #     heartbeat thread advanced heartbeat_at at least once. If it then
+    #     went silent for `cutoff_seconds`, the worker died mid-run: reap.
+    #
+    #   heartbeat_at <= admitted_at → never heartbeated past admission. The
+    #     row was pre-inserted by the Tick and the job is still waiting in
+    #     the adapter's queue (or only just started — the first heartbeat
+    #     fires after inflight_heartbeat_interval). Reaping these at the
+    #     short cutoff would under-count the concurrency gate and over-admit
+    #     whenever queue latency exceeds it. Only reap once they're older
+    #     than the far more generous `queued_cutoff_seconds`, by which point
+    #     the admission is presumed lost.
+    #
+    # The Tick pre-insert writes admitted_at and heartbeat_at from the same
+    # now() (a single statement), so a never-started row has them exactly
+    # equal; one heartbeat makes heartbeat_at strictly greater.
+    def sweep_stale_inflight!(cutoff_seconds:, queued_cutoff_seconds: nil)
+      queued_cutoff_seconds ||= cutoff_seconds
       connection.exec_query(
         <<~SQL.squish,
           DELETE FROM #{INFLIGHT_TABLE}
-          WHERE heartbeat_at < now() - ($1 || ' seconds')::interval
+          WHERE (heartbeat_at > admitted_at
+                 AND heartbeat_at < now() - ($1 || ' seconds')::interval)
+             OR (heartbeat_at <= admitted_at
+                 AND admitted_at < now() - ($2 || ' seconds')::interval)
         SQL
         "sweep_stale_inflight",
-        [cutoff_seconds.to_i]
+        [cutoff_seconds.to_i, queued_cutoff_seconds.to_i]
       )
     end
 
