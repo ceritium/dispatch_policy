@@ -534,6 +534,7 @@ DispatchPolicy.configure do |c|
   c.idle_pause                = 0.5      # seconds slept when a tick admits nothing
   c.partition_inactive_after  = 86_400   # GC partitions idle this long
   c.inflight_stale_after      = 300      # GC inflight rows whose worker stopped heartbeating
+  c.inflight_queued_stale_after = 3_600  # GC inflight rows admitted but never started (queued)
   c.inflight_heartbeat_interval = 30     # how often the worker bumps heartbeat_at
   c.sweep_every_ticks         = 50       # sweeper cadence (in tick iterations)
   c.metrics_retention         = 86_400   # tick_samples kept this long
