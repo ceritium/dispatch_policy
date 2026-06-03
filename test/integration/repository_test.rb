@@ -309,6 +309,114 @@ class RepositoryIntegrationTest < Minitest::Test
            "oldest age (#{stats[:oldest_age_seconds]}) must be >= P95 (#{stats[:p95_age_seconds]})"
   end
 
+  def test_tick_summaries_by_policy_matches_per_policy_summary
+    since = Time.current - 60
+    DispatchPolicy::Repository.record_tick_sample!(
+      policy_name: "a", duration_ms: 30, partitions_seen: 5, partitions_admitted: 3,
+      partitions_denied: 2, jobs_admitted: 12, forward_failures: 1,
+      pending_total: 0, inflight_total: 0, denied_reasons: {}
+    )
+    DispatchPolicy::Repository.record_tick_sample!(
+      policy_name: "a", duration_ms: 50, partitions_seen: 1, partitions_admitted: 1,
+      partitions_denied: 0, jobs_admitted: 8, forward_failures: 0,
+      pending_total: 0, inflight_total: 0, denied_reasons: {}
+    )
+    DispatchPolicy::Repository.record_tick_sample!(
+      policy_name: "b", duration_ms: 10, partitions_seen: 1, partitions_admitted: 1,
+      partitions_denied: 0, jobs_admitted: 3, forward_failures: 2,
+      pending_total: 0, inflight_total: 0, denied_reasons: {}
+    )
+
+    grouped = DispatchPolicy::Repository.tick_summaries_by_policy(since: since)
+
+    %w[a b].each do |name|
+      single = DispatchPolicy::Repository.tick_summary(policy_name: name, since: since)
+      assert_equal single[:jobs_admitted],    grouped[name][:jobs_admitted]
+      assert_equal single[:forward_failures], grouped[name][:forward_failures]
+      assert_equal single[:ticks],            grouped[name][:ticks]
+      assert_equal single[:avg_duration_ms],  grouped[name][:avg_duration_ms]
+    end
+    assert_equal 20, grouped["a"][:jobs_admitted]
+    assert_equal 3,  grouped["b"][:jobs_admitted]
+  end
+
+  def test_top_denied_reason_by_policy_picks_the_max_per_policy
+    since = Time.current - 60
+    DispatchPolicy::Repository.record_tick_sample!(
+      policy_name: "a", duration_ms: 0, partitions_seen: 0, partitions_admitted: 0,
+      partitions_denied: 0, jobs_admitted: 0, forward_failures: 0,
+      pending_total: 0, inflight_total: 0,
+      denied_reasons: { "throttle_empty" => 5, "concurrency_full" => 2 }
+    )
+    DispatchPolicy::Repository.record_tick_sample!(
+      policy_name: "a", duration_ms: 0, partitions_seen: 0, partitions_admitted: 0,
+      partitions_denied: 0, jobs_admitted: 0, forward_failures: 0,
+      pending_total: 0, inflight_total: 0,
+      denied_reasons: { "concurrency_full" => 9 }
+    )
+    DispatchPolicy::Repository.record_tick_sample!(
+      policy_name: "b", duration_ms: 0, partitions_seen: 0, partitions_admitted: 0,
+      partitions_denied: 0, jobs_admitted: 0, forward_failures: 0,
+      pending_total: 0, inflight_total: 0,
+      denied_reasons: { "tick_cap_exhausted" => 1 }
+    )
+
+    top = DispatchPolicy::Repository.top_denied_reason_by_policy(since: since)
+    # a: concurrency_full 11 > throttle_empty 5
+    assert_equal ["concurrency_full", 11], top["a"]
+    assert_equal ["tick_cap_exhausted", 1], top["b"]
+  end
+
+  def test_partition_counts_by_policy_matches_per_policy_aggregates
+    %w[a a b].each_with_index do |name, i|
+      DispatchPolicy::Repository.stage!(
+        policy_name: name, partition_key: "k#{i}", queue_name: nil,
+        job_class: "J", job_data: { "job_id" => "#{name}#{i}", "job_class" => "J", "arguments" => [] },
+        context: {}, priority: 0
+      )
+    end
+    # Pause one of a's partitions.
+    DispatchPolicy::Partition.where(policy_name: "a", partition_key: "k0").update_all(status: "paused")
+
+    grouped = DispatchPolicy::Repository.partition_counts_by_policy
+
+    %w[a b].each do |name|
+      scope = DispatchPolicy::Partition.for_policy(name)
+      assert_equal scope.sum(:pending_count), grouped[name][:pending], "#{name} pending"
+      assert_equal scope.count,               grouped[name][:partitions], "#{name} partitions"
+      assert_equal scope.paused.count,        grouped[name][:paused], "#{name} paused"
+    end
+    assert_equal 2, grouped["a"][:partitions]
+    assert_equal 1, grouped["a"][:paused]
+    assert_equal 1, grouped["b"][:partitions]
+    assert_equal 0, grouped["b"][:paused]
+  end
+
+  def test_partition_round_trip_stats_by_policy_matches_per_policy
+    %w[a b].each do |name|
+      DispatchPolicy::Repository.stage!(
+        policy_name: name, partition_key: "k", queue_name: nil,
+        job_class: "J", job_data: { "job_id" => "#{name}1", "job_class" => "J", "arguments" => [] },
+        context: {}, priority: 0
+      )
+    end
+    DispatchPolicy::Partition.where(policy_name: "a").update_all(last_checked_at: 60.seconds.ago)
+    DispatchPolicy::Partition.where(policy_name: "b").update_all(
+      last_checked_at: 10.seconds.ago, next_eligible_at: 30.seconds.from_now
+    )
+
+    grouped = DispatchPolicy::Repository.partition_round_trip_stats_by_policy
+
+    %w[a b].each do |name|
+      single = DispatchPolicy::Repository.partition_round_trip_stats(policy_name: name)
+      assert_equal single[:in_backoff], grouped[name][:in_backoff]
+      assert_in_delta single[:oldest_age_seconds], grouped[name][:oldest_age_seconds], 1.0
+      assert_in_delta single[:p95_age_seconds],    grouped[name][:p95_age_seconds], 1.0
+    end
+    assert_equal 0, grouped["a"][:in_backoff]
+    assert_equal 1, grouped["b"][:in_backoff], "b's partition is in backoff (next_eligible_at in future)"
+  end
+
   def test_sweep_old_tick_samples
     DispatchPolicy::Repository.record_tick_sample!(
       policy_name: "p", duration_ms: 0, partitions_seen: 0, partitions_admitted: 0,
