@@ -143,4 +143,16 @@ class PolicyDSLTest < Minitest::Test
     assert_equal "", policy.partition_for(policy.build_context([])),
                  "nil partition_by result is coerced to empty string"
   end
+
+  def test_nil_budget_and_batch_size_are_noops_not_errors
+    # Passing nil explicitly means "defer to config default"; it must not
+    # blow up in Integer(nil), matching how fairness(half_life:) guards nil.
+    policy = DispatchPolicy::PolicyDSL.build("p") do
+      partition_by ->(_c) { "k" }
+      tick_admission_budget nil
+      admission_batch_size  nil
+    end
+    assert_nil policy.tick_admission_budget
+    assert_nil policy.admission_batch_size
+  end
 end

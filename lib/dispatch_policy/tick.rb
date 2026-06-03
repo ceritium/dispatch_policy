@@ -201,19 +201,24 @@ module DispatchPolicy
         return { admitted: 0, failures: 0, reasons: deduce_reasons(result) }
       end
 
-      admitted = 0
+      admitted      = 0
+      settled_patch = nil
       half_life = @policy.fairness_half_life_seconds || @config.fairness_half_life_seconds
 
       Repository.with_connection do
         ActiveRecord::Base.transaction(requires_new: true) do
+          # The gate_state we persist depends on how many rows actually
+          # got claimed: each gate settles its state against the real
+          # admitted count via Pipeline.settle (the throttle deducts that
+          # many tokens, not the optimistic `allowed`). The block runs
+          # inside claim_staged_jobs! right after the DELETE.
           rows = Repository.claim_staged_jobs!(
             policy_name:       @policy_name,
             partition_key:     partition["partition_key"],
             limit:             result.admit_count,
-            gate_state_patch:  result.gate_state_patch,
             retry_after:       result.retry_after,
             half_life_seconds: half_life
-          )
+          ) { |admitted_count| settled_patch = Pipeline.settle(result.decisions, admitted_count) }
 
           # `claim_staged_jobs!` always runs `record_partition_admit!` so
           # the partition's counters and gate_state commit even when the
@@ -293,11 +298,13 @@ module DispatchPolicy
       # the STALE pre-pass-1 snapshot. For the throttle that means reading
       # the token bucket at its original level and double-spending —
       # admitting above the configured rate and overwriting pass-1's
-      # consumption. The shallow merge matches Postgres jsonb `||`.
-      # Only runs on a committed admit: if the TX raised we fall through to
-      # the rescue below and never touch the in-memory state.
-      if result.gate_state_patch&.any?
-        partition["gate_state"] = (partition["gate_state"] || {}).merge(result.gate_state_patch)
+      # consumption. We mirror the SETTLED patch (post-consume, charged for
+      # the real admitted count), not evaluate's pre-consume snapshot. The
+      # shallow merge matches Postgres jsonb `||`. Only runs on a committed
+      # admit: if the TX raised we fall through to the rescue below and
+      # never touch the in-memory state.
+      if settled_patch&.any?
+        partition["gate_state"] = (partition["gate_state"] || {}).merge(settled_patch)
       end
 
       if admitted.zero?

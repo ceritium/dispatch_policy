@@ -10,6 +10,7 @@ module DispatchPolicy
                   :busy_pause,
                   :partition_inactive_after,
                   :inflight_stale_after,
+                  :inflight_queued_stale_after,
                   :inflight_heartbeat_interval,
                   :real_adapter,
                   :logger,
@@ -40,6 +41,16 @@ module DispatchPolicy
       @busy_pause                = 0.0
       @partition_inactive_after  = 24 * 60 * 60
       @inflight_stale_after      = 5 * 60
+      # Cutoff for inflight rows that were admitted (pre-inserted by the
+      # Tick) but never started performing — so the heartbeat thread, which
+      # only starts in around_perform, never advanced their heartbeat_at.
+      # These sit in the adapter's queue waiting for a worker; reaping them
+      # at `inflight_stale_after` (5 min) would make the concurrency gate
+      # under-count and over-admit whenever queue latency exceeds that. We
+      # give never-started rows a far more generous cutoff (1h) before
+      # assuming the admission was lost. Raise it if your adapter backlog
+      # can exceed an hour.
+      @inflight_queued_stale_after = 60 * 60
       @inflight_heartbeat_interval = 30
       @real_adapter              = nil
       @logger                    = nil

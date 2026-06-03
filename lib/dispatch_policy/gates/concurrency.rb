@@ -27,6 +27,13 @@ module DispatchPolicy
         cap = capacity_for(ctx)
         return Decision.deny(retry_after: @full_backoff, reason: "max=0") if cap <= 0
 
+        # This COUNT(*) runs in `evaluate`, BEFORE the admission TX opens, so
+        # the cap holds only when a single tick loop owns a given
+        # (policy, shard): within one tick, pass-2 re-reads the count after
+        # pass-1's inflight pre-insert has committed. Running two tick loops
+        # over the SAME shard would let both read the same pre-admission
+        # count and over-admit — shard the policy instead of duplicating
+        # loops on one shard (see shard_by in the README).
         in_flight = Repository.count_inflight(
           policy_name:   partition["policy_name"],
           partition_key: inflight_partition_key(partition["policy_name"], ctx)

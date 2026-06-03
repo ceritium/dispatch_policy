@@ -27,7 +27,9 @@ class ThrottleGateTest < Minitest::Test
     decision = gate.evaluate(DispatchPolicy::Context.wrap({}), empty_partition, 100)
 
     assert_equal 10, decision.allowed
-    assert_in_delta 0.0, decision.gate_state_patch.dig("throttle", "tokens"), 0.001
+    # evaluate records the post-refill bucket WITHOUT deducting; the
+    # deduction happens in #consume once the real admitted count is known.
+    assert_in_delta 10.0, decision.gate_state_patch.dig("throttle", "tokens"), 0.001
   end
 
   def test_admit_budget_caps_allowed
@@ -35,7 +37,32 @@ class ThrottleGateTest < Minitest::Test
     decision = gate.evaluate(DispatchPolicy::Context.wrap({}), empty_partition, 3)
 
     assert_equal 3, decision.allowed
-    assert_in_delta 7.0, decision.gate_state_patch.dig("throttle", "tokens"), 0.001
+    # Still the full refilled bucket — admit_budget caps `allowed`, not the
+    # recorded token count.
+    assert_in_delta 10.0, decision.gate_state_patch.dig("throttle", "tokens"), 0.001
+  end
+
+  def test_consume_deducts_exactly_the_admitted_count
+    gate = DispatchPolicy::Gates::Throttle.new(rate: 10, per: 60)
+    decision = gate.evaluate(DispatchPolicy::Context.wrap({}), empty_partition, 100)
+    assert_equal 10, decision.allowed
+
+    # Admitted fewer than allowed (e.g. only 4 staged rows were claimable):
+    # the bucket is charged 4, not 10.
+    patch = gate.consume(decision, 4)
+    assert_in_delta 6.0, patch.dig("throttle", "tokens"), 0.001
+    assert_equal decision.gate_state_patch.dig("throttle", "refilled_at"),
+                 patch.dig("throttle", "refilled_at")
+  end
+
+  def test_consume_with_zero_admits_leaves_the_refilled_bucket_untouched
+    gate = DispatchPolicy::Gates::Throttle.new(rate: 10, per: 60)
+    decision = gate.evaluate(DispatchPolicy::Context.wrap({}), empty_partition, 100)
+
+    # No rows actually claimed (all future-scheduled / raced away): the
+    # refill stands, but not a single token is spent.
+    patch = gate.consume(decision, 0)
+    assert_in_delta 10.0, patch.dig("throttle", "tokens"), 0.001
   end
 
   def test_no_tokens_returns_retry_after

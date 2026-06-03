@@ -66,6 +66,13 @@ module DispatchPolicy
       decoded = JSON.parse(Base64.urlsafe_decode64(cursor))
       return nil unless decoded.is_a?(Array) && decoded.size == 2
 
+      # The cursor is attacker-controllable (a query param). Reject anything
+      # that isn't a (scalar value, integer id) tuple so a hostile payload
+      # like [[1,2], {}] can't reach the WHERE clause and raise a 500 (or
+      # worse). Per-column type compatibility is enforced in #apply.
+      value, id = decoded
+      return nil unless (value.is_a?(String) || value.is_a?(Numeric)) && id.is_a?(Integer)
+
       decoded
     rescue StandardError
       nil
@@ -78,6 +85,15 @@ module DispatchPolicy
       return scope if cursor.nil?
 
       value, last_id = cursor
+      # Ignore a cursor whose value type can't be compared against this
+      # sort's column. The numeric columns (pending_count, total_admitted)
+      # need a Numeric; everything else compares as text (partition_key, or
+      # the ISO8601 timestamps emitted by #extract). A mismatch — e.g. a
+      # numeric value forged for a timestamp sort — would raise PG error;
+      # instead we fall back to the first page.
+      numeric_column = %w[pending_count total_admitted].include?(sort[:cursor_sql])
+      return scope unless numeric_column ? value.is_a?(Numeric) : value.is_a?(String)
+
       case sort[:direction]
       when :desc
         scope.where(
