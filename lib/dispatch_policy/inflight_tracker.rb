@@ -28,7 +28,15 @@ module DispatchPolicy
       policy = DispatchPolicy.registry.fetch(policy_name)
       return yield unless policy
 
-      ctx           = policy.build_context(job.arguments, queue_name: job.queue_name&.to_s)
+      # Mirror the stage-time fallback in JobExtension.around_enqueue_for:
+      # when the job carries no explicit queue, use the policy's default.
+      # Without this, a policy whose partition_by/shard_by reads queue_name
+      # would compute a DIFFERENT partition_key here than at admission, so
+      # the around_perform inflight row (and adaptive observations) would
+      # land under the wrong scope and the concurrency gate's COUNT(*) would
+      # miss them.
+      queue_name    = job.queue_name&.to_s || policy.queue_name
+      ctx           = policy.build_context(job.arguments, queue_name: queue_name)
       partition_key = policy.partition_key_for(ctx)
 
       Repository.insert_inflight!([{
