@@ -471,6 +471,37 @@ module DispatchPolicy
       }
     end
 
+    # One grouped query returning per-policy tick aggregates, keyed by
+    # policy_name. Replaces calling tick_summary once per policy on the
+    # dashboard (N queries → 1). Only the fields the overview renders.
+    #   { "policy_a" => { jobs_admitted:, forward_failures:, ticks:,
+    #                     avg_duration_ms: }, ... }
+    def tick_summaries_by_policy(since:)
+      result = connection.exec_query(
+        <<~SQL.squish,
+          SELECT
+            policy_name,
+            COALESCE(SUM(jobs_admitted), 0)::int    AS jobs_admitted,
+            COALESCE(SUM(forward_failures), 0)::int AS forward_failures,
+            COUNT(*)::int                           AS ticks,
+            COALESCE(AVG(duration_ms), 0)::int      AS avg_duration_ms
+          FROM #{SAMPLES_TABLE}
+          WHERE sampled_at >= $1
+          GROUP BY policy_name
+        SQL
+        "tick_summaries_by_policy",
+        [since]
+      )
+      result.to_a.each_with_object({}) do |r, h|
+        h[r["policy_name"]] = {
+          jobs_admitted:    r["jobs_admitted"].to_i,
+          forward_failures: r["forward_failures"].to_i,
+          ticks:            r["ticks"].to_i,
+          avg_duration_ms:  r["avg_duration_ms"].to_i
+        }
+      end
+    end
+
     # Aggregate denied_reasons jsonb across samples in window: returns
     # { "throttle" => 12, "concurrency_full" => 3, ... }
     def denied_reasons_summary(policy_name: nil, since:)
@@ -488,6 +519,30 @@ module DispatchPolicy
         params
       )
       result.to_a.each_with_object({}) { |r, h| h[r["key"]] = r["total"].to_i }
+    end
+
+    # The single most-denied reason per policy in one query, keyed by
+    # policy_name → [reason, count]. Replaces calling denied_reasons_summary
+    # per policy on the dashboard just to read its top entry.
+    def top_denied_reason_by_policy(since:)
+      result = connection.exec_query(
+        <<~SQL.squish,
+          SELECT DISTINCT ON (policy_name) policy_name, key, total
+          FROM (
+            SELECT policy_name, key, SUM(value::int)::int AS total
+            FROM #{SAMPLES_TABLE},
+                 LATERAL jsonb_each_text(denied_reasons)
+            WHERE sampled_at >= $1
+            GROUP BY policy_name, key
+          ) t
+          ORDER BY policy_name, total DESC
+        SQL
+        "top_denied_reason_by_policy",
+        [since]
+      )
+      result.to_a.each_with_object({}) do |r, h|
+        h[r["policy_name"]] = [r["key"], r["total"].to_i]
+      end
     end
 
     # Returns time-bucketed series for sparklines. `bucket_seconds` is the
@@ -593,6 +648,35 @@ module DispatchPolicy
         p50_age_seconds:    row["p50_age_seconds"]&.to_f,
         p95_age_seconds:    row["p95_age_seconds"]&.to_f
       }
+    end
+
+    # Per-policy round-trip stats in one grouped query, keyed by
+    # policy_name. Only the fields the dashboard overview renders
+    # (in_backoff, oldest/p95 age); use partition_round_trip_stats for the
+    # full single-policy breakdown. Replaces N per-policy calls on the
+    # dashboard. Same percentile-inversion note as partition_round_trip_stats.
+    def partition_round_trip_stats_by_policy
+      result = connection.exec_query(
+        <<~SQL.squish,
+          SELECT
+            p.policy_name,
+            COUNT(*) FILTER (WHERE p.next_eligible_at IS NOT NULL AND p.next_eligible_at > now())::int AS in_backoff,
+            EXTRACT(EPOCH FROM (now() - MIN(p.last_checked_at)))::float AS oldest_age_seconds,
+            EXTRACT(EPOCH FROM (now() - PERCENTILE_DISC(0.05) WITHIN GROUP (ORDER BY p.last_checked_at)))::float AS p95_age_seconds
+          FROM #{PARTITIONS_TABLE} p
+          WHERE p.status = 'active' AND p.pending_count > 0
+          GROUP BY p.policy_name
+        SQL
+        "partition_round_trip_stats_by_policy",
+        []
+      )
+      result.to_a.each_with_object({}) do |r, h|
+        h[r["policy_name"]] = {
+          in_backoff:         r["in_backoff"].to_i,
+          oldest_age_seconds: r["oldest_age_seconds"]&.to_f,
+          p95_age_seconds:    r["p95_age_seconds"]&.to_f
+        }
+      end
     end
 
     # ----- adaptive_concurrency stats -----------------------------------------

@@ -61,29 +61,37 @@ module DispatchPolicy
       one_min_ago = now - 60
       five_min_ago = now - 300
 
+      # Aggregate everything the per-policy rows need in 4 grouped queries
+      # instead of ~4 per policy. With dozens of policies this was the bulk
+      # of the dashboard's query count.
+      m1_by     = Repository.tick_summaries_by_policy(since: one_min_ago)
+      m5_by     = Repository.tick_summaries_by_policy(since: five_min_ago)
+      denied_by = Repository.top_denied_reason_by_policy(since: one_min_ago)
+      rt_by     = Repository.partition_round_trip_stats_by_policy
+
       names = (pending_by_policy.keys + in_flight_by_policy.keys).uniq.sort
       @policies = names.map do |name|
-        info  = pending_by_policy[name] || {}
-        m1    = Repository.tick_summary(policy_name: name, since: one_min_ago)
-        m5    = Repository.tick_summary(policy_name: name, since: five_min_ago)
-        rs    = Repository.denied_reasons_summary(policy_name: name, since: one_min_ago)
-        rt    = Repository.partition_round_trip_stats(policy_name: name)
+        info = pending_by_policy[name] || {}
+        m1   = m1_by[name] || {}
+        m5   = m5_by[name] || {}
+        rt   = rt_by[name] || {}
+        top  = denied_by[name] # [reason, count] or nil
 
         {
           name:           name,
           pending:        info[:pending] || 0,
           in_flight:      in_flight_by_policy[name] || 0,
           last_admit_at:  info[:last_admit_at],
-          admitted_1m:    m1[:jobs_admitted],
-          admitted_5m:    m5[:jobs_admitted],
-          ticks_1m:       m1[:ticks],
-          avg_tick_ms_1m: m1[:avg_duration_ms],
-          forward_failures_1m: m1[:forward_failures],
+          admitted_1m:    m1[:jobs_admitted] || 0,
+          admitted_5m:    m5[:jobs_admitted] || 0,
+          ticks_1m:       m1[:ticks] || 0,
+          avg_tick_ms_1m: m1[:avg_duration_ms] || 0,
+          forward_failures_1m: m1[:forward_failures] || 0,
           oldest_age_seconds:  rt[:oldest_age_seconds],
           p95_age_seconds:     rt[:p95_age_seconds],
-          in_backoff:          rt[:in_backoff],
-          top_denial_reason:   rs.first&.first,
-          top_denial_count:    rs.first&.last
+          in_backoff:          rt[:in_backoff] || 0,
+          top_denial_reason:   top&.first,
+          top_denial_count:    top&.last
         }
       end
     end
