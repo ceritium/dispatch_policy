@@ -45,7 +45,7 @@ module DispatchPolicy
     end
 
     def admission_batch_size(size)
-      @admission_batch_size = Integer(size)
+      @admission_batch_size = Integer(size) if size
     end
 
     # Per-policy override for the EWMA half-life used to weigh recent
@@ -62,7 +62,7 @@ module DispatchPolicy
     # nil, no global cap is enforced and per-partition admission_batch_size
     # is the only ceiling.
     def tick_admission_budget(value)
-      @tick_admission_budget = Integer(value)
+      @tick_admission_budget = Integer(value) if value
     end
 
     # Defines the partition scope. Required — every policy declares
