@@ -883,5 +883,43 @@ module DispatchPolicy
         ["now() + ($5 || ' seconds')::interval", [retry_after.to_f.round(3)]]
       end
     end
+
+    # ----- role routing ---------------------------------------------------------
+    #
+    # Every public Repository method must run against config.database_role
+    # so multi-DB setups (e.g. solid_queue on a separate :queue DB, with
+    # the gem tables living there) hit the DB the staging/admission/inflight
+    # state actually lives in. Otherwise staging writes the primary DB while
+    # the tick reads the queue DB — silent job loss — and the concurrency
+    # gate counts inflight rows in a different DB than the tracker writes.
+    #
+    # Rather than wrap ~25 method bodies by hand — and risk missing one as
+    # the API grows — we redefine each public SQL method to run inside
+    # `with_connection`. We capture the ORIGINAL as a bound closure and call
+    # it directly (no `super`, no prepended module): this is immune to the
+    # file being evaluated more than once in a process (dev reloader,
+    # integration suites that boot the dummy app under multiple require
+    # paths). Each evaluation re-wraps the freshly (re)defined originals
+    # exactly once, so wrappers never stack. `connected_to(role:)` nesting
+    # with the SAME role is a no-op, so the explicit `with_connection` blocks
+    # at the transaction boundaries (Tick, ManualAdmission) stay correct: the
+    # admission TX still opens entirely within one role context, preserving
+    # the shared-connection atomicity invariant. The `connection` accessor
+    # and the pure helpers are excluded — they issue no SQL of their own and
+    # always run inside an already-routed caller, so wrapping them would only
+    # add redundant role swaps in hot per-row loops (normalize_*/parse_jsonb
+    # run once per claimed row).
+    ROLE_ROUTING_EXCLUDED = %i[
+      connection with_connection
+      normalize_partition normalize_staged parse_jsonb
+      sample_filter next_eligible_clause trend_direction
+    ].freeze
+
+    (singleton_methods(false) - ROLE_ROUTING_EXCLUDED).each do |method_name|
+      original = singleton_class.instance_method(method_name)
+      define_singleton_method(method_name) do |*args, **kwargs, &block|
+        with_connection { original.bind_call(self, *args, **kwargs, &block) }
+      end
+    end
   end
 end

@@ -81,11 +81,16 @@ module DispatchPolicy
     # - admitted_at). nil if the row vanished or the lookup fails —
     # the observation is then skipped.
     def self.lookup_admitted_at(active_job_id)
-      result = ActiveRecord::Base.connection.exec_query(
-        "SELECT admitted_at FROM dispatch_policy_inflight_jobs WHERE active_job_id = $1 LIMIT 1",
-        "lookup_admitted_at",
-        [active_job_id]
-      )
+      # Route through config.database_role: the inflight row lives in the
+      # same DB the Tick pre-inserted it into, which under multi-DB is the
+      # queue DB, not the default writing role of the worker process.
+      result = Repository.with_connection do
+        ActiveRecord::Base.connection.exec_query(
+          "SELECT admitted_at FROM dispatch_policy_inflight_jobs WHERE active_job_id = $1 LIMIT 1",
+          "lookup_admitted_at",
+          [active_job_id]
+        )
+      end
       row = result.first
       return nil unless row
       ts = row["admitted_at"]
@@ -147,8 +152,16 @@ module DispatchPolicy
           break if stop_flag.true?
 
           begin
-            ActiveRecord::Base.connection_pool.with_connection do
-              Repository.heartbeat_inflight!(active_job_id: active_job_id)
+            # Establish config.database_role inside this thread BEFORE the
+            # checkout: under multi-DB, connection_pool must resolve to the
+            # role's pool (where the inflight row lives), not the default
+            # writing pool. with_connection swaps the role thread-locally;
+            # the nested pool checkout then borrows/returns a dedicated
+            # connection from that pool per beat.
+            Repository.with_connection do
+              ActiveRecord::Base.connection_pool.with_connection do
+                Repository.heartbeat_inflight!(active_job_id: active_job_id)
+              end
             end
           rescue StandardError => e
             DispatchPolicy.config.logger&.warn("[dispatch_policy] heartbeat #{active_job_id} failed: #{e.class}: #{e.message}")

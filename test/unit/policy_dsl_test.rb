@@ -65,6 +65,28 @@ class PolicyDSLTest < Minitest::Test
     end
   end
 
+  def test_duplicate_gate_type_raises
+    # Two gates of the same type would share a gate_state key and corrupt
+    # each other's persisted bucket — reject at definition time.
+    err = assert_raises(DispatchPolicy::InvalidPolicy) do
+      DispatchPolicy::PolicyDSL.build("p") do
+        partition_by ->(_c) { "k" }
+        gate :throttle, rate: 10,  per: 60
+        gate :throttle, rate: 600, per: 3600
+      end
+    end
+    assert_match(/duplicate :throttle gate/, err.message)
+  end
+
+  def test_distinct_gate_types_are_allowed
+    policy = DispatchPolicy::PolicyDSL.build("p") do
+      partition_by ->(_c) { "k" }
+      gate :throttle,    rate: 10, per: 60
+      gate :concurrency, max: 5
+    end
+    assert_equal %i[throttle concurrency], policy.gates.map(&:name)
+  end
+
   def test_no_gates_is_allowed_for_fairness_only_policies
     # A policy with no gates uses admission_batch_size (or
     # tick_admission_budget) as its ceiling and relies on the in-tick

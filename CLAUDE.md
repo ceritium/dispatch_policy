@@ -109,10 +109,21 @@ dispatch_policy_adaptive_concurrency_stats    AIMD-tuned current_max + EWMA lag
   lost. Deliberate: a custom PG-backed adapter (not detected) can
   still work, and we don't want to break its deploy.
 - **`config.database_role`**: for Rails multi-DB (e.g. solid_queue
-  with a separate DB), sets the role the admission TX is opened
-  against. `Repository.with_connection` wraps the TX in
-  `connected_to(role:)` when set. Staging tables and the adapter's
-  table must live in the same DB for atomicity to hold.
+  with a separate DB), sets the role every Repository call is opened
+  against. **All** public `Repository` methods are auto-wrapped in
+  `with_connection` (`connected_to(role:)`) at the bottom of
+  `repository.rb` — not just the admission TX — so staging, claim,
+  inflight counts/tracking, sweeps and dashboard reads all hit the DB
+  the gem tables live in. The wrap captures each original as a bound
+  closure (no `super`/prepend): a `super`-based prepend stacks wrappers
+  and stack-overflows when the suite re-evaluates the file. New public
+  Repository methods are routed automatically; pure helpers
+  (`normalize_*`, `parse_jsonb`, `sample_filter`,
+  `next_eligible_clause`, `trend_direction`) and the `connection`
+  accessor are in `ROLE_ROUTING_EXCLUDED`. `InflightTracker`'s direct
+  AR access (`lookup_admitted_at`, the heartbeat thread) wraps
+  explicitly. Staging tables and the adapter's table must live in the
+  same DB for atomicity to hold.
 - **Every admitted job creates a row in `inflight_jobs`**, whether or
   not there's a concurrency gate. The key is always
   `policy.partition_for(ctx)` (same canonical scope as the staged

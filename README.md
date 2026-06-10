@@ -210,6 +210,12 @@ Gates run in declared order; each narrows the survivor count. Every
 option that takes a value can alternatively take a lambda receiving
 the `ctx` hash, so parameters can depend on per-job data.
 
+A policy may declare each gate type **at most once** — two gates of the
+same type would share a `gate_state` key and corrupt each other's
+persisted state, so the policy raises `InvalidPolicy` at definition
+time. For multi-window rate limiting (e.g. 10/min *and* 600/hour), use
+separate policies.
+
 ### `:throttle` — token-bucket rate limit per partition
 
 Refills `rate` tokens every `per` seconds, capped at `rate` (no
