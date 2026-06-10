@@ -238,6 +238,11 @@ bundle exec rake test                        # 101 runs / 225 asserts
 #      migrations because v0.1 ships a single migration)
 #   4. test/integration/repository_test.rb#schema_present? detects
 #      drift via known columns; add the new one to the check.
+#   5. CHANGELOG: add/extend an "Upgrade notes" subsection under
+#      Unreleased stating the schema change and the exact SQL/steps an
+#      EXISTING install must run (the gem ships a single migration, so
+#      upgraders don't get it via db:migrate). Release notes must always
+#      flag migration changes — this is a hard convention.
 ```
 
 ## Useful debug queries
