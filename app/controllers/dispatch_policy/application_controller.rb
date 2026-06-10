@@ -4,10 +4,23 @@ module DispatchPolicy
   class ApplicationController < ActionController::Base
     protect_from_forgery with: :exception
 
+    # The dashboard reads and writes the gem tables through the AR models
+    # directly (Partition, StagedJob, InflightJob, PolicySetting,
+    # TickSample), which — unlike Repository — have no role wrapper of
+    # their own. Under multi-DB (config.database_role) those queries would
+    # hit the default writing role, where the gem tables don't live.
+    # Wrapping the whole action keeps view rendering inside the role too,
+    # so lazily-evaluated relations (@partitions etc.) stay routed.
+    around_action :route_database_role
+
     helper_method :format_time, :format_count, :format_duration_seconds,
                   :format_duration_ms, :sparkline, :registered_policies
 
     private
+
+    def route_database_role(&action)
+      Repository.with_connection(&action)
+    end
 
     def registered_policies
       DispatchPolicy.registry.each.to_a

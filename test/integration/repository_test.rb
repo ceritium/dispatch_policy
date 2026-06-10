@@ -151,6 +151,22 @@ class RepositoryIntegrationTest < Minitest::Test
                  "resuming the policy makes its partitions claimable again"
   end
 
+  # M9 follow-up: PoliciesController#pause wraps the flag upsert and the
+  # partitions' status update in one AR transaction so both commit or
+  # neither. That only holds if set_policy_paused! (raw exec_query through
+  # Repository.connection) actually JOINS an outer model-opened TX instead
+  # of autocommitting — i.e. both run on the same connection.
+  def test_set_policy_paused_joins_an_outer_model_transaction
+    DispatchPolicy::Partition.transaction do
+      DispatchPolicy::Repository.set_policy_paused!(policy_name: "p", paused: true)
+      raise ActiveRecord::Rollback
+    end
+
+    paused = ActiveRecord::Base.connection
+                               .select_value("SELECT paused FROM dispatch_policy_policy_settings WHERE policy_name = 'p'")
+    assert_nil paused, "a rolled-back outer TX must take the pause flag with it"
+  end
+
   # L1: stage_many! must chunk so a batch larger than PG's bind-param limit
   # (65_535 / 8 params per row ≈ 8_191 rows) doesn't fail the whole INSERT.
   # 2_500 rows crosses two STAGE_MANY_BATCH (1_000) boundaries cheaply.

@@ -45,6 +45,20 @@
   partitions / growing backlog while admission is intentionally stopped.
 
 ### Fixed
+- **The admin UI honors `config.database_role`.** The engine controllers
+  query the gem tables through the AR models directly (`Partition`,
+  `StagedJob`, `InflightJob`, `PolicySetting`, `TickSample`), which the
+  `Repository` role wrapper doesn't cover — under multi-DB every dashboard
+  page queried the default writing role (`PG::UndefinedTable` → 500), and
+  `pause`/`resume` updated the partition `status` in the wrong DB while
+  the policy flag went to the right one. An `around_action` in the
+  engine's `ApplicationController` now wraps every action — including view
+  rendering, so lazily-evaluated relations stay routed — in
+  `Repository.with_connection`. No-op without `database_role`.
+- **`pause`/`resume` write the policy flag and the partition statuses in
+  one transaction.** They were two autocommitted statements; a crash
+  between them left the partition list contradicting what admission
+  actually does until the next toggle.
 - **The generated `DispatchTickLoopJob` no longer dies after its first run
   under good_job.** It re-enqueues itself at the end of `perform`, but
   `good_job_control_concurrency_with(total_limit: 1)` counts the

@@ -14,6 +14,20 @@ remediation plan at the bottom. Line numbers are as of `ae820fa`.
 > durations, ILIKE escaping, Turbo listener leak, dynamic throttle `per`,
 > blank-field 500s). All are in the CHANGELOG (Unreleased).
 
+> **A third-pass review** (over the fix branch itself) found and fixed one
+> more medium: **M9 — the engine controllers bypass `config.database_role`**.
+> H1 wrapped every `Repository` method, but the five dashboard controllers
+> query the AR models directly (~25 call sites: `Partition.all`,
+> `StagedJob.find`, `InflightJob.count`, `PolicySetting.paused`, …), so
+> under multi-DB every dashboard page hit the default writing role
+> (`PG::UndefinedTable` → 500) and `pause`/`resume` wrote the partition
+> `status` to the wrong DB while the flag went to the right one. Fixed with
+> an `around_action` in the engine's `ApplicationController` wrapping the
+> whole action (including view rendering) in `Repository.with_connection`.
+> While there, `pause`/`resume` now write the policy flag and the partition
+> statuses in **one transaction** — previously two autocommitted statements
+> could diverge if the process died between them.
+
 Verified clean (no findings): SQL injection (everything goes through bind
 params or whitelists), XSS (the only `html_safe` calls are static gem
 assets), CSRF on dashboard actions, keyset pagination correctness,
