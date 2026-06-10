@@ -462,9 +462,12 @@ DispatchPolicy.configure do |c|
 end
 ```
 
-`Repository.with_connection` wraps the admission TX in
-`connected_to(role:)` when set. Staging tables and the adapter's
-table must live in the same DB for atomicity to hold.
+When set, **every** DB access the gem makes runs inside
+`connected_to(role:)` — staging on `perform_later`, the admission TX,
+inflight tracking and its heartbeat thread, sweeps, and the admin UI
+(an `around_action` routes each dashboard request, so its reads and
+operator actions hit the same DB the tick writes). Staging tables and
+the adapter's table must live in the same DB for atomicity to hold.
 
 ### Job identity across staging and adapter
 
@@ -555,13 +558,13 @@ DispatchPolicy.configure do |c|
   c.partition_inactive_after  = 86_400   # GC partitions idle this long
   c.inflight_stale_after      = 300      # GC inflight rows whose worker stopped heartbeating
   c.inflight_queued_stale_after = 3_600  # GC inflight rows admitted but never started (queued)
-  c.inflight_heartbeat_interval = 30     # how often the worker bumps heartbeat_at
-  c.sweep_every_ticks         = 50       # sweeper cadence (in tick iterations)
+  c.inflight_heartbeat_interval = 30     # how often the worker bumps heartbeat_at; 0 disables the thread
+  c.sweep_every_ticks         = 50       # sweeper cadence (in tick iterations); <= 0 never sweeps
   c.metrics_retention         = 86_400   # tick_samples kept this long
   c.fairness_half_life_seconds = 60      # EWMA half-life for in-tick reorder; nil disables
   c.tick_admission_budget      = nil     # global cap on admissions per tick; nil = none
   c.adapter_throughput_target  = nil     # jobs/sec; UI shows admit rate as % of this
-  c.database_role              = nil     # AR role for the admission TX (multi-DB)
+  c.database_role              = nil     # AR role ALL gem DB access runs against (multi-DB)
 end
 ```
 
