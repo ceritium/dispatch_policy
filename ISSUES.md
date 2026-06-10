@@ -15,10 +15,12 @@ anti-starvation).
 
 ## High
 
-> **Status:** H1 and H2 fixed on branch `fix/high-priority-audit-issues`
-> (`Repository` role routing + duplicate-gate validation), with regression
-> tests in `test/unit/repository_role_routing_test.rb` and
-> `test/unit/policy_dsl_test.rb`.
+> **Status:** H1, H2 and all medium issues (M1–M8) fixed on branch
+> `fix/high-priority-audit-issues`, each with regression tests. The low
+> issues (L1–L10) remain open. M6 adds the `dispatch_policy_policy_settings`
+> table — existing installs must create it (the gem ships a single
+> migration; copy the new `create_table` block or run the updated
+> migration/generator).
 
 ### H1 — `config.database_role` is only applied in 3 call sites; multi-DB is broken end-to-end
 
@@ -62,7 +64,7 @@ becomes "10 per tick". The same collision applies to two
 
 ---
 
-## Medium
+## Medium — all fixed
 
 ### M1 — Bulk enqueue: silent job drop, premature `successfully_enqueued`, missing `bypass_retries`
 

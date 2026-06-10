@@ -111,6 +111,22 @@ class ManualAdmissionTest < Minitest::Test
     assert_equal 0, DispatchPolicy::Partition.first.pending_count
   end
 
+  # M2: force! must pre-insert an inflight row per admitted job, like the
+  # Tick does, so the concurrency gate's COUNT(*) sees them immediately
+  # instead of under-counting until each job starts performing.
+  def test_force_admit_pre_inserts_inflight_rows
+    stage_one_job!
+
+    forwarded = DispatchPolicy::ManualAdmission.force!(
+      policy_name: "manual_test", partition_key: "k", limit: 5
+    )
+
+    assert_equal 1, forwarded
+    assert_equal 1,
+                 DispatchPolicy::InflightJob.where(policy_name: "manual_test", partition_key: "k").count,
+                 "force! must create an inflight row for the admitted job"
+  end
+
   def test_empty_partition_forwards_zero_without_error
     assert_equal 0, DispatchPolicy::ManualAdmission.force!(
       policy_name: "manual_test", partition_key: "k", limit: 5

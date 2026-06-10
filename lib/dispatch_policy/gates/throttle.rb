@@ -28,16 +28,26 @@ module DispatchPolicy
       end
 
       def evaluate(ctx, partition, admit_budget)
-        capacity = capacity_for(ctx)
-        return Decision.deny(reason: "rate=0") if capacity <= 0
+        rate = rate_for(ctx)
+        # rate <= 0 (e.g. a paused tenant) backs off for one window instead
+        # of denying with a NULL retry_after. A NULL retry_after leaves the
+        # partition immediately eligible, so it would be re-claimed and
+        # re-evaluated every single tick — a busy-loop that also clobbers any
+        # backoff a prior tick had set.
+        return Decision.deny(retry_after: @per, reason: "rate=0") if rate <= 0
 
-        refill_rate = capacity.to_f / @per
+        # The bucket holds at least one whole token; otherwise a sub-unit rate
+        # (e.g. rate: 0.5) could never accumulate a full token and would never
+        # admit. refill_rate stays at the true `rate` so the long-run pace is
+        # exact — the floor only sets the burst ceiling.
+        capacity    = [rate, 1.0].max
+        refill_rate = rate / @per
         state       = (partition["gate_state"] || {})["throttle"] || {}
         tokens      = (state["tokens"] || capacity).to_f
         refilled_at = (state["refilled_at"] || now).to_f
 
         elapsed     = [now - refilled_at, 0.0].max
-        tokens      = [tokens + (elapsed * refill_rate), capacity.to_f].min
+        tokens      = [tokens + (elapsed * refill_rate), capacity].min
 
         # The patch records the post-refill bucket WITHOUT deducting yet.
         # The actual deduction is deferred to #consume, which runs once
@@ -77,9 +87,12 @@ module DispatchPolicy
 
       private
 
-      def capacity_for(ctx)
+      def rate_for(ctx)
         value = @rate_proc.call(ctx)
-        value.nil? ? 0 : Integer(value)
+        # Float, not Integer: a fractional rate (e.g. 2.5/sec) must keep its
+        # fractional part or the bucket systematically under-admits by
+        # truncating every refill. nil means "no rate configured" → deny.
+        value.nil? ? 0.0 : Float(value)
       end
 
       def now

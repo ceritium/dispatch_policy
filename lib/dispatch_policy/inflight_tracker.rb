@@ -75,6 +75,27 @@ module DispatchPolicy
       end
     end
 
+    # Deletes the inflight row for a job that ActiveJob discarded BEFORE
+    # around_perform ran — most commonly an ActiveJob::DeserializationError
+    # (a GlobalID whose record was deleted) on a job with
+    # `discard_on ActiveJob::DeserializationError`. Argument deserialization
+    # happens before the perform callbacks, so track's `ensure` never runs
+    # and the row the Tick pre-inserted would otherwise sit until the
+    # `inflight_queued_stale_after` sweeper reaps it (default 1h), holding a
+    # concurrency slot the whole time. Wired to the `discard.active_job`
+    # notification by the railtie. Idempotent: a no-op when no row exists
+    # (e.g. discard fired after track already deleted it).
+    def self.handle_discard(job)
+      return unless job
+      return unless job.class.respond_to?(:dispatch_policy_name) && job.class.dispatch_policy_name
+
+      Repository.delete_inflight!(active_job_id: job.job_id)
+    rescue StandardError => e
+      DispatchPolicy.config.logger&.warn(
+        "[dispatch_policy] failed to clean up inflight row for discarded job #{job&.job_id}: #{e.class}: #{e.message}"
+      )
+    end
+
     # Reads the admitted_at column from the inflight row that the Tick
     # pre-inserted. Used as the start-of-queue-wait reference for the
     # adaptive_concurrency feedback signal (queue_lag = perform_start

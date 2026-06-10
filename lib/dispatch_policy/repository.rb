@@ -13,8 +13,9 @@ module DispatchPolicy
     STAGED_TABLE      = "dispatch_policy_staged_jobs"
     PARTITIONS_TABLE  = "dispatch_policy_partitions"
     INFLIGHT_TABLE    = "dispatch_policy_inflight_jobs"
-    SAMPLES_TABLE     = "dispatch_policy_tick_samples"
-    ADAPTIVE_TABLE    = "dispatch_policy_adaptive_concurrency_stats"
+    SAMPLES_TABLE        = "dispatch_policy_tick_samples"
+    ADAPTIVE_TABLE       = "dispatch_policy_adaptive_concurrency_stats"
+    POLICY_SETTINGS_TABLE = "dispatch_policy_policy_settings"
 
     module_function
 
@@ -169,6 +170,10 @@ module DispatchPolicy
             AND status = 'active'
             AND pending_count > 0
             AND (next_eligible_at IS NULL OR next_eligible_at <= now())
+            AND NOT EXISTS (
+              SELECT 1 FROM #{POLICY_SETTINGS_TABLE} ps
+              WHERE ps.policy_name = $1 AND ps.paused
+            )
             #{shard_sql}
           ORDER BY last_checked_at NULLS FIRST, id
           LIMIT $#{params.size}
@@ -331,7 +336,7 @@ module DispatchPolicy
           UPDATE #{PARTITIONS_TABLE} p
           SET gate_state       = p.gate_state || v.gate_state_patch,
               next_eligible_at = CASE
-                WHEN v.retry_after_secs IS NULL THEN NULL
+                WHEN v.retry_after_secs IS NULL THEN p.next_eligible_at
                 ELSE now() + (v.retry_after_secs || ' seconds')::interval
               END,
               updated_at       = now()
@@ -341,6 +346,24 @@ module DispatchPolicy
         SQL
         "bulk_record_partition_denies",
         params
+      )
+    end
+
+    # ----- policy settings ------------------------------------------------------
+
+    # Upsert the pause flag for a policy. The tick's claim_partitions reads
+    # this row, so toggling it takes effect for every partition of the
+    # policy — including ones created after the toggle.
+    def set_policy_paused!(policy_name:, paused:)
+      connection.exec_query(
+        <<~SQL.squish,
+          INSERT INTO #{POLICY_SETTINGS_TABLE} (policy_name, paused, created_at, updated_at)
+          VALUES ($1, $2, now(), now())
+          ON CONFLICT (policy_name)
+          DO UPDATE SET paused = EXCLUDED.paused, updated_at = now()
+        SQL
+        "set_policy_paused",
+        [policy_name, paused ? true : false]
       )
     end
 

@@ -45,6 +45,28 @@ class AdaptiveConcurrencyGateTest < Minitest::Test
     Gate.new(**{ initial_max: 4, target_lag_ms: 1000 }.merge(opts))
   end
 
+  # ----- M5: constructor validation -----------------------------------------
+
+  def test_invalid_ewma_alpha_raises
+    # alpha=0 freezes the EWMA at its seed so the cap grows without bound;
+    # alpha>1 makes (1-alpha) negative and the EWMA oscillate in sign.
+    assert_raises(ArgumentError) { make_gate(ewma_alpha: 0) }
+    assert_raises(ArgumentError) { make_gate(ewma_alpha: 1.5) }
+  end
+
+  def test_invalid_decrease_factors_raise
+    # A factor >= 1 turns the multiplicative decrease into an increase —
+    # positive feedback under failure/overload, the opposite of AIMD.
+    assert_raises(ArgumentError) { make_gate(failure_decrease_factor: 1.0) }
+    assert_raises(ArgumentError) { make_gate(overload_decrease_factor: 1.2) }
+    assert_raises(ArgumentError) { make_gate(failure_decrease_factor: 0) }
+  end
+
+  def test_valid_tuning_knobs_are_accepted
+    gate = make_gate(ewma_alpha: 0.3, failure_decrease_factor: 0.5, overload_decrease_factor: 0.9)
+    assert_in_delta 0.3, gate.ewma_alpha, 0.001
+  end
+
   # ----- evaluate -----------------------------------------------------------
 
   def test_first_admission_seeds_and_uses_initial_max

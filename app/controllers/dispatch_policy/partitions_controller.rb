@@ -67,7 +67,12 @@ module DispatchPolicy
     end
 
     def admit
-      count     = Integer(params[:count] || 1)
+      # Bound the count: an unbounded value would force a single
+      # DELETE…RETURNING + dispatch of the whole backlog in one transaction,
+      # bypassing the batching/cap that #drain uses precisely to avoid
+      # request timeouts and giant transactions. A non-numeric value falls
+      # back to 1 instead of raising (ArgumentError → 500).
+      count     = (Integer(params[:count], exception: false) || 1).clamp(1, DRAIN_MAX_PER_REQUEST)
       forwarded = ManualAdmission.force!(
         policy_name:   @partition.policy_name,
         partition_key: @partition.partition_key,

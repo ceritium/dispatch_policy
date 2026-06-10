@@ -39,6 +39,24 @@ module DispatchPolicy
           next if rows.empty?
 
           rows.each { |row| row["job_data"]["job_id"] = SecureRandom.uuid }
+
+          # Pre-insert an inflight row per admitted job, exactly like
+          # Tick#admit_partition does. Without it the concurrency gate's
+          # COUNT(*) misses these jobs until each one starts performing and
+          # InflightTracker.track inserts its own row — an over-admission
+          # window proportional to how many jobs were force-admitted. The
+          # key is the canonical partition value, which for a policy-level
+          # partition_by is exactly the staged partition_key (see
+          # Concurrency#inflight_partition_key). Runs inside the same TX, so
+          # a rolled-back claim takes the inflight rows with it.
+          inflight_rows = rows.filter_map do |row|
+            ajid = row.dig("job_data", "job_id")
+            next unless ajid
+
+            { policy_name: policy_name, partition_key: partition_key, active_job_id: ajid }
+          end
+          Repository.insert_inflight!(inflight_rows) if inflight_rows.any?
+
           Forwarder.dispatch(rows)
           forwarded = rows.size
         end

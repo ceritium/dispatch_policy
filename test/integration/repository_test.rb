@@ -49,6 +49,7 @@ class RepositoryIntegrationTest < Minitest::Test
     dispatch_policy_inflight_jobs
     dispatch_policy_tick_samples
     dispatch_policy_adaptive_concurrency_stats
+    dispatch_policy_policy_settings
   ].freeze
 
   def schema_present?
@@ -126,6 +127,28 @@ class RepositoryIntegrationTest < Minitest::Test
 
     persisted = DispatchPolicy::Partition.first
     refute_nil persisted.last_checked_at, "claim_partitions must bump last_checked_at"
+  end
+
+  # M6: pausing a policy must hold partitions created AFTER the pause too,
+  # not only the ones that existed when the operator clicked. claim_partitions
+  # reads the policy_settings flag, so a brand-new active partition with
+  # pending work is still skipped while the policy is paused.
+  def test_claim_partitions_respects_policy_pause_for_new_partitions
+    DispatchPolicy::Repository.set_policy_paused!(policy_name: "p", paused: true)
+
+    # This partition is created (active) only after the pause.
+    DispatchPolicy::Repository.stage!(
+      policy_name: "p", partition_key: "fresh", queue_name: nil,
+      job_class: "J", job_data: { "job_id" => "1", "job_class" => "J", "arguments" => [] },
+      context: {}, priority: 0
+    )
+
+    assert_empty DispatchPolicy::Repository.claim_partitions(policy_name: "p", limit: 5),
+                 "a paused policy must not admit a partition created after the pause"
+
+    DispatchPolicy::Repository.set_policy_paused!(policy_name: "p", paused: false)
+    assert_equal 1, DispatchPolicy::Repository.claim_partitions(policy_name: "p", limit: 5).size,
+                 "resuming the policy makes its partitions claimable again"
   end
 
   def test_claim_staged_jobs_deletes_returning_and_updates_partition

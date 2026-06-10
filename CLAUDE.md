@@ -21,7 +21,7 @@ What's pending lives in `IDEAS.md` with the rationale.
 
 124 tests / 284 assertions. `bundle exec rake test` from the root.
 
-## Architecture — 5 tables
+## Architecture — 6 tables
 
 ```
 dispatch_policy_staged_jobs                   intercepted jobs awaiting admission
@@ -33,6 +33,8 @@ dispatch_policy_inflight_jobs                 admitted jobs currently running
 dispatch_policy_tick_samples                  one row per Tick.run for metrics
 dispatch_policy_adaptive_concurrency_stats    AIMD-tuned current_max + EWMA lag
                                               per partition for adaptive gates
+dispatch_policy_policy_settings               one row per policy — pause flag
+                                              (claim_partitions skips paused policies)
 ```
 
 ## Flow
@@ -124,6 +126,19 @@ dispatch_policy_adaptive_concurrency_stats    AIMD-tuned current_max + EWMA lag
   AR access (`lookup_admitted_at`, the heartbeat thread) wraps
   explicitly. Staging tables and the adapter's table must live in the
   same DB for atomicity to hold.
+- **`ManualAdmission.force!` (UI admit/drain) also pre-inserts inflight
+  rows** in the same TX as the claim, just like the Tick. Don't remove
+  it: without it the concurrency gate under-counts force-admitted jobs
+  until each one starts performing (over-admission window).
+- **Inflight rows are reaped on `discard.active_job`.** The railtie
+  subscribes and calls `InflightTracker.handle_discard`, deleting the
+  row by `active_job_id`. This covers jobs killed BEFORE around_perform
+  (e.g. `discard_on ActiveJob::DeserializationError`), whose `ensure`
+  never runs — otherwise the Tick's pre-inserted row sits until the
+  `inflight_queued_stale_after` sweeper (1h), holding a slot.
+- **Adding a table?** Update `test/integration/repository_test.rb`'s
+  `TABLES` list (drift detection rebuilds the schema) AND both the
+  migration and the generator template, per the workflow below.
 - **Every admitted job creates a row in `inflight_jobs`**, whether or
   not there's a concurrency gate. The key is always
   `policy.partition_for(ctx)` (same canonical scope as the staged

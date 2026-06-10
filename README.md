@@ -232,6 +232,13 @@ gate :throttle,
 Throttle does **not** release tokens on completion — tokens refill
 only with elapsed time.
 
+`rate` may be fractional (e.g. `2.5`): the bucket keeps the fractional
+part so the long-run rate is exact rather than truncated. A sub-unit
+rate works too — the bucket holds at least one whole token, so e.g.
+`rate: 1, per: 2.seconds` admits one job every two seconds. A `rate`
+of `0` (or `nil`) denies and backs the partition off for one `per`
+window. Prefer expressing low rates via a longer `per`.
+
 ### `:concurrency` — in-flight cap per partition
 
 Caps the number of admitted-but-not-yet-completed jobs per partition.
@@ -515,7 +522,10 @@ Mount the engine and visit `/dispatch_policy`:
   ("avg tick at 88% of tick_max_duration — shard or lower
   admission_batch_size").
 - **Policies** — per-policy throughput, denial reasons breakdown,
-  top partitions by lifetime/pending, pause/resume/drain.
+  top partitions by lifetime/pending, pause/resume/drain. Pause is a
+  policy-level flag (stored in `dispatch_policy_policy_settings`) the
+  tick honors, so it also holds partitions that first appear *after*
+  the pause; resume clears it.
 - **Partitions** — searchable list, detail view with gate state,
   decayed_admits + admits/min estimate, recent staged jobs,
   force-admit, drain.

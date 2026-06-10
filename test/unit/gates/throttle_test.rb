@@ -109,6 +109,37 @@ class ThrottleGateTest < Minitest::Test
     assert_equal 0, decision.allowed
   end
 
+  # M4: a rate<=0 deny must carry a retry_after so the partition backs off
+  # for a window instead of being re-claimed and re-evaluated every tick
+  # (a NULL retry_after leaves it immediately eligible — a busy-loop).
+  def test_zero_rate_backs_off_with_retry_after
+    gate = DispatchPolicy::Gates::Throttle.new(rate: 0, per: 60)
+    decision = gate.evaluate(DispatchPolicy::Context.wrap({}), empty_partition, 100)
+    assert_equal 0, decision.allowed
+    assert_in_delta 60.0, decision.retry_after, 0.001,
+                    "rate=0 must back off one window, not deny with a NULL retry_after"
+  end
+
+  # M4: a sub-unit rate used to truncate to 0 (Integer(0.5)) and deny
+  # forever. With a Float rate and a capacity floored at one whole token,
+  # it admits at the correct long-run pace.
+  def test_fractional_sub_unit_rate_still_admits
+    gate = DispatchPolicy::Gates::Throttle.new(rate: 0.5, per: 1)
+    decision = gate.evaluate(DispatchPolicy::Context.wrap({}), empty_partition, 100)
+    assert_equal 1, decision.allowed,
+                 "rate: 0.5 must accumulate a whole token and admit, not truncate to a permanent deny"
+  end
+
+  # M4: a fractional rate >= 1 must keep its fractional part instead of
+  # truncating every refill (which would systematically under-admit).
+  def test_fractional_rate_preserves_precision_in_bucket
+    gate = DispatchPolicy::Gates::Throttle.new(rate: 2.5, per: 1)
+    decision = gate.evaluate(DispatchPolicy::Context.wrap({}), empty_partition, 100)
+    assert_equal 2, decision.allowed, "2.5 tokens floor to 2 whole admits"
+    assert_in_delta 2.5, decision.gate_state_patch.dig("throttle", "tokens"), 0.001,
+                    "the 0.5 fractional token must be preserved (Float, not Integer)"
+  end
+
   def test_zero_per_raises_on_construction
     assert_raises(ArgumentError) do
       DispatchPolicy::Gates::Throttle.new(rate: 5, per: 0)

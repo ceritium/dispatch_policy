@@ -19,6 +19,16 @@ module DispatchPolicy
       end
     end
 
+    # Reap the inflight row when a job is discarded before its perform
+    # callbacks run (e.g. discard_on ActiveJob::DeserializationError):
+    # InflightTracker.track's `ensure` never fires in that path, so the
+    # Tick's pre-inserted row would orphan until the stale sweeper.
+    initializer "dispatch_policy.discard_cleanup" do
+      ActiveSupport::Notifications.subscribe("discard.active_job") do |event|
+        DispatchPolicy::InflightTracker.handle_discard(event.payload[:job])
+      end
+    end
+
     # Hosts copy the gem's migration into their own db/migrate via
     # `rails railties:install:migrations` (or hand-write a cutover
     # migration like opstasks did). We deliberately do NOT auto-merge

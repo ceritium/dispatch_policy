@@ -82,11 +82,16 @@ module DispatchPolicy
     end
 
     def pause
+      # Policy-level flag is the source of truth the tick honors (so a key
+      # that first appears AFTER the pause is held too). The per-partition
+      # status update is kept for the partitions index display.
+      Repository.set_policy_paused!(policy_name: @policy_name, paused: true)
       Partition.for_policy(@policy_name).update_all(status: "paused", updated_at: Time.current)
       redirect_to policy_path(@policy_name), notice: "Policy paused."
     end
 
     def resume
+      Repository.set_policy_paused!(policy_name: @policy_name, paused: false)
       Partition.for_policy(@policy_name).update_all(status: "active", updated_at: Time.current)
       redirect_to policy_path(@policy_name), notice: "Policy resumed."
     end

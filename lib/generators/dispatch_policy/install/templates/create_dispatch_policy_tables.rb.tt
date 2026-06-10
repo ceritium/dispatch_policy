@@ -91,5 +91,14 @@ class CreateDispatchPolicyTables < ActiveRecord::Migration[<%= Rails::VERSION::S
               [:policy_name, :partition_key],
               unique: true,
               name:   "idx_dp_adaptive_concurrency_lookup"
+
+    create_table :dispatch_policy_policy_settings do |t|
+      t.string   :policy_name, null: false
+      t.boolean  :paused,      null: false, default: false
+      t.timestamps
+    end
+    add_index :dispatch_policy_policy_settings, :policy_name,
+              unique: true,
+              name:   "idx_dp_policy_settings_lookup"
   end
 end
