@@ -229,6 +229,10 @@ gate :throttle,
      per:  1.minute
 ```
 
+Both `rate` and `per` accept a lambda receiving the `ctx`, so the rate
+limit and its window can depend on per-job data (e.g. a per-tenant plan
+that sets both). A `per` that resolves to `<= 0` raises.
+
 Throttle does **not** release tokens on completion — tokens refill
 only with elapsed time.
 

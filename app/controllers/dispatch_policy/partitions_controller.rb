@@ -13,7 +13,11 @@ module DispatchPolicy
       base = Partition.all
       base = base.for_policy(params[:policy]) if params[:policy].present?
       base = base.for_shard(params[:shard])   if params[:shard].present?
-      base = base.where("partition_key ILIKE ?", "%#{params[:q]}%") if params[:q].present?
+      if params[:q].present?
+        # Escape %/_ so a literal key containing them (e.g. "discount_50%")
+        # matches literally instead of as ILIKE wildcards.
+        base = base.where("partition_key ILIKE ?", "%#{Partition.sanitize_sql_like(params[:q])}%")
+      end
       base = base.where("pending_count > 0")                         if params[:only_pending] == "1"
 
       @sort = DispatchPolicy::CursorPagination::SORTS.key?(params[:sort]) ? params[:sort] : DispatchPolicy::CursorPagination::DEFAULT_SORT

@@ -4,6 +4,16 @@ Findings from a full-repo review (admission core, enqueue/tracking path,
 gates/policy DSL, dashboard/engine). Each issue has an ID used by the
 remediation plan at the bottom. Line numbers are as of `ae820fa`.
 
+> **A second-pass review** (after the fixes below) surfaced and fixed a few
+> more: the generated good_job tick-loop job dying after one run
+> (`total_limit` vs `enqueue_limit`), `record_sample!` bypassing the
+> multi-DB role, the admin UI not reflecting the policy-level pause flag,
+> `Context` indifference only at the top level, the tick loop crashing on
+> `sweep_every_ticks = 0` / negative pauses, pass-2 denies missing from
+> metrics, and assorted UI/dummy polish (sign in `format_count`, negative
+> durations, ILIKE escaping, Turbo listener leak, dynamic throttle `per`,
+> blank-field 500s). All are in the CHANGELOG (Unreleased).
+
 Verified clean (no findings): SQL injection (everything goes through bind
 params or whitelists), XSS (the only `html_safe` calls are static gem
 assets), CSRF on dashboard actions, keyset pagination correctness,

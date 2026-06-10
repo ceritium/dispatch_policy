@@ -127,6 +127,15 @@ module DispatchPolicy
             forward_failures += outcome[:failures]
             admitted_per_partition[p["partition_key"]] += outcome[:admitted]
             remaining -= outcome[:admitted]
+
+            # Feed pass-2 denies into the reason breakdown (e.g. a throttle
+            # that emptied after pass-1's settle) so the dashboard sees why
+            # redistribution stopped. We do NOT bump partitions_denied: the
+            # partition already counted as admitted in pass-1, and
+            # admitted + denied should stay ≈ partitions_seen.
+            if outcome[:admitted].zero?
+              outcome[:reasons].each { |r| denied_reasons[r] += 1 }
+            end
           end
         end
       end

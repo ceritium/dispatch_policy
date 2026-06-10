@@ -14,13 +14,20 @@ module DispatchPolicy
     # The bucket lives on the staged partition row — one row per
     # `policy.partition_for(ctx)` value, one bucket per row, no dilution.
     class Throttle < Gate
-      attr_reader :rate_proc, :per
+      attr_reader :rate_proc, :per_proc
 
       def initialize(rate:, per:)
         super()
         @rate_proc = rate.respond_to?(:call) ? rate : ->(_ctx) { rate }
-        @per       = duration_seconds(per)
-        raise ArgumentError, "throttle :per must be > 0 (got #{@per})" unless @per.positive?
+        if per.respond_to?(:call)
+          # Dynamic window (per-ctx), symmetric with a dynamic rate. Validated
+          # per-evaluate since the value isn't known until admission time.
+          @per_proc = ->(ctx) { duration_seconds(per.call(ctx)) }
+        else
+          fixed = duration_seconds(per)
+          raise ArgumentError, "throttle :per must be > 0 (got #{fixed})" unless fixed.positive?
+          @per_proc = ->(_ctx) { fixed }
+        end
       end
 
       def name
@@ -28,20 +35,21 @@ module DispatchPolicy
       end
 
       def evaluate(ctx, partition, admit_budget)
+        per  = per_for(ctx)
         rate = rate_for(ctx)
         # rate <= 0 (e.g. a paused tenant) backs off for one window instead
         # of denying with a NULL retry_after. A NULL retry_after leaves the
         # partition immediately eligible, so it would be re-claimed and
         # re-evaluated every single tick — a busy-loop that also clobbers any
         # backoff a prior tick had set.
-        return Decision.deny(retry_after: @per, reason: "rate=0") if rate <= 0
+        return Decision.deny(retry_after: per, reason: "rate=0") if rate <= 0
 
         # The bucket holds at least one whole token; otherwise a sub-unit rate
         # (e.g. rate: 0.5) could never accumulate a full token and would never
         # admit. refill_rate stays at the true `rate` so the long-run pace is
         # exact — the floor only sets the burst ceiling.
         capacity    = [rate, 1.0].max
-        refill_rate = rate / @per
+        refill_rate = rate / per
         state       = (partition["gate_state"] || {})["throttle"] || {}
         tokens      = (state["tokens"] || capacity).to_f
         refilled_at = (state["refilled_at"] || now).to_f
@@ -86,6 +94,12 @@ module DispatchPolicy
       end
 
       private
+
+      def per_for(ctx)
+        value = @per_proc.call(ctx)
+        raise ArgumentError, "throttle :per must be > 0 (got #{value})" unless value.positive?
+        value
+      end
 
       def rate_for(ctx)
         value = @rate_proc.call(ctx)

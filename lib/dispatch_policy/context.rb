@@ -19,7 +19,7 @@ module DispatchPolicy
     end
 
     def [](key)
-      @data[key.to_s]
+      indifferent(@data[key.to_s])
     end
 
     def to_h
@@ -31,10 +31,20 @@ module DispatchPolicy
     end
 
     def fetch(key, *args, &block)
-      @data.fetch(key.to_s, *args, &block)
+      indifferent(@data.fetch(key.to_s, *args, &block))
     end
 
     private
+
+    # Nested hashes are stored string-keyed (deep_stringify), so
+    # `ctx[:limits][:max]` would miss — the inner lookup is by symbol.
+    # Return nested hashes with indifferent access so symbol and string
+    # keys work at every depth, matching how host apps usually write
+    # context. to_h/to_jsonb still return the plain string-keyed hash for
+    # storage, untouched.
+    def indifferent(value)
+      value.is_a?(Hash) ? value.with_indifferent_access : value
+    end
 
     def deep_stringify(value)
       case value

@@ -89,6 +89,27 @@ class ThrottleGateTest < Minitest::Test
     assert_equal 5, decision.allowed
   end
 
+  def test_dynamic_per_uses_ctx_value
+    # rate 30 over a 30s window = refill 1 token/s. After 5s, 5 whole tokens.
+    gate = DispatchPolicy::Gates::Throttle.new(
+      rate: 30,
+      per:  ->(c) { c[:window] }
+    )
+    state     = { "gate_state" => { "throttle" => { "tokens" => 0.0, "refilled_at" => @clock_now.to_f } } }
+    partition = empty_partition.merge(state)
+
+    advance(5)
+    decision = gate.evaluate(DispatchPolicy::Context.wrap({ window: 30 }), partition, 100)
+    assert_equal 5, decision.allowed
+  end
+
+  def test_dynamic_per_zero_raises
+    gate = DispatchPolicy::Gates::Throttle.new(rate: 10, per: ->(c) { c[:window] })
+    assert_raises(ArgumentError) do
+      gate.evaluate(DispatchPolicy::Context.wrap({ window: 0 }), empty_partition, 100)
+    end
+  end
+
   def test_dynamic_rate_uses_ctx_value
     gate = DispatchPolicy::Gates::Throttle.new(
       rate: ->(c) { c[:rate_limit] },

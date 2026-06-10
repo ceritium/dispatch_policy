@@ -16,7 +16,7 @@ class SlowExternalApiJob < ApplicationJob
     }
 
     partition_by ->(c) { c[:endpoint_id] }
-    gate :throttle, rate: ->(c) { c[:rate] }, per: 60000
+    gate :throttle, rate: ->(c) { c[:rate] }, per: ->(c) { c[:per] }
   end
 
   def perform(attrs = {})

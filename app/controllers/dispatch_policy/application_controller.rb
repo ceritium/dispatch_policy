@@ -20,12 +20,18 @@ module DispatchPolicy
 
     def format_count(value)
       return "0" if value.nil?
-      value.to_i.to_s.reverse.scan(/\d{1,3}/).join(",").reverse
+      n      = value.to_i
+      sign   = n.negative? ? "-" : ""
+      digits = n.abs.to_s.reverse.scan(/\d{1,3}/).join(",").reverse
+      "#{sign}#{digits}"
     end
 
     def format_duration_seconds(seconds)
       return "—" if seconds.nil?
-      s = seconds.to_f
+      # A duration is never meaningfully negative; clock skew between the
+      # app and Postgres (timestamps written by now(), subtracted in Ruby)
+      # can yield a small negative — clamp so the UI shows 0ms, not "-340ms".
+      s = [seconds.to_f, 0.0].max
       return "%.0fms" % (s * 1000) if s < 1
       return "%.1fs"  % s          if s < 60
       return "%.1fm"  % (s / 60)   if s < 3600

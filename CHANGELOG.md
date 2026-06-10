@@ -24,6 +24,9 @@
   policy-wide source of truth `claim_partitions` consults.
 
 ### Added
+- The `:throttle` gate's `per` now accepts a lambda (like `rate`), so the
+  rate-limit window can depend on per-job context. A resolved `per <= 0`
+  raises.
 - Policy-level **pause** now actually holds the whole policy. The pause
   flag lives in the new `dispatch_policy_policy_settings` table and is
   honored by `claim_partitions`, so it also stops partitions that first
@@ -137,6 +140,28 @@
 - `partitions#show` lists recent staged jobs in the real admission order
   (`priority DESC, scheduled_at NULLS FIRST, id`) and drops a dead,
   mis-scoped `@inflight` query.
+- `Context` now exposes indifferent (symbol/string) access at every depth,
+  not just the top level — `ctx[:limits][:max]` no longer silently returns
+  nil when the host wrote a nested hash with symbol keys. `to_jsonb`/`to_h`
+  still return the plain string-keyed hash for storage.
+- The tick loop survives misconfigured pacing: `sweep_every_ticks <= 0`
+  now means "never sweep" instead of raising `ZeroDivisionError`, and a
+  negative `idle_pause`/`busy_pause` is treated as no pause instead of
+  raising in `sleep`. Both previously escaped the loop's rescues and
+  stopped admission.
+- Pass-2 budget redistribution denies (e.g. a throttle emptied after
+  pass-1) now feed the tick sample's denied-reason breakdown, so the
+  dashboard reflects why redistribution stopped.
+- Admin UI: `format_count` keeps the sign of negative values; durations
+  clamp at 0 so app↔DB clock skew can't render "-340ms"; the partition
+  search escapes `%`/`_` so a literal key containing them matches
+  literally; and the refresh/theme controls bind via a single delegated
+  document listener instead of per-button (Turbo's morph refresh dropped
+  the `data-bound` guard, leaking a new listener per refresh).
+- Dummy app: the throttle demos (`slow_api`, `mixed`) honor the form's
+  `per` field via the new callable `per` instead of a hardcoded window
+  (`slow_api` was stuck at 60000s), and the enqueue forms tolerate blank
+  numeric fields / unknown job names instead of 500ing.
 
 ### Internal
 - Corrected the `bulk_record_partition_denies!` comment: `claim_partitions`
