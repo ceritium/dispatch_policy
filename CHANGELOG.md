@@ -32,8 +32,28 @@
   enqueue afterwards created an `active` partition the next tick admitted.
   The per-partition `status` update is kept for the partitions-index
   display; `resume` clears the flag.
+- The admin UI now reflects the policy-level pause flag everywhere
+  (policies index + show, dashboard policy rows, partitions index + show):
+  partitions created after a pause render as effectively paused even
+  though their own `status` is still `active`, the pause/resume button
+  toggles to a single relevant action, and `policies#show` shows a PAUSED
+  badge. The per-policy operator hints also short-circuit to a single
+  "policy is paused" note instead of falsely warning about never-checked
+  partitions / growing backlog while admission is intentionally stopped.
 
 ### Fixed
+- **The generated `DispatchTickLoopJob` no longer dies after its first run
+  under good_job.** It re-enqueues itself at the end of `perform`, but
+  `good_job_control_concurrency_with(total_limit: 1)` counts the
+  still-running job in its enqueue check (`unfinished`), so the successor
+  was silently aborted and admission stopped after `tick_max_duration`.
+  Switched to `enqueue_limit: 1` + `perform_limit: 1` (the enqueue check
+  excludes the running job) and the job now logs an error if a re-enqueue
+  is ever refused. solid_queue was unaffected.
+- **`Tick#record_sample!` routes its two AR-model reads through
+  `config.database_role`.** They bypassed the `Repository` role wrapper, so
+  under a separate queue DB they queried the wrong role and the swallowed
+  error meant no `tick_sample` was ever written (empty dashboard/metrics).
 - **Multi-DB (`config.database_role`) is now honored everywhere.** It was
   only applied at the three admission-TX boundaries (`Tick`,
   `ManualAdmission`), leaving staging, partition claim, inflight

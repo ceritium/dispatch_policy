@@ -17,8 +17,16 @@ class DispatchTickLoopJob < ApplicationJob
 <% if good_job? -%>
 
   include GoodJob::ActiveJobExtensions::Concurrency
+  # enqueue_limit + perform_limit, NOT total_limit. total_limit counts the
+  # currently-RUNNING job in its enqueue check (GoodJob counts `unfinished`,
+  # and finished_at is only set after perform), so the self-re-enqueue at the
+  # bottom of perform gets aborted and the tick chain silently dies after the
+  # first run. enqueue_limit's check excludes running jobs (advisory-locked),
+  # so the successor can be enqueued; perform_limit: 1 still guarantees a
+  # single concurrent execution per key.
   good_job_control_concurrency_with(
-    total_limit: 1,
+    enqueue_limit: 1,
+    perform_limit: 1,
     key: -> { "dispatch_tick_loop:#{arguments[0] || 'all'}:#{arguments[1] || 'all'}" }
   )
 <% elsif solid_queue? -%>
@@ -36,7 +44,17 @@ class DispatchTickLoopJob < ApplicationJob
       stop_when:   -> { adapter_shutting_down? || Time.current >= deadline }
     )
 
-    self.class.set(wait: 1.second).perform_later(policy_name, shard)
+    successor = self.class.set(wait: 1.second).perform_later(policy_name, shard)
+
+    # Belt and braces: a concurrency-aborted enqueue returns the job with
+    # successfully_enqueued? == false instead of raising. If that ever
+    # happens the loop chain is dead — make it loud instead of silent.
+    if successor.respond_to?(:successfully_enqueued?) && !successor.successfully_enqueued?
+      Rails.logger.error(
+        "[dispatch_policy] DispatchTickLoopJob failed to re-enqueue itself " \
+        "(policy=#{policy_name.inspect} shard=#{shard.inspect}) — the tick loop chain has stopped"
+      )
+    end
   end
 
   private

@@ -5,8 +5,12 @@ class DispatchTickLoopJob < ApplicationJob
 
   if ENV["DUMMY_ADAPTER"].to_s == "good_job" && defined?(GoodJob::ActiveJobExtensions::Concurrency)
     include GoodJob::ActiveJobExtensions::Concurrency
+    # enqueue_limit + perform_limit, NOT total_limit: total_limit counts the
+    # running job in its enqueue check, so the self-re-enqueue would be
+    # aborted and the tick chain would die after the first run.
     good_job_control_concurrency_with(
-      total_limit: 1,
+      enqueue_limit: 1,
+      perform_limit: 1,
       key: -> { "dispatch_tick_loop:#{arguments[0] || 'all'}:#{arguments[1] || 'all'}" }
     )
   elsif ENV["DUMMY_ADAPTER"].to_s == "solid_queue"
@@ -25,7 +29,14 @@ class DispatchTickLoopJob < ApplicationJob
       stop_when:   -> { adapter_shutting_down? || Time.current >= deadline }
     )
 
-    self.class.set(wait: 1.second).perform_later(policy_name, shard)
+    successor = self.class.set(wait: 1.second).perform_later(policy_name, shard)
+
+    if successor.respond_to?(:successfully_enqueued?) && !successor.successfully_enqueued?
+      Rails.logger.error(
+        "[dispatch_policy] DispatchTickLoopJob failed to re-enqueue itself " \
+        "(policy=#{policy_name.inspect} shard=#{shard.inspect}) — the tick loop chain has stopped"
+      )
+    end
   end
 
   private

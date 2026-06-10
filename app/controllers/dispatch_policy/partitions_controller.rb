@@ -40,6 +40,11 @@ module DispatchPolicy
       @query         = params[:q]
       @only_pending  = params[:only_pending] == "1"
 
+      # Policy-level pause flags so rows show their EFFECTIVE state: a
+      # partition created after a pause has status 'active' but is not
+      # being admitted (claim_partitions skips the whole policy).
+      @paused_policies = PolicySetting.paused.pluck(:policy_name).to_set
+
       shards_scope = Partition.all
       shards_scope = shards_scope.for_policy(params[:policy]) if params[:policy].present?
       @shards      = shards_scope.distinct.pluck(:shard).sort
@@ -65,6 +70,10 @@ module DispatchPolicy
         .for_partition(@partition.policy_name, @partition.partition_key)
         .order(Arel.sql("priority DESC, scheduled_at ASC NULLS FIRST, id ASC"))
         .limit(50)
+      # The whole policy may be paused even if this partition's own status
+      # is 'active' (it was created after the pause). claim_partitions skips
+      # the policy regardless, so surface the effective state.
+      @policy_paused = PolicySetting.for_policy(@partition.policy_name).pick(:paused) || false
     end
 
     def admit

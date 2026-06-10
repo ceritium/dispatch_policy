@@ -1,4 +1,9 @@
-<h1>Policy <code><%= @policy_name %></code></h1>
+<h1>
+  Policy <code><%= @policy_name %></code>
+  <% if @paused %>
+    <span class="dp-warn" style="font-size:14px; vertical-align:middle; border:1px solid currentColor; border-radius:4px; padding:2px 8px; margin-left:8px;">PAUSED</span>
+  <% end %>
+</h1>
 
 <section class="dp-stats">
   <div class="dp-stat"><span class="dp-stat-label">Partitions</span><span class="dp-stat-value"><%= format_count(@totals[:partitions]) %></span></div>
@@ -150,15 +155,19 @@
 
 <section class="dp-section">
   <h2>Actions</h2>
-  <%= button_to "Pause all partitions",  pause_policy_path(@policy_name),  class: "dp-btn",         method: :post, form: { class: "dp-form-inline" } %>
-  <%= button_to "Resume all partitions", resume_policy_path(@policy_name), class: "dp-btn dp-btn-ok", method: :post, form: { class: "dp-form-inline" } %>
+  <% if @paused %>
+    <%= button_to "Resume policy", resume_policy_path(@policy_name), class: "dp-btn dp-btn-ok", method: :post, form: { class: "dp-form-inline" } %>
+  <% else %>
+    <%= button_to "Pause policy", pause_policy_path(@policy_name), class: "dp-btn", method: :post, form: { class: "dp-form-inline" } %>
+  <% end %>
   <%= button_to "Drain policy",          drain_policy_path(@policy_name),
                 class:  "dp-btn dp-btn-warn",
                 method: :post,
                 form: { class: "dp-form-inline",
                         onsubmit: "return confirm('Force-admit every staged job across every partition of this policy, bypassing all gates?');" } %>
   <p class="dp-hint">
-    <strong>Pause</strong> stops admission but keeps staging — the queue keeps filling, in-flight jobs finish.
+    <strong>Pause</strong> stops admission for the whole policy — including partitions created
+    after the pause — but keeps staging: the queue keeps filling, in-flight jobs finish.
     <strong>Drain</strong> empties the staging table by force-admitting every job (bypassing gates).
     Capped at 10,000 jobs per click — click again for more.
   </p>

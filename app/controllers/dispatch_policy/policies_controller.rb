@@ -15,12 +15,16 @@ module DispatchPolicy
       # One grouped query for pending / partition count / paused count
       # across every policy instead of three per policy.
       counts_by_policy    = Repository.partition_counts_by_policy
+      # Policy-level pause flags — the source of truth the tick honors
+      # (partitions.status alone misses partitions created after the pause).
+      paused_policies     = PolicySetting.paused.pluck(:policy_name).to_set
 
       @rows = names.map do |name|
         counts = counts_by_policy[name] || {}
         {
           name:           name,
           registered:     registry_names.include?(name),
+          paused:         paused_policies.include?(name),
           pending:        counts[:pending] || 0,
           in_flight:      in_flight_by_policy[name] || 0,
           partitions:     counts[:partitions] || 0,
@@ -31,6 +35,7 @@ module DispatchPolicy
 
     def show
       @policy_object = DispatchPolicy.registry.fetch(@policy_name)
+      @paused        = PolicySetting.for_policy(@policy_name).pick(:paused) || false
       @partitions    = Partition.for_policy(@policy_name)
                                 .order(Arel.sql("pending_count DESC, last_admit_at DESC NULLS LAST"))
                                 .limit(100)
@@ -77,7 +82,8 @@ module DispatchPolicy
         in_backoff:           @round_trip[:in_backoff],
         total_partitions:     @totals[:partitions],
         adapter_target_jps:   @capacity[:adapter_target_jps],
-        pending_trend:        @pending_trend
+        pending_trend:        @pending_trend,
+        paused:               @paused
       )
     end
 

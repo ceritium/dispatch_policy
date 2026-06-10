@@ -341,8 +341,15 @@ module DispatchPolicy
     end
 
     def record_sample!(**fields)
-      pending_total  = DispatchPolicy::Partition.for_policy(@policy_name).sum(:pending_count)
-      inflight_total = DispatchPolicy::InflightJob.where(policy_name: @policy_name).count
+      # These two reads go through the AR models, which the Repository role
+      # wrapper doesn't cover — wrap explicitly or, under multi-DB
+      # (config.database_role), they'd query the default writing role and
+      # either raise (swallowed below → no samples ever) or record zeros.
+      pending_total = inflight_total = nil
+      Repository.with_connection do
+        pending_total  = DispatchPolicy::Partition.for_policy(@policy_name).sum(:pending_count)
+        inflight_total = DispatchPolicy::InflightJob.where(policy_name: @policy_name).count
+      end
 
       Repository.record_tick_sample!(
         policy_name:    @policy_name,
