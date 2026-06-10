@@ -35,7 +35,7 @@
     </thead>
     <tbody>
       <% @partitions.each do |p| %>
-        <%= render "dispatch_policy/shared/partition_row", partition: p %>
+        <%= render "dispatch_policy/shared/partition_row", partition: p, policy_paused: @paused_policies.include?(p.policy_name) %>
       <% end %>
     </tbody>
   </table>

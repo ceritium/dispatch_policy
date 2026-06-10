@@ -29,7 +29,7 @@ module DispatchPolicy
 
         names = policy_names(policy_name)
         if names.empty?
-          sleep(config.idle_pause)
+          pause(config.idle_pause)
           next
         end
 
@@ -46,16 +46,24 @@ module DispatchPolicy
         end
 
         iteration += 1
-        if (iteration % config.sweep_every_ticks).zero?
-          sweep!
-        end
+        # sweep_every_ticks <= 0 means "never sweep" (rather than crashing
+        # the loop with ZeroDivisionError on `iteration % 0`).
+        sweep_every = config.sweep_every_ticks.to_i
+        sweep! if sweep_every.positive? && (iteration % sweep_every).zero?
 
         if admitted.zero?
-          sleep(config.idle_pause)
-        elsif config.busy_pause.to_f.positive?
-          sleep(config.busy_pause)
+          pause(config.idle_pause)
+        else
+          pause(config.busy_pause)
         end
       end
+    end
+
+    # sleep, but never with a negative argument (which would raise
+    # ArgumentError mid-loop) — a non-positive pause just means "no pause".
+    def pause(seconds)
+      secs = seconds.to_f
+      sleep(secs) if secs.positive?
     end
 
     def policy_names(filter)

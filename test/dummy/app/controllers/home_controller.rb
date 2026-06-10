@@ -20,10 +20,13 @@ class HomeController < ApplicationController
   end
 
   def enqueue
-    job_class = JOBS.fetch(params[:job])
-    attrs     = params.fetch(:attrs, {}).permit!.to_h
-    if (delay = params[:delay].presence)
-      job_class.set(wait: Integer(delay).seconds).perform_later(attrs)
+    job_class = JOBS[params[:job]]
+    return redirect_to(root_path, alert: "Unknown job #{params[:job].inspect}") unless job_class
+
+    attrs = clean_attrs
+    delay = safe_int(params[:delay])
+    if delay&.positive?
+      job_class.set(wait: delay.seconds).perform_later(attrs)
     else
       job_class.perform_later(attrs)
     end
@@ -31,13 +34,14 @@ class HomeController < ApplicationController
   end
 
   def enqueue_many
-    job_class = JOBS.fetch(params[:job])
-    count     = Integer(params.fetch(:count, 10))
-    base      = params.fetch(:attrs, {}).permit!.to_h
+    job_class = JOBS[params[:job]]
+    return redirect_to(root_path, alert: "Unknown job #{params[:job].inspect}") unless job_class
+
+    count = (safe_int(params[:count]) || 10).clamp(1, 100_000)
+    base  = clean_attrs
 
     jobs = count.times.map do |i|
-      attrs = base.merge("seq" => i)
-      job_class.new(attrs)
+      job_class.new(base.merge("seq" => i))
     end
 
     if ActiveJob.respond_to?(:perform_all_later)
@@ -55,8 +59,8 @@ class HomeController < ApplicationController
   # cold tenants drain in 1-2 ticks while the hot one progresses at the
   # capped rate.
   def fairness_demo_flood
-    hot_count  = Integer(params.fetch(:hot_count, 500))
-    cold_count = Integer(params.fetch(:cold_count, 10))
+    hot_count  = (safe_int(params[:hot_count])  || 500).clamp(0, 100_000)
+    cold_count = (safe_int(params[:cold_count]) || 10).clamp(0, 100_000)
 
     plan = [["hot", hot_count]] +
            %w[cold-1 cold-2 cold-3 cold-4].map { |t| [t, cold_count] }
@@ -71,5 +75,17 @@ class HomeController < ApplicationController
                 notice: "Enqueued #{total} FairnessDemoJob across 5 tenants " \
                         "(1 × #{hot_count} hot + 4 × #{cold_count} cold). " \
                         "Watch /dispatch_policy/policies/fairness_demo."
+  end
+
+  private
+
+  # Strip blank form fields so the job context procs' Integer(attrs[...] ||
+  # default) hit the default instead of Integer("") → ArgumentError → 500.
+  def clean_attrs
+    params.fetch(:attrs, {}).permit!.to_h.reject { |_, v| v.respond_to?(:empty?) ? v.empty? : v.nil? }
+  end
+
+  def safe_int(value)
+    Integer(value, exception: false)
   end
 end

@@ -127,6 +127,15 @@ module DispatchPolicy
             forward_failures += outcome[:failures]
             admitted_per_partition[p["partition_key"]] += outcome[:admitted]
             remaining -= outcome[:admitted]
+
+            # Feed pass-2 denies into the reason breakdown (e.g. a throttle
+            # that emptied after pass-1's settle) so the dashboard sees why
+            # redistribution stopped. We do NOT bump partitions_denied: the
+            # partition already counted as admitted in pass-1, and
+            # admitted + denied should stay ≈ partitions_seen.
+            if outcome[:admitted].zero?
+              outcome[:reasons].each { |r| denied_reasons[r] += 1 }
+            end
           end
         end
       end
@@ -341,8 +350,15 @@ module DispatchPolicy
     end
 
     def record_sample!(**fields)
-      pending_total  = DispatchPolicy::Partition.for_policy(@policy_name).sum(:pending_count)
-      inflight_total = DispatchPolicy::InflightJob.where(policy_name: @policy_name).count
+      # These two reads go through the AR models, which the Repository role
+      # wrapper doesn't cover — wrap explicitly or, under multi-DB
+      # (config.database_role), they'd query the default writing role and
+      # either raise (swallowed below → no samples ever) or record zeros.
+      pending_total = inflight_total = nil
+      Repository.with_connection do
+        pending_total  = DispatchPolicy::Partition.for_policy(@policy_name).sum(:pending_count)
+        inflight_total = DispatchPolicy::InflightJob.where(policy_name: @policy_name).count
+      end
 
       Repository.record_tick_sample!(
         policy_name:    @policy_name,

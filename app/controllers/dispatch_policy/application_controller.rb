@@ -4,10 +4,23 @@ module DispatchPolicy
   class ApplicationController < ActionController::Base
     protect_from_forgery with: :exception
 
+    # The dashboard reads and writes the gem tables through the AR models
+    # directly (Partition, StagedJob, InflightJob, PolicySetting,
+    # TickSample), which — unlike Repository — have no role wrapper of
+    # their own. Under multi-DB (config.database_role) those queries would
+    # hit the default writing role, where the gem tables don't live.
+    # Wrapping the whole action keeps view rendering inside the role too,
+    # so lazily-evaluated relations (@partitions etc.) stay routed.
+    around_action :route_database_role
+
     helper_method :format_time, :format_count, :format_duration_seconds,
                   :format_duration_ms, :sparkline, :registered_policies
 
     private
+
+    def route_database_role(&action)
+      Repository.with_connection(&action)
+    end
 
     def registered_policies
       DispatchPolicy.registry.each.to_a
@@ -20,12 +33,18 @@ module DispatchPolicy
 
     def format_count(value)
       return "0" if value.nil?
-      value.to_i.to_s.reverse.scan(/\d{1,3}/).join(",").reverse
+      n      = value.to_i
+      sign   = n.negative? ? "-" : ""
+      digits = n.abs.to_s.reverse.scan(/\d{1,3}/).join(",").reverse
+      "#{sign}#{digits}"
     end
 
     def format_duration_seconds(seconds)
       return "—" if seconds.nil?
-      s = seconds.to_f
+      # A duration is never meaningfully negative; clock skew between the
+      # app and Postgres (timestamps written by now(), subtracted in Ruby)
+      # can yield a small negative — clamp so the UI shows 0ms, not "-340ms".
+      s = [seconds.to_f, 0.0].max
       return "%.0fms" % (s * 1000) if s < 1
       return "%.1fs"  % s          if s < 60
       return "%.1fm"  % (s / 60)   if s < 3600

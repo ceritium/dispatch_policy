@@ -13,8 +13,9 @@ module DispatchPolicy
     STAGED_TABLE      = "dispatch_policy_staged_jobs"
     PARTITIONS_TABLE  = "dispatch_policy_partitions"
     INFLIGHT_TABLE    = "dispatch_policy_inflight_jobs"
-    SAMPLES_TABLE     = "dispatch_policy_tick_samples"
-    ADAPTIVE_TABLE    = "dispatch_policy_adaptive_concurrency_stats"
+    SAMPLES_TABLE        = "dispatch_policy_tick_samples"
+    ADAPTIVE_TABLE       = "dispatch_policy_adaptive_concurrency_stats"
+    POLICY_SETTINGS_TABLE = "dispatch_policy_policy_settings"
 
     module_function
 
@@ -78,35 +79,43 @@ module DispatchPolicy
     # Bulk version for perform_all_later. Receives an array of hashes with
     # the same keys as #stage!. Performs one INSERT for staged_jobs and
     # one UPSERT per (policy_name, partition_key) group.
+    # Rows per INSERT. Each row binds 8 params; Postgres caps a statement at
+    # 65_535 bind params, so we slice well under 65_535/8 ≈ 8_191 to leave
+    # headroom. A single perform_all_later with more rows than this would
+    # otherwise blow the limit and fail the whole batch.
+    STAGE_MANY_BATCH = 1_000
+
     def stage_many!(rows)
       return 0 if rows.empty?
 
       connection.transaction(requires_new: true) do
-        values_sql = []
-        params     = []
-        rows.each_with_index do |row, idx|
-          base = idx * 8
-          values_sql << "($#{base + 1}, $#{base + 2}, $#{base + 3}, $#{base + 4}, $#{base + 5}::jsonb, $#{base + 6}::jsonb, $#{base + 7}, $#{base + 8})"
-          params.push(
-            row[:policy_name],
-            row[:partition_key],
-            row[:queue_name],
-            row[:job_class],
-            JSON.dump(row[:job_data]),
-            JSON.dump(row[:context] || {}),
-            row[:scheduled_at],
-            row[:priority] || 0
+        rows.each_slice(STAGE_MANY_BATCH) do |slice|
+          values_sql = []
+          params     = []
+          slice.each_with_index do |row, idx|
+            base = idx * 8
+            values_sql << "($#{base + 1}, $#{base + 2}, $#{base + 3}, $#{base + 4}, $#{base + 5}::jsonb, $#{base + 6}::jsonb, $#{base + 7}, $#{base + 8})"
+            params.push(
+              row[:policy_name],
+              row[:partition_key],
+              row[:queue_name],
+              row[:job_class],
+              JSON.dump(row[:job_data]),
+              JSON.dump(row[:context] || {}),
+              row[:scheduled_at],
+              row[:priority] || 0
+            )
+          end
+          connection.exec_query(
+            <<~SQL.squish,
+              INSERT INTO #{STAGED_TABLE}
+                (policy_name, partition_key, queue_name, job_class, job_data, context, scheduled_at, priority)
+              VALUES #{values_sql.join(", ")}
+            SQL
+            "stage_many",
+            params
           )
         end
-        connection.exec_query(
-          <<~SQL.squish,
-            INSERT INTO #{STAGED_TABLE}
-              (policy_name, partition_key, queue_name, job_class, job_data, context, scheduled_at, priority)
-            VALUES #{values_sql.join(", ")}
-          SQL
-          "stage_many",
-          params
-        )
 
         rows.group_by { |r| [r[:policy_name], r[:partition_key]] }.each do |(policy_name, partition_key), group|
           upsert_partition!(
@@ -169,6 +178,10 @@ module DispatchPolicy
             AND status = 'active'
             AND pending_count > 0
             AND (next_eligible_at IS NULL OR next_eligible_at <= now())
+            AND NOT EXISTS (
+              SELECT 1 FROM #{POLICY_SETTINGS_TABLE} ps
+              WHERE ps.policy_name = $1 AND ps.paused
+            )
             #{shard_sql}
           ORDER BY last_checked_at NULLS FIRST, id
           LIMIT $#{params.size}
@@ -306,10 +319,13 @@ module DispatchPolicy
     #
     # Each entry: { policy_name:, partition_key:, gate_state_patch:, retry_after: }.
     # Independent per row — the join via FROM(VALUES…) makes the bulk
-    # statement equivalent to N sequential UPDATEs in correctness terms;
-    # the row-level locks held by `claim_partitions` (FOR UPDATE SKIP
-    # LOCKED, last_checked_at bumped) keep concurrent ticks away from the
-    # same partitions while we batch.
+    # statement equivalent to N sequential UPDATEs in correctness terms.
+    # Note: `claim_partitions` runs as its own autocommitted statement, so
+    # its `FOR UPDATE SKIP LOCKED` row locks are already released by the time
+    # we reach this flush — they do NOT guard the batch. What keeps two ticks
+    # off the same partitions is the operational invariant of one tick loop
+    # per (policy, shard), reinforced by the `last_checked_at` bump on claim
+    # (a racing claim skips recently-checked rows).
     def bulk_record_partition_denies!(entries)
       return if entries.empty?
 
@@ -331,7 +347,7 @@ module DispatchPolicy
           UPDATE #{PARTITIONS_TABLE} p
           SET gate_state       = p.gate_state || v.gate_state_patch,
               next_eligible_at = CASE
-                WHEN v.retry_after_secs IS NULL THEN NULL
+                WHEN v.retry_after_secs IS NULL THEN p.next_eligible_at
                 ELSE now() + (v.retry_after_secs || ' seconds')::interval
               END,
               updated_at       = now()
@@ -341,6 +357,24 @@ module DispatchPolicy
         SQL
         "bulk_record_partition_denies",
         params
+      )
+    end
+
+    # ----- policy settings ------------------------------------------------------
+
+    # Upsert the pause flag for a policy. The tick's claim_partitions reads
+    # this row, so toggling it takes effect for every partition of the
+    # policy — including ones created after the toggle.
+    def set_policy_paused!(policy_name:, paused:)
+      connection.exec_query(
+        <<~SQL.squish,
+          INSERT INTO #{POLICY_SETTINGS_TABLE} (policy_name, paused, created_at, updated_at)
+          VALUES ($1, $2, now(), now())
+          ON CONFLICT (policy_name)
+          DO UPDATE SET paused = EXCLUDED.paused, updated_at = now()
+        SQL
+        "set_policy_paused",
+        [policy_name, paused ? true : false]
       )
     end
 
@@ -881,6 +915,44 @@ module DispatchPolicy
       else
         # 5th param ($5) — caller appends params to those of the parent UPDATE
         ["now() + ($5 || ' seconds')::interval", [retry_after.to_f.round(3)]]
+      end
+    end
+
+    # ----- role routing ---------------------------------------------------------
+    #
+    # Every public Repository method must run against config.database_role
+    # so multi-DB setups (e.g. solid_queue on a separate :queue DB, with
+    # the gem tables living there) hit the DB the staging/admission/inflight
+    # state actually lives in. Otherwise staging writes the primary DB while
+    # the tick reads the queue DB — silent job loss — and the concurrency
+    # gate counts inflight rows in a different DB than the tracker writes.
+    #
+    # Rather than wrap ~25 method bodies by hand — and risk missing one as
+    # the API grows — we redefine each public SQL method to run inside
+    # `with_connection`. We capture the ORIGINAL as a bound closure and call
+    # it directly (no `super`, no prepended module): this is immune to the
+    # file being evaluated more than once in a process (dev reloader,
+    # integration suites that boot the dummy app under multiple require
+    # paths). Each evaluation re-wraps the freshly (re)defined originals
+    # exactly once, so wrappers never stack. `connected_to(role:)` nesting
+    # with the SAME role is a no-op, so the explicit `with_connection` blocks
+    # at the transaction boundaries (Tick, ManualAdmission) stay correct: the
+    # admission TX still opens entirely within one role context, preserving
+    # the shared-connection atomicity invariant. The `connection` accessor
+    # and the pure helpers are excluded — they issue no SQL of their own and
+    # always run inside an already-routed caller, so wrapping them would only
+    # add redundant role swaps in hot per-row loops (normalize_*/parse_jsonb
+    # run once per claimed row).
+    ROLE_ROUTING_EXCLUDED = %i[
+      connection with_connection
+      normalize_partition normalize_staged parse_jsonb
+      sample_filter next_eligible_clause trend_direction
+    ].freeze
+
+    (singleton_methods(false) - ROLE_ROUTING_EXCLUDED).each do |method_name|
+      original = singleton_class.instance_method(method_name)
+      define_singleton_method(method_name) do |*args, **kwargs, &block|
+        with_connection { original.bind_call(self, *args, **kwargs, &block) }
       end
     end
   end

@@ -70,20 +70,19 @@
           });
         }
 
-        function bindControls() {
-          document.querySelectorAll("[data-dp-refresh]").forEach(function (btn) {
-            if (btn.dataset.bound) return;
-            btn.dataset.bound = "1";
-            btn.addEventListener("click", function (e) {
-              e.preventDefault();
-              setInterval(parseInt(btn.getAttribute("data-dp-refresh"), 10));
-            });
-          });
-          syncControls();
-        }
+        // Delegate on document, registered ONCE. Per-button listeners with a
+        // data-bound guard leaked: Turbo's morph refresh preserves the button
+        // node but drops the data-bound attribute (it's not in the server
+        // HTML), so every turbo:load re-bound and clicks fired N+1 times.
+        document.addEventListener("click", function (e) {
+          var btn = e.target.closest("[data-dp-refresh]");
+          if (!btn) return;
+          e.preventDefault();
+          setInterval(parseInt(btn.getAttribute("data-dp-refresh"), 10));
+        });
 
         function init() {
-          bindControls();
+          syncControls();
           restart();
         }
 
@@ -140,20 +139,17 @@
           });
         }
 
-        function bindControls() {
-          document.querySelectorAll("[data-dp-theme]").forEach(function (btn) {
-            if (btn.dataset.bound) return;
-            btn.dataset.bound = "1";
-            btn.addEventListener("click", function (e) {
-              e.preventDefault();
-              setTheme(btn.getAttribute("data-dp-theme"));
-            });
-          });
-          syncControls();
-        }
+        // Delegate on document, registered ONCE (see the refresh control
+        // above for why per-button binding leaks under Turbo morph).
+        document.addEventListener("click", function (e) {
+          var btn = e.target.closest("[data-dp-theme]");
+          if (!btn) return;
+          e.preventDefault();
+          setTheme(btn.getAttribute("data-dp-theme"));
+        });
 
-        document.addEventListener("DOMContentLoaded", bindControls);
-        document.addEventListener("turbo:load",       bindControls);
+        document.addEventListener("DOMContentLoaded", syncControls);
+        document.addEventListener("turbo:load",       syncControls);
       })();
     </script>
   </head>

@@ -160,6 +160,67 @@ class JobExtensionTest < Minitest::Test
                  "context proc must see the materialized 'alpha', not [] (which would yield throttle=)"
   end
 
+  # M1: a job whose declared policy isn't registered must fall through to
+  # the adapter, exactly like the single-enqueue path — not be silently
+  # dropped (the old `next unless policy` in the row builder ate it).
+  def test_bulk_enqueue_delegates_unregistered_policy_to_adapter
+    repo = DispatchPolicy::Repository.singleton_class
+    repo.send(:alias_method, :__orig_stage_many, :stage_many!) unless repo.method_defined?(:__orig_stage_many)
+    staged = []
+    repo.define_method(:stage_many!) { |rows| staged.replace(rows); rows.size }
+
+    unless ActiveJob.singleton_class.include?(DispatchPolicy::JobExtension::BulkEnqueue)
+      ActiveJob.singleton_class.prepend(DispatchPolicy::JobExtension::BulkEnqueue)
+    end
+
+    ghost = Class.new(ActiveJob::Base) do
+      include DispatchPolicy::JobExtension
+      self.dispatch_policy_name = "ghost_policy_not_registered"
+      def perform(*); end
+    end
+    Object.const_set(:GhostPolicyJob, ghost) unless Object.const_defined?(:GhostPolicyJob)
+
+    received_at_adapter = []
+    ghost.queue_adapter.singleton_class.alias_method(:__orig_enqueue, :enqueue)
+    ghost.queue_adapter.singleton_class.define_method(:enqueue) do |job|
+      received_at_adapter << job
+      __orig_enqueue(job)
+    end
+
+    ActiveJob.perform_all_later([ghost.new("x")])
+
+    assert_empty staged, "unregistered-policy job must not be staged"
+    assert_equal 1, received_at_adapter.size,
+                 "unregistered-policy job must reach the adapter via super, not vanish"
+  ensure
+    repo.send(:alias_method, :stage_many!, :__orig_stage_many) if repo.method_defined?(:__orig_stage_many)
+    if defined?(GhostPolicyJob)
+      GhostPolicyJob.queue_adapter.singleton_class.alias_method(:enqueue, :__orig_enqueue) if GhostPolicyJob.queue_adapter.singleton_class.method_defined?(:__orig_enqueue)
+      Object.send(:remove_const, :GhostPolicyJob)
+    end
+  end
+
+  # M1: successfully_enqueued? must reflect reality. If the bulk INSERT
+  # raises, a caller that rescues and inspects the flag must not be told
+  # the jobs were enqueued.
+  def test_bulk_enqueue_does_not_mark_enqueued_when_insert_raises
+    repo = DispatchPolicy::Repository.singleton_class
+    repo.send(:alias_method, :__orig_stage_many, :stage_many!) unless repo.method_defined?(:__orig_stage_many)
+    repo.define_method(:stage_many!) { |_rows| raise "boom" }
+
+    unless ActiveJob.singleton_class.include?(DispatchPolicy::JobExtension::BulkEnqueue)
+      ActiveJob.singleton_class.prepend(DispatchPolicy::JobExtension::BulkEnqueue)
+    end
+
+    jobs = [JobExtensionTestJob.new("a"), JobExtensionTestJob.new("b")]
+    assert_raises(RuntimeError) { ActiveJob.perform_all_later(jobs) }
+
+    refute jobs.any?(&:successfully_enqueued?),
+           "no job may be marked enqueued when stage_many! raised"
+  ensure
+    repo.send(:alias_method, :stage_many!, :__orig_stage_many) if repo.method_defined?(:__orig_stage_many)
+  end
+
   def test_bulk_enqueue_materialises_arguments_after_deserialize
     repo = DispatchPolicy::Repository.singleton_class
     repo.send(:alias_method, :__orig_stage_many, :stage_many!) unless repo.method_defined?(:__orig_stage_many)

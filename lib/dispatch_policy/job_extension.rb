@@ -71,6 +71,25 @@ module DispatchPolicy
       (job.respond_to?(:executions) ? job.executions.to_i : 0).positive?
     end
 
+    # Whether a job should be staged through admission control rather than
+    # handed straight to the adapter. Mirrors the single-enqueue decision in
+    # around_enqueue_for: it needs a registered policy and must not be a
+    # retry on a bypass_retries policy. Used by the bulk path to split jobs
+    # so the ones we don't own fall through to the adapter instead of being
+    # silently dropped.
+    def self.stageable?(job)
+      return false unless job.class.respond_to?(:dispatch_policy_name)
+
+      name = job.class.dispatch_policy_name
+      return false unless name
+
+      policy = DispatchPolicy.registry.fetch(name)
+      return false unless policy
+      return false if retry_attempt?(job) && policy.bypass_retries?
+
+      true
+    end
+
     def self.scheduled_time(job)
       ts = job.scheduled_at
       return nil if ts.nil?
@@ -111,17 +130,19 @@ module DispatchPolicy
         return super unless DispatchPolicy.config.enabled
         return super unless DispatchPolicy.registry.size.positive?
 
-        with_policy, without_policy = flat.partition do |j|
-          j.class.respond_to?(:dispatch_policy_name) && j.class.dispatch_policy_name
-        end
+        # Split exactly like the single path decides: jobs we own get staged,
+        # everything else (no policy, unregistered policy name, or a retry on
+        # a bypass_retries policy) goes straight to the adapter. Dropping them
+        # — as a `next unless policy` inside the row builder would — silently
+        # loses jobs the caller expected to be enqueued.
+        to_stage, to_adapter = flat.partition { |job| JobExtension.stageable?(job) }
 
-        super(without_policy) if without_policy.any?
+        super(to_adapter) if to_adapter.any?
 
-        return nil if with_policy.empty?
+        return nil if to_stage.empty?
 
-        rows = with_policy.filter_map do |job|
+        rows = to_stage.map do |job|
           policy = DispatchPolicy.registry.fetch(job.class.dispatch_policy_name)
-          next unless policy
 
           # See JobExtension.ensure_arguments_materialized! — we need this
           # for the same reason as the single-enqueue path.
@@ -132,7 +153,6 @@ module DispatchPolicy
           partition_key = policy.partition_key_for(ctx)
           shard         = policy.shard_for(ctx)
           payload       = Serializer.serialize(job)
-          job.successfully_enqueued = true
 
           {
             policy_name:   policy.name,
@@ -147,7 +167,11 @@ module DispatchPolicy
           }
         end
 
-        Repository.stage_many!(rows) if rows.any?
+        # Only mark enqueued AFTER the INSERT commits. If stage_many! raises,
+        # a caller that rescues and inspects successfully_enqueued? must not
+        # be told the jobs were enqueued when they weren't.
+        Repository.stage_many!(rows)
+        to_stage.each { |job| job.successfully_enqueued = true }
         nil # ActiveJob.perform_all_later contract returns nil
       end
     end

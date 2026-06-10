@@ -1,5 +1,188 @@
 # Changelog
 
+## Unreleased
+
+### Upgrade notes
+- **New table `dispatch_policy_policy_settings`.** Required by the
+  policy-level pause fix below. New installs get it from the updated
+  install generator. **Existing installs must add it** — the gem ships a
+  single migration, so either re-copy the migration via
+  `rails dispatch_policy:install:migrations` (or hand-apply) or run:
+
+  ```ruby
+  create_table :dispatch_policy_policy_settings do |t|
+    t.string  :policy_name, null: false
+    t.boolean :paused,      null: false, default: false
+    t.timestamps
+  end
+  add_index :dispatch_policy_policy_settings, :policy_name,
+            unique: true, name: "idx_dp_policy_settings_lookup"
+  ```
+
+  Until the table exists, the tick's `claim_partitions` raises
+  `PG::UndefinedTable`. One row per policy holds its pause flag; it's the
+  policy-wide source of truth `claim_partitions` consults.
+
+### Added
+- The `:throttle` gate's `per` now accepts a lambda (like `rate`), so the
+  rate-limit window can depend on per-job context. A resolved `per <= 0`
+  raises.
+- Policy-level **pause** now actually holds the whole policy. The pause
+  flag lives in the new `dispatch_policy_policy_settings` table and is
+  honored by `claim_partitions`, so it also stops partitions that first
+  appear *after* the pause — previously `pause` only flipped the `status`
+  of partition rows that existed at click time, and a tenant's first
+  enqueue afterwards created an `active` partition the next tick admitted.
+  The per-partition `status` update is kept for the partitions-index
+  display; `resume` clears the flag.
+- The admin UI now reflects the policy-level pause flag everywhere
+  (policies index + show, dashboard policy rows, partitions index + show):
+  partitions created after a pause render as effectively paused even
+  though their own `status` is still `active`, the pause/resume button
+  toggles to a single relevant action, and `policies#show` shows a PAUSED
+  badge. The per-policy operator hints also short-circuit to a single
+  "policy is paused" note instead of falsely warning about never-checked
+  partitions / growing backlog while admission is intentionally stopped.
+
+### Fixed
+- **The admin UI honors `config.database_role`.** The engine controllers
+  query the gem tables through the AR models directly (`Partition`,
+  `StagedJob`, `InflightJob`, `PolicySetting`, `TickSample`), which the
+  `Repository` role wrapper doesn't cover — under multi-DB every dashboard
+  page queried the default writing role (`PG::UndefinedTable` → 500), and
+  `pause`/`resume` updated the partition `status` in the wrong DB while
+  the policy flag went to the right one. An `around_action` in the
+  engine's `ApplicationController` now wraps every action — including view
+  rendering, so lazily-evaluated relations stay routed — in
+  `Repository.with_connection`. No-op without `database_role`.
+- **`pause`/`resume` write the policy flag and the partition statuses in
+  one transaction.** They were two autocommitted statements; a crash
+  between them left the partition list contradicting what admission
+  actually does until the next toggle.
+- **The generated `DispatchTickLoopJob` no longer dies after its first run
+  under good_job.** It re-enqueues itself at the end of `perform`, but
+  `good_job_control_concurrency_with(total_limit: 1)` counts the
+  still-running job in its enqueue check (`unfinished`), so the successor
+  was silently aborted and admission stopped after `tick_max_duration`.
+  Switched to `enqueue_limit: 1` + `perform_limit: 1` (the enqueue check
+  excludes the running job) and the job now logs an error if a re-enqueue
+  is ever refused. solid_queue was unaffected.
+- **`Tick#record_sample!` routes its two AR-model reads through
+  `config.database_role`.** They bypassed the `Repository` role wrapper, so
+  under a separate queue DB they queried the wrong role and the swallowed
+  error meant no `tick_sample` was ever written (empty dashboard/metrics).
+- **Multi-DB (`config.database_role`) is now honored everywhere.** It was
+  only applied at the three admission-TX boundaries (`Tick`,
+  `ManualAdmission`), leaving staging, partition claim, inflight
+  counts/tracking, sweeps and dashboard reads on the default writing role.
+  Under a separate queue DB (e.g. `solid_queue`) with the gem tables
+  there, staging wrote one DB while the tick read another — silent job
+  loss — and the concurrency gate counted inflight rows in a different DB
+  than the tracker wrote them to. Every public `Repository` method now
+  opens inside `connected_to(role:)`; `InflightTracker`'s direct access
+  (lookup + heartbeat thread) is routed too.
+- **A policy may declare each gate type at most once.** Two gates of the
+  same type shared a single `gate_state` key (both throttles wrote
+  `gate_state["throttle"]`), so the merged patch kept only the last gate's
+  bucket and the other then saw a permanently full bucket — silently
+  defeating the stricter limit (the classic 10/min + 600/hour idiom).
+  `Policy#validate!` now raises `InvalidPolicy`; use separate policies for
+  multi-window limits.
+- **Bulk `perform_all_later` correctness.** A job whose declared policy
+  wasn't registered was silently dropped (neither staged nor sent to the
+  adapter); jobs were marked `successfully_enqueued` before the INSERT
+  committed; and the bulk path ignored `bypass_retries`. It now mirrors
+  the single path: unstageable jobs fall through to the adapter, the
+  enqueued flag is set only after `stage_many!` returns, and retries on a
+  `:bypass` policy skip staging.
+- **`ManualAdmission.force!` pre-inserts inflight rows** in the same
+  transaction as the claim, like the Tick. Without it the concurrency
+  gate under-counted force-admitted jobs (UI admit/drain) until each one
+  started performing — an over-admission window proportional to the
+  backlog drained.
+- **Inflight rows are reaped when a job is discarded before performing.**
+  `discard_on ActiveJob::DeserializationError` (and any discard) fires
+  during argument deserialization, before `around_perform`, so
+  `InflightTracker.track`'s `ensure` never ran and the Tick's pre-inserted
+  row sat until the `inflight_queued_stale_after` sweeper (1h), holding a
+  concurrency slot. The railtie now subscribes to `discard.active_job` and
+  deletes the row by `active_job_id`.
+- **`throttle` no longer busy-loops on a zero/nil rate.** A `rate` of `0`
+  or `nil` (e.g. a paused tenant) denied with a NULL `retry_after`, which
+  left the partition immediately eligible — re-claimed and re-evaluated
+  every tick — and clobbered any existing backoff. It now backs off one
+  `per` window, and `bulk_record_partition_denies!` preserves the existing
+  `next_eligible_at` when `retry_after` is NULL instead of nulling it.
+- **`throttle` rate is read as `Float`.** A fractional rate (e.g. `2.5`)
+  kept its fractional part instead of truncating every refill (systematic
+  under-admission), and a sub-unit rate (`rate: 0.5`) accumulates a whole
+  token and admits instead of truncating to `0` and denying forever.
+- **`adaptive_concurrency` validates its tuning knobs.** Out-of-range
+  values silently inverted the AIMD loop: `ewma_alpha: 0` froze the EWMA
+  at its seed so the cap grew unbounded, and a decrease factor `>= 1`
+  turned the multiplicative *decrease* into a positive-feedback *increase*
+  under failure/overload. The constructor now requires
+  `0 < ewma_alpha <= 1` and `0 < failure/overload_decrease_factor < 1`.
+- **`partitions#admit` bounds its count.** An unbounded `count` forced a
+  single `DELETE…RETURNING` + dispatch of the whole backlog in one
+  transaction (bypassing the batching/cap that `drain` uses), and a
+  non-numeric value 500'd. It's now clamped to `[1, 10_000]` with a
+  fallback to `1`.
+- **Forged timestamp pagination cursors no longer 500.** A non-parseable
+  string on a `stale`/`recent` sort bound into a timestamp column and
+  raised `invalid input syntax for type timestamp`. `CursorPagination`
+  now requires a parseable ISO8601 value for timestamp sorts, falling back
+  to the first page otherwise.
+- `stage_many!` chunks its INSERT into batches of 1,000 rows so a bulk
+  `perform_all_later` larger than ~8,191 jobs no longer blows Postgres's
+  65,535 bind-param limit and fails the whole batch.
+- `InflightTracker.track` now inserts the inflight row and spawns the
+  heartbeat inside its `begin/ensure`, so a failure spawning the heartbeat
+  thread can't leave a ghost inflight row behind until the sweeper.
+- `Registry` reads (`fetch`/`names`/`each`/`size`) take the same mutex as
+  `register`/`clear` (snapshotting before iterating in `each`), removing a
+  data race on non-GVL runtimes (JRuby/TruffleRuby).
+- The DSL rejects `tick_admission_budget`/`admission_batch_size` of `0` or
+  negative (a silent full stop of the policy) and the `concurrency` /
+  `adaptive_concurrency` gates reject a negative `full_backoff` (which
+  would put `next_eligible_at` in the past and re-evaluate every tick).
+  `nil` still defers to config.
+- The policy-wide drain passes its remaining budget to each partition so
+  the total can't overshoot the 10,000 cap by nearly 2×, and a drain that
+  only leaves future-scheduled jobs now says "N scheduled for later
+  remain" instead of looping "click drain again" forever.
+- `partitions#show` lists recent staged jobs in the real admission order
+  (`priority DESC, scheduled_at NULLS FIRST, id`) and drops a dead,
+  mis-scoped `@inflight` query.
+- `Context` now exposes indifferent (symbol/string) access at every depth,
+  not just the top level — `ctx[:limits][:max]` no longer silently returns
+  nil when the host wrote a nested hash with symbol keys. `to_jsonb`/`to_h`
+  still return the plain string-keyed hash for storage.
+- The tick loop survives misconfigured pacing: `sweep_every_ticks <= 0`
+  now means "never sweep" instead of raising `ZeroDivisionError`, and a
+  negative `idle_pause`/`busy_pause` is treated as no pause instead of
+  raising in `sleep`. Both previously escaped the loop's rescues and
+  stopped admission.
+- Pass-2 budget redistribution denies (e.g. a throttle emptied after
+  pass-1) now feed the tick sample's denied-reason breakdown, so the
+  dashboard reflects why redistribution stopped.
+- Admin UI: `format_count` keeps the sign of negative values; durations
+  clamp at 0 so app↔DB clock skew can't render "-340ms"; the partition
+  search escapes `%`/`_` so a literal key containing them matches
+  literally; and the refresh/theme controls bind via a single delegated
+  document listener instead of per-button (Turbo's morph refresh dropped
+  the `data-bound` guard, leaking a new listener per refresh).
+- Dummy app: the throttle demos (`slow_api`, `mixed`) honor the form's
+  `per` field via the new callable `per` instead of a hardcoded window
+  (`slow_api` was stuck at 60000s), and the enqueue forms tolerate blank
+  numeric fields / unknown job names instead of 500ing.
+
+### Internal
+- Corrected the `bulk_record_partition_denies!` comment: `claim_partitions`
+  runs autocommitted, so its `FOR UPDATE SKIP LOCKED` locks don't guard the
+  end-of-tick deny flush — the one-tick-loop-per-(policy,shard) invariant
+  and the `last_checked_at` bump do.
+
 ## 0.4.3
 
 ### Fixed

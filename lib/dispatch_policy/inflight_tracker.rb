@@ -39,33 +39,45 @@ module DispatchPolicy
       ctx           = policy.build_context(job.arguments, queue_name: queue_name)
       partition_key = policy.partition_key_for(ctx)
 
-      Repository.insert_inflight!([{
-        policy_name:    policy.name,
-        partition_key:  partition_key,
-        active_job_id:  job.job_id
-      }])
-
       adaptive_gates = policy.gates.select { |g| g.name == :adaptive_concurrency }
-      admitted_at    = adaptive_gates.any? ? lookup_admitted_at(job.job_id) : nil
-      perform_start  = Time.current
+      admitted_at    = nil
+      perform_start  = nil
+      heartbeat      = nil
+      started        = false
+      succeeded      = false
 
-      heartbeat = start_heartbeat(job.job_id)
-
-      succeeded = false
+      # insert + heartbeat spawn live INSIDE the begin so the ensure always
+      # cleans up: if start_heartbeat (Thread.new) raises after the row is
+      # inserted, the row would otherwise orphan until the stale sweeper.
       begin
+        Repository.insert_inflight!([{
+          policy_name:    policy.name,
+          partition_key:  partition_key,
+          active_job_id:  job.job_id
+        }])
+
+        admitted_at   = adaptive_gates.any? ? lookup_admitted_at(job.job_id) : nil
+        perform_start = Time.current
+        heartbeat     = start_heartbeat(job.job_id)
+
+        started = true
         yield
         succeeded = true
       ensure
         stop_heartbeat(heartbeat)
 
-        record_adaptive_observations(
-          policy:        policy,
-          gates:         adaptive_gates,
-          partition_key: partition_key,
-          admitted_at:   admitted_at,
-          perform_start: perform_start,
-          succeeded:     succeeded
-        )
+        # Only record an observation if we actually reached perform — a
+        # failure in setup (insert / heartbeat spawn) isn't a perform result.
+        if started
+          record_adaptive_observations(
+            policy:        policy,
+            gates:         adaptive_gates,
+            partition_key: partition_key,
+            admitted_at:   admitted_at,
+            perform_start: perform_start,
+            succeeded:     succeeded
+          )
+        end
 
         begin
           Repository.delete_inflight!(active_job_id: job.job_id)
@@ -75,17 +87,43 @@ module DispatchPolicy
       end
     end
 
+    # Deletes the inflight row for a job that ActiveJob discarded BEFORE
+    # around_perform ran — most commonly an ActiveJob::DeserializationError
+    # (a GlobalID whose record was deleted) on a job with
+    # `discard_on ActiveJob::DeserializationError`. Argument deserialization
+    # happens before the perform callbacks, so track's `ensure` never runs
+    # and the row the Tick pre-inserted would otherwise sit until the
+    # `inflight_queued_stale_after` sweeper reaps it (default 1h), holding a
+    # concurrency slot the whole time. Wired to the `discard.active_job`
+    # notification by the railtie. Idempotent: a no-op when no row exists
+    # (e.g. discard fired after track already deleted it).
+    def self.handle_discard(job)
+      return unless job
+      return unless job.class.respond_to?(:dispatch_policy_name) && job.class.dispatch_policy_name
+
+      Repository.delete_inflight!(active_job_id: job.job_id)
+    rescue StandardError => e
+      DispatchPolicy.config.logger&.warn(
+        "[dispatch_policy] failed to clean up inflight row for discarded job #{job&.job_id}: #{e.class}: #{e.message}"
+      )
+    end
+
     # Reads the admitted_at column from the inflight row that the Tick
     # pre-inserted. Used as the start-of-queue-wait reference for the
     # adaptive_concurrency feedback signal (queue_lag = perform_start
     # - admitted_at). nil if the row vanished or the lookup fails —
     # the observation is then skipped.
     def self.lookup_admitted_at(active_job_id)
-      result = ActiveRecord::Base.connection.exec_query(
-        "SELECT admitted_at FROM dispatch_policy_inflight_jobs WHERE active_job_id = $1 LIMIT 1",
-        "lookup_admitted_at",
-        [active_job_id]
-      )
+      # Route through config.database_role: the inflight row lives in the
+      # same DB the Tick pre-inserted it into, which under multi-DB is the
+      # queue DB, not the default writing role of the worker process.
+      result = Repository.with_connection do
+        ActiveRecord::Base.connection.exec_query(
+          "SELECT admitted_at FROM dispatch_policy_inflight_jobs WHERE active_job_id = $1 LIMIT 1",
+          "lookup_admitted_at",
+          [active_job_id]
+        )
+      end
       row = result.first
       return nil unless row
       ts = row["admitted_at"]
@@ -147,8 +185,16 @@ module DispatchPolicy
           break if stop_flag.true?
 
           begin
-            ActiveRecord::Base.connection_pool.with_connection do
-              Repository.heartbeat_inflight!(active_job_id: active_job_id)
+            # Establish config.database_role inside this thread BEFORE the
+            # checkout: under multi-DB, connection_pool must resolve to the
+            # role's pool (where the inflight row lives), not the default
+            # writing pool. with_connection swaps the role thread-locally;
+            # the nested pool checkout then borrows/returns a dedicated
+            # connection from that pool per beat.
+            Repository.with_connection do
+              ActiveRecord::Base.connection_pool.with_connection do
+                Repository.heartbeat_inflight!(active_job_id: active_job_id)
+              end
             end
           rescue StandardError => e
             DispatchPolicy.config.logger&.warn("[dispatch_policy] heartbeat #{active_job_id} failed: #{e.class}: #{e.message}")

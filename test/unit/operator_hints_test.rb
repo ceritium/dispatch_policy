@@ -27,6 +27,25 @@ class OperatorHintsTest < Minitest::Test
     assert_empty hints
   end
 
+  def test_paused_policy_returns_only_the_pause_hint
+    # A paused policy must not be diagnosed as unhealthy: never_checked,
+    # drain time and pending-growth would all fire falsely (admission is
+    # deliberately stopped). Only the pause notice is shown.
+    hints = call(
+      paused:              true,
+      avg_tick_ms:         50,
+      pending_total:       5_000,
+      admitted_per_minute: 0,
+      never_checked:       42,
+      pending_trend:       :up,
+      active_partitions:   42
+    )
+    assert_equal 1, hints.size
+    assert_match(/paused/i, hints.first.message)
+    refute(hints.any? { |h| h.message.include?("never been checked") },
+           "must not raise the never_checked alarm while deliberately paused")
+  end
+
   def test_warns_when_avg_tick_above_60_percent_of_deadline
     hints = call(avg_tick_ms: 16_000) # 64% of 25_000
     msgs = hints.map(&:message)

@@ -1,9 +1,16 @@
-<tr id="partition_<%= partition.id %>" class="<%= "dp-row-paused" if partition.paused? %>">
+<% policy_paused = local_assigns.fetch(:policy_paused, false) %>
+<tr id="partition_<%= partition.id %>" class="<%= "dp-row-paused" if partition.paused? || policy_paused %>">
   <td><%= link_to partition.policy_name, policy_path(partition.policy_name), class: "dp-link" %></td>
   <td><code><%= partition.shard %></code></td>
   <td><%= partition.queue_name || "—" %></td>
   <td><%= link_to partition.partition_key, partition_path(partition), class: "dp-link" %></td>
-  <td><%= partition.status %></td>
+  <td>
+    <% if policy_paused && !partition.paused? %>
+      <%= partition.status %> <span class="dp-warn" style="font-size:11px;">(policy paused)</span>
+    <% else %>
+      <%= partition.status %>
+    <% end %>
+  </td>
   <td class="dp-num"><%= format_count(partition.pending_count) %></td>
   <td class="dp-num"><%= format_count(partition.total_admitted) %></td>
   <td><%= format_time(partition.next_eligible_at) %></td>

@@ -49,6 +49,7 @@ class RepositoryIntegrationTest < Minitest::Test
     dispatch_policy_inflight_jobs
     dispatch_policy_tick_samples
     dispatch_policy_adaptive_concurrency_stats
+    dispatch_policy_policy_settings
   ].freeze
 
   def schema_present?
@@ -126,6 +127,67 @@ class RepositoryIntegrationTest < Minitest::Test
 
     persisted = DispatchPolicy::Partition.first
     refute_nil persisted.last_checked_at, "claim_partitions must bump last_checked_at"
+  end
+
+  # M6: pausing a policy must hold partitions created AFTER the pause too,
+  # not only the ones that existed when the operator clicked. claim_partitions
+  # reads the policy_settings flag, so a brand-new active partition with
+  # pending work is still skipped while the policy is paused.
+  def test_claim_partitions_respects_policy_pause_for_new_partitions
+    DispatchPolicy::Repository.set_policy_paused!(policy_name: "p", paused: true)
+
+    # This partition is created (active) only after the pause.
+    DispatchPolicy::Repository.stage!(
+      policy_name: "p", partition_key: "fresh", queue_name: nil,
+      job_class: "J", job_data: { "job_id" => "1", "job_class" => "J", "arguments" => [] },
+      context: {}, priority: 0
+    )
+
+    assert_empty DispatchPolicy::Repository.claim_partitions(policy_name: "p", limit: 5),
+                 "a paused policy must not admit a partition created after the pause"
+
+    DispatchPolicy::Repository.set_policy_paused!(policy_name: "p", paused: false)
+    assert_equal 1, DispatchPolicy::Repository.claim_partitions(policy_name: "p", limit: 5).size,
+                 "resuming the policy makes its partitions claimable again"
+  end
+
+  # M9 follow-up: PoliciesController#pause wraps the flag upsert and the
+  # partitions' status update in one AR transaction so both commit or
+  # neither. That only holds if set_policy_paused! (raw exec_query through
+  # Repository.connection) actually JOINS an outer model-opened TX instead
+  # of autocommitting — i.e. both run on the same connection.
+  def test_set_policy_paused_joins_an_outer_model_transaction
+    DispatchPolicy::Partition.transaction do
+      DispatchPolicy::Repository.set_policy_paused!(policy_name: "p", paused: true)
+      raise ActiveRecord::Rollback
+    end
+
+    paused = ActiveRecord::Base.connection
+                               .select_value("SELECT paused FROM dispatch_policy_policy_settings WHERE policy_name = 'p'")
+    assert_nil paused, "a rolled-back outer TX must take the pause flag with it"
+  end
+
+  # L1: stage_many! must chunk so a batch larger than PG's bind-param limit
+  # (65_535 / 8 params per row ≈ 8_191 rows) doesn't fail the whole INSERT.
+  # 2_500 rows crosses two STAGE_MANY_BATCH (1_000) boundaries cheaply.
+  def test_stage_many_chunks_large_batches
+    rows = Array.new(2_500) do |i|
+      {
+        policy_name:   "bulk",
+        partition_key: "k",
+        queue_name:    nil,
+        job_class:     "J",
+        job_data:      { "job_id" => "j#{i}", "job_class" => "J", "arguments" => [] },
+        context:       {},
+        priority:      0
+      }
+    end
+
+    inserted = DispatchPolicy::Repository.stage_many!(rows)
+
+    assert_equal 2_500, inserted
+    assert_equal 2_500, DispatchPolicy::StagedJob.where(policy_name: "bulk").count
+    assert_equal 2_500, DispatchPolicy::Partition.find_by(policy_name: "bulk", partition_key: "k").pending_count
   end
 
   def test_claim_staged_jobs_deletes_returning_and_updates_partition

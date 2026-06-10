@@ -78,6 +78,18 @@ module DispatchPolicy
       unless %i[restage bypass].include?(@retry_strategy)
         raise InvalidPolicy, "retry_strategy must be :restage or :bypass"
       end
+      # Two gates of the same type would persist their state under the same
+      # gate_state key (e.g. both throttles share gate_state["throttle"]),
+      # silently corrupting each other: the merged patch keeps only the last
+      # gate's bucket, and on the next tick the other gate clamps that count
+      # to its own capacity and sees a permanently full bucket. Reject it at
+      # definition time — multi-window rate limiting needs separate policies.
+      duplicate = @gates.map(&:name).tally.find { |_, count| count > 1 }
+      if duplicate
+        raise InvalidPolicy,
+              "duplicate #{duplicate.first.inspect} gate: a policy may declare each gate " \
+              "type at most once (use separate policies for multi-window limits)"
+      end
       # Note: gates are NOT required. A policy with no gates uses the
       # admission_batch_size (or tick_admission_budget when set) as its
       # only ceiling, with the in-tick fairness reorder distributing

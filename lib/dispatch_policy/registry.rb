@@ -19,7 +19,7 @@ module DispatchPolicy
     end
 
     def fetch(name)
-      entry = @policies[name.to_s]
+      entry = @mutex.synchronize { @policies[name.to_s] }
       entry && entry[:policy]
     end
 
@@ -28,15 +28,19 @@ module DispatchPolicy
     end
 
     def names
-      @policies.keys
+      @mutex.synchronize { @policies.keys }
     end
 
     def each(&block)
-      @policies.values.map { |e| e[:policy] }.each(&block)
+      # Snapshot under the lock, then iterate outside it: the block may run
+      # arbitrary code (and Mutex isn't reentrant), so we must not hold the
+      # lock while yielding.
+      snapshot = @mutex.synchronize { @policies.values.map { |e| e[:policy] } }
+      snapshot.each(&block)
     end
 
     def size
-      @policies.size
+      @mutex.synchronize { @policies.size }
     end
 
     def clear

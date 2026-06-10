@@ -23,7 +23,7 @@ class MixedJob < ApplicationJob
     # split into two policies and chain them.
     partition_by ->(c) { "ep:#{c[:endpoint_id]}|acct:#{c[:account_id]}" }
 
-    gate :throttle,    rate: ->(c) { c[:rate] }, per: 60
+    gate :throttle,    rate: ->(c) { c[:rate] }, per: ->(c) { c[:per] }
     gate :concurrency, max:  ->(c) { c[:max] }
   end
 

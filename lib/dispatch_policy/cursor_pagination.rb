@@ -2,6 +2,7 @@
 
 require "base64"
 require "json"
+require "time"
 
 module DispatchPolicy
   # Tiny keyset-pagination helper for the engine UI. Each sort mode declares
@@ -86,13 +87,22 @@ module DispatchPolicy
 
       value, last_id = cursor
       # Ignore a cursor whose value type can't be compared against this
-      # sort's column. The numeric columns (pending_count, total_admitted)
-      # need a Numeric; everything else compares as text (partition_key, or
-      # the ISO8601 timestamps emitted by #extract). A mismatch — e.g. a
-      # numeric value forged for a timestamp sort — would raise PG error;
-      # instead we fall back to the first page.
-      numeric_column = %w[pending_count total_admitted].include?(sort[:cursor_sql])
-      return scope unless numeric_column ? value.is_a?(Numeric) : value.is_a?(String)
+      # sort's column. A mismatch — e.g. a numeric value forged for a
+      # timestamp sort — would raise a PG error; instead we fall back to the
+      # first page.
+      numeric_column   = %w[pending_count total_admitted].include?(sort[:cursor_sql])
+      timestamp_column = sort[:cursor_sql].start_with?("COALESCE(")
+      if numeric_column
+        return scope unless value.is_a?(Numeric)
+      elsif timestamp_column
+        # Bound against a timestamp column: a non-parseable string (e.g. a
+        # hand-forged "zzz") would raise `invalid input syntax for type
+        # timestamp` and 500. Require a real ISO8601 value — exactly what
+        # #extract emits — or fall back to the first page.
+        return scope unless value.is_a?(String) && parseable_timestamp?(value)
+      else
+        return scope unless value.is_a?(String)
+      end
 
       case sort[:direction]
       when :desc
@@ -132,6 +142,13 @@ module DispatchPolicy
       when Time, ActiveSupport::TimeWithZone then v.utc.iso8601(6)
       else v
       end
+    end
+
+    def parseable_timestamp?(str)
+      Time.iso8601(str)
+      true
+    rescue ArgumentError, TypeError
+      false
     end
   end
 end

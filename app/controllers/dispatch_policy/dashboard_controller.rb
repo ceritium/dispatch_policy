@@ -69,6 +69,8 @@ module DispatchPolicy
       denied_by = Repository.top_denied_reason_by_policy(since: one_min_ago)
       rt_by     = Repository.partition_round_trip_stats_by_policy
 
+      paused_policies = PolicySetting.paused.pluck(:policy_name).to_set
+
       names = (pending_by_policy.keys + in_flight_by_policy.keys).uniq.sort
       @policies = names.map do |name|
         info = pending_by_policy[name] || {}
@@ -79,6 +81,7 @@ module DispatchPolicy
 
         {
           name:           name,
+          paused:         paused_policies.include?(name),
           pending:        info[:pending] || 0,
           in_flight:      in_flight_by_policy[name] || 0,
           last_admit_at:  info[:last_admit_at],

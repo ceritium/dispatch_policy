@@ -210,6 +210,12 @@ Gates run in declared order; each narrows the survivor count. Every
 option that takes a value can alternatively take a lambda receiving
 the `ctx` hash, so parameters can depend on per-job data.
 
+A policy may declare each gate type **at most once** — two gates of the
+same type would share a `gate_state` key and corrupt each other's
+persisted state, so the policy raises `InvalidPolicy` at definition
+time. For multi-window rate limiting (e.g. 10/min *and* 600/hour), use
+separate policies.
+
 ### `:throttle` — token-bucket rate limit per partition
 
 Refills `rate` tokens every `per` seconds, capped at `rate` (no
@@ -223,8 +229,19 @@ gate :throttle,
      per:  1.minute
 ```
 
+Both `rate` and `per` accept a lambda receiving the `ctx`, so the rate
+limit and its window can depend on per-job data (e.g. a per-tenant plan
+that sets both). A `per` that resolves to `<= 0` raises.
+
 Throttle does **not** release tokens on completion — tokens refill
 only with elapsed time.
+
+`rate` may be fractional (e.g. `2.5`): the bucket keeps the fractional
+part so the long-run rate is exact rather than truncated. A sub-unit
+rate works too — the bucket holds at least one whole token, so e.g.
+`rate: 1, per: 2.seconds` admits one job every two seconds. A `rate`
+of `0` (or `nil`) denies and backs the partition off for one `per`
+window. Prefer expressing low rates via a longer `per`.
 
 ### `:concurrency` — in-flight cap per partition
 
@@ -445,9 +462,12 @@ DispatchPolicy.configure do |c|
 end
 ```
 
-`Repository.with_connection` wraps the admission TX in
-`connected_to(role:)` when set. Staging tables and the adapter's
-table must live in the same DB for atomicity to hold.
+When set, **every** DB access the gem makes runs inside
+`connected_to(role:)` — staging on `perform_later`, the admission TX,
+inflight tracking and its heartbeat thread, sweeps, and the admin UI
+(an `around_action` routes each dashboard request, so its reads and
+operator actions hit the same DB the tick writes). Staging tables and
+the adapter's table must live in the same DB for atomicity to hold.
 
 ### Job identity across staging and adapter
 
@@ -509,7 +529,10 @@ Mount the engine and visit `/dispatch_policy`:
   ("avg tick at 88% of tick_max_duration — shard or lower
   admission_batch_size").
 - **Policies** — per-policy throughput, denial reasons breakdown,
-  top partitions by lifetime/pending, pause/resume/drain.
+  top partitions by lifetime/pending, pause/resume/drain. Pause is a
+  policy-level flag (stored in `dispatch_policy_policy_settings`) the
+  tick honors, so it also holds partitions that first appear *after*
+  the pause; resume clears it.
 - **Partitions** — searchable list, detail view with gate state,
   decayed_admits + admits/min estimate, recent staged jobs,
   force-admit, drain.
@@ -535,13 +558,13 @@ DispatchPolicy.configure do |c|
   c.partition_inactive_after  = 86_400   # GC partitions idle this long
   c.inflight_stale_after      = 300      # GC inflight rows whose worker stopped heartbeating
   c.inflight_queued_stale_after = 3_600  # GC inflight rows admitted but never started (queued)
-  c.inflight_heartbeat_interval = 30     # how often the worker bumps heartbeat_at
-  c.sweep_every_ticks         = 50       # sweeper cadence (in tick iterations)
+  c.inflight_heartbeat_interval = 30     # how often the worker bumps heartbeat_at; 0 disables the thread
+  c.sweep_every_ticks         = 50       # sweeper cadence (in tick iterations); <= 0 never sweeps
   c.metrics_retention         = 86_400   # tick_samples kept this long
   c.fairness_half_life_seconds = 60      # EWMA half-life for in-tick reorder; nil disables
   c.tick_admission_budget      = nil     # global cap on admissions per tick; nil = none
   c.adapter_throughput_target  = nil     # jobs/sec; UI shows admit rate as % of this
-  c.database_role              = nil     # AR role for the admission TX (multi-DB)
+  c.database_role              = nil     # AR role ALL gem DB access runs against (multi-DB)
 end
 ```
 

@@ -84,7 +84,12 @@
         <tbody>
           <% @policies.each do |p| %>
             <tr>
-              <td><%= link_to p[:name], policy_path(p[:name]), class: "dp-link" %></td>
+              <td>
+                <%= link_to p[:name], policy_path(p[:name]), class: "dp-link" %>
+                <% if p[:paused] %>
+                  <span class="dp-warn" style="font-size:11px; border:1px solid currentColor; border-radius:4px; padding:1px 5px; margin-left:4px;">paused</span>
+                <% end %>
+              </td>
               <td class="dp-num"><%= format_count(p[:pending]) %></td>
               <td class="dp-num"><%= format_count(p[:in_flight]) %></td>
               <td class="dp-num"><%= format_count(p[:admitted_1m]) %></td>

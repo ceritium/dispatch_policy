@@ -29,9 +29,23 @@ module DispatchPolicy
     #   in_backoff:             int
     #   total_partitions:       int
     #   adapter_target_jps:     int|nil  (config.adapter_throughput_target)
+    #   paused:                 bool (policy-level pause flag)
     def for(metrics)
       hints = []
       m     = metrics
+
+      # ---- policy paused: everything below presumes admission SHOULD be
+      # flowing (never_checked, drain time, pending growing), so during a
+      # deliberate pause those hints turn into false alarms — e.g.
+      # "increase partition_batch_size" while the tick is intentionally
+      # skipping the policy. State the pause and stop.
+      if m[:paused]
+        return [Hint.new(
+          level: :warn,
+          message: "Policy is paused — admission is stopped while staging continues " \
+                   "(pending keeps growing). Resume to drain."
+        )]
+      end
 
       # ---- tick approaching deadline ---------------------------------
       if m[:tick_max_duration_ms].to_i.positive? && m[:avg_tick_ms].to_i.positive?

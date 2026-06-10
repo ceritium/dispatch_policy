@@ -45,6 +45,20 @@ module DispatchPolicy
         raise ArgumentError, "target_lag_ms must be > 0" unless @target_lag_ms.positive?
         raise ArgumentError, "min must be >= 1"          unless @min >= 1
         raise ArgumentError, "initial_max must be >= min" unless @initial_max >= @min
+        # Out-of-range tuning knobs invert the AIMD loop instead of erroring:
+        # alpha=0 freezes the EWMA at its seed so the cap grows unbounded;
+        # a decrease factor >= 1 turns the multiplicative *decrease* into an
+        # increase, a positive-feedback loop under failure/overload.
+        unless @ewma_alpha > 0 && @ewma_alpha <= 1
+          raise ArgumentError, "ewma_alpha must be in (0, 1]"
+        end
+        unless @fail_factor > 0 && @fail_factor < 1
+          raise ArgumentError, "failure_decrease_factor must be in (0, 1)"
+        end
+        unless @slow_factor > 0 && @slow_factor < 1
+          raise ArgumentError, "overload_decrease_factor must be in (0, 1)"
+        end
+        raise ArgumentError, "full_backoff must be >= 0" if @full_backoff.negative?
       end
 
       def name

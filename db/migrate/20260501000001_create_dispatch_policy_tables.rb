@@ -99,5 +99,18 @@ class CreateDispatchPolicyTables < ActiveRecord::Migration[7.1]
               [:policy_name, :partition_key],
               unique: true,
               name:   "idx_dp_adaptive_concurrency_lookup"
+
+    # Policy-level settings. Currently just the pause flag: a paused policy
+    # admits nothing, INCLUDING partitions created after the pause (the
+    # tick's claim checks this row). The partitions' own `status` is a
+    # per-partition display concern; this is the policy-wide source of truth.
+    create_table :dispatch_policy_policy_settings do |t|
+      t.string   :policy_name, null: false
+      t.boolean  :paused,      null: false, default: false
+      t.timestamps
+    end
+    add_index :dispatch_policy_policy_settings, :policy_name,
+              unique: true,
+              name:   "idx_dp_policy_settings_lookup"
   end
 end

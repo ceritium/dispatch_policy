@@ -15,12 +15,16 @@ module DispatchPolicy
       # One grouped query for pending / partition count / paused count
       # across every policy instead of three per policy.
       counts_by_policy    = Repository.partition_counts_by_policy
+      # Policy-level pause flags — the source of truth the tick honors
+      # (partitions.status alone misses partitions created after the pause).
+      paused_policies     = PolicySetting.paused.pluck(:policy_name).to_set
 
       @rows = names.map do |name|
         counts = counts_by_policy[name] || {}
         {
           name:           name,
           registered:     registry_names.include?(name),
+          paused:         paused_policies.include?(name),
           pending:        counts[:pending] || 0,
           in_flight:      in_flight_by_policy[name] || 0,
           partitions:     counts[:partitions] || 0,
@@ -31,6 +35,7 @@ module DispatchPolicy
 
     def show
       @policy_object = DispatchPolicy.registry.fetch(@policy_name)
+      @paused        = PolicySetting.for_policy(@policy_name).pick(:paused) || false
       @partitions    = Partition.for_policy(@policy_name)
                                 .order(Arel.sql("pending_count DESC, last_admit_at DESC NULLS LAST"))
                                 .limit(100)
@@ -77,17 +82,31 @@ module DispatchPolicy
         in_backoff:           @round_trip[:in_backoff],
         total_partitions:     @totals[:partitions],
         adapter_target_jps:   @capacity[:adapter_target_jps],
-        pending_trend:        @pending_trend
+        pending_trend:        @pending_trend,
+        paused:               @paused
       )
     end
 
     def pause
-      Partition.for_policy(@policy_name).update_all(status: "paused", updated_at: Time.current)
+      # Policy-level flag is the source of truth the tick honors (so a key
+      # that first appears AFTER the pause is held too). The per-partition
+      # status update is kept for the partitions index display. One TX so
+      # both writes commit or neither: a flag without the statuses (or vice
+      # versa) leaves the partition list contradicting what admission
+      # actually does until the next toggle. set_policy_paused! shares the
+      # connection (same role via around_action), so it joins this TX.
+      Partition.transaction do
+        Repository.set_policy_paused!(policy_name: @policy_name, paused: true)
+        Partition.for_policy(@policy_name).update_all(status: "paused", updated_at: Time.current)
+      end
       redirect_to policy_path(@policy_name), notice: "Policy paused."
     end
 
     def resume
-      Partition.for_policy(@policy_name).update_all(status: "active", updated_at: Time.current)
+      Partition.transaction do
+        Repository.set_policy_paused!(policy_name: @policy_name, paused: false)
+        Partition.for_policy(@policy_name).update_all(status: "active", updated_at: Time.current)
+      end
       redirect_to policy_path(@policy_name), notice: "Policy resumed."
     end
 
@@ -103,7 +122,10 @@ module DispatchPolicy
                .each do |partition|
         break if drained >= DRAIN_MAX_PER_REQUEST
 
-        batch, _ = PartitionsController.drain_partition!(partition)
+        # Pass the REMAINING budget so a single partition can't push the
+        # total past the cap (a fixed per-partition cap could overshoot by
+        # nearly 2× when the first partition nearly fills it).
+        batch, = PartitionsController.drain_partition!(partition, cap: DRAIN_MAX_PER_REQUEST - drained)
         drained += batch
       end
 
