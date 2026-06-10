@@ -79,35 +79,43 @@ module DispatchPolicy
     # Bulk version for perform_all_later. Receives an array of hashes with
     # the same keys as #stage!. Performs one INSERT for staged_jobs and
     # one UPSERT per (policy_name, partition_key) group.
+    # Rows per INSERT. Each row binds 8 params; Postgres caps a statement at
+    # 65_535 bind params, so we slice well under 65_535/8 ≈ 8_191 to leave
+    # headroom. A single perform_all_later with more rows than this would
+    # otherwise blow the limit and fail the whole batch.
+    STAGE_MANY_BATCH = 1_000
+
     def stage_many!(rows)
       return 0 if rows.empty?
 
       connection.transaction(requires_new: true) do
-        values_sql = []
-        params     = []
-        rows.each_with_index do |row, idx|
-          base = idx * 8
-          values_sql << "($#{base + 1}, $#{base + 2}, $#{base + 3}, $#{base + 4}, $#{base + 5}::jsonb, $#{base + 6}::jsonb, $#{base + 7}, $#{base + 8})"
-          params.push(
-            row[:policy_name],
-            row[:partition_key],
-            row[:queue_name],
-            row[:job_class],
-            JSON.dump(row[:job_data]),
-            JSON.dump(row[:context] || {}),
-            row[:scheduled_at],
-            row[:priority] || 0
+        rows.each_slice(STAGE_MANY_BATCH) do |slice|
+          values_sql = []
+          params     = []
+          slice.each_with_index do |row, idx|
+            base = idx * 8
+            values_sql << "($#{base + 1}, $#{base + 2}, $#{base + 3}, $#{base + 4}, $#{base + 5}::jsonb, $#{base + 6}::jsonb, $#{base + 7}, $#{base + 8})"
+            params.push(
+              row[:policy_name],
+              row[:partition_key],
+              row[:queue_name],
+              row[:job_class],
+              JSON.dump(row[:job_data]),
+              JSON.dump(row[:context] || {}),
+              row[:scheduled_at],
+              row[:priority] || 0
+            )
+          end
+          connection.exec_query(
+            <<~SQL.squish,
+              INSERT INTO #{STAGED_TABLE}
+                (policy_name, partition_key, queue_name, job_class, job_data, context, scheduled_at, priority)
+              VALUES #{values_sql.join(", ")}
+            SQL
+            "stage_many",
+            params
           )
         end
-        connection.exec_query(
-          <<~SQL.squish,
-            INSERT INTO #{STAGED_TABLE}
-              (policy_name, partition_key, queue_name, job_class, job_data, context, scheduled_at, priority)
-            VALUES #{values_sql.join(", ")}
-          SQL
-          "stage_many",
-          params
-        )
 
         rows.group_by { |r| [r[:policy_name], r[:partition_key]] }.each do |(policy_name, partition_key), group|
           upsert_partition!(
@@ -311,10 +319,13 @@ module DispatchPolicy
     #
     # Each entry: { policy_name:, partition_key:, gate_state_patch:, retry_after: }.
     # Independent per row — the join via FROM(VALUES…) makes the bulk
-    # statement equivalent to N sequential UPDATEs in correctness terms;
-    # the row-level locks held by `claim_partitions` (FOR UPDATE SKIP
-    # LOCKED, last_checked_at bumped) keep concurrent ticks away from the
-    # same partitions while we batch.
+    # statement equivalent to N sequential UPDATEs in correctness terms.
+    # Note: `claim_partitions` runs as its own autocommitted statement, so
+    # its `FOR UPDATE SKIP LOCKED` row locks are already released by the time
+    # we reach this flush — they do NOT guard the batch. What keeps two ticks
+    # off the same partitions is the operational invariant of one tick loop
+    # per (policy, shard), reinforced by the `last_checked_at` bump on claim
+    # (a racing claim skips recently-checked rows).
     def bulk_record_partition_denies!(entries)
       return if entries.empty?
 

@@ -108,7 +108,10 @@ module DispatchPolicy
                .each do |partition|
         break if drained >= DRAIN_MAX_PER_REQUEST
 
-        batch, _ = PartitionsController.drain_partition!(partition)
+        # Pass the REMAINING budget so a single partition can't push the
+        # total past the cap (a fixed per-partition cap could overshoot by
+        # nearly 2× when the first partition nearly fills it).
+        batch, = PartitionsController.drain_partition!(partition, cap: DRAIN_MAX_PER_REQUEST - drained)
         drained += batch
       end
 

@@ -67,6 +67,10 @@ class AdaptiveConcurrencyGateTest < Minitest::Test
     assert_in_delta 0.3, gate.ewma_alpha, 0.001
   end
 
+  def test_negative_full_backoff_raises
+    assert_raises(ArgumentError) { make_gate(full_backoff: -1) }
+  end
+
   # ----- evaluate -----------------------------------------------------------
 
   def test_first_admission_seeds_and_uses_initial_max

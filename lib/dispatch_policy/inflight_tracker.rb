@@ -39,33 +39,45 @@ module DispatchPolicy
       ctx           = policy.build_context(job.arguments, queue_name: queue_name)
       partition_key = policy.partition_key_for(ctx)
 
-      Repository.insert_inflight!([{
-        policy_name:    policy.name,
-        partition_key:  partition_key,
-        active_job_id:  job.job_id
-      }])
-
       adaptive_gates = policy.gates.select { |g| g.name == :adaptive_concurrency }
-      admitted_at    = adaptive_gates.any? ? lookup_admitted_at(job.job_id) : nil
-      perform_start  = Time.current
+      admitted_at    = nil
+      perform_start  = nil
+      heartbeat      = nil
+      started        = false
+      succeeded      = false
 
-      heartbeat = start_heartbeat(job.job_id)
-
-      succeeded = false
+      # insert + heartbeat spawn live INSIDE the begin so the ensure always
+      # cleans up: if start_heartbeat (Thread.new) raises after the row is
+      # inserted, the row would otherwise orphan until the stale sweeper.
       begin
+        Repository.insert_inflight!([{
+          policy_name:    policy.name,
+          partition_key:  partition_key,
+          active_job_id:  job.job_id
+        }])
+
+        admitted_at   = adaptive_gates.any? ? lookup_admitted_at(job.job_id) : nil
+        perform_start = Time.current
+        heartbeat     = start_heartbeat(job.job_id)
+
+        started = true
         yield
         succeeded = true
       ensure
         stop_heartbeat(heartbeat)
 
-        record_adaptive_observations(
-          policy:        policy,
-          gates:         adaptive_gates,
-          partition_key: partition_key,
-          admitted_at:   admitted_at,
-          perform_start: perform_start,
-          succeeded:     succeeded
-        )
+        # Only record an observation if we actually reached perform — a
+        # failure in setup (insert / heartbeat spawn) isn't a perform result.
+        if started
+          record_adaptive_observations(
+            policy:        policy,
+            gates:         adaptive_gates,
+            partition_key: partition_key,
+            admitted_at:   admitted_at,
+            perform_start: perform_start,
+            succeeded:     succeeded
+          )
+        end
 
         begin
           Repository.delete_inflight!(active_job_id: job.job_id)

@@ -15,12 +15,11 @@ anti-starvation).
 
 ## High
 
-> **Status:** H1, H2 and all medium issues (M1–M8) fixed on branch
-> `fix/high-priority-audit-issues`, each with regression tests. The low
-> issues (L1–L10) remain open. M6 adds the `dispatch_policy_policy_settings`
-> table — existing installs must create it (the gem ships a single
-> migration; copy the new `create_table` block or run the updated
-> migration/generator).
+> **Status:** ALL issues (H1–H2, M1–M8, L1–L10) fixed on branch
+> `fix/high-priority-audit-issues`, each with regression tests. M6 adds the
+> `dispatch_policy_policy_settings` table — existing installs must create
+> it (the gem ships a single migration; copy the new `create_table` block
+> or run the updated migration/generator).
 
 ### H1 — `config.database_role` is only applied in 3 call sites; multi-DB is broken end-to-end
 
@@ -159,7 +158,7 @@ raise a 500"; the implementation doesn't deliver that for timestamps.
 
 ---
 
-## Low
+## Low — all fixed
 
 - **L1** — `stage_many!` doesn't chunk: > 8,191 rows exceeds PG's 65,535
   bind-param limit and fails the whole batch (`repository.rb:81-123`).

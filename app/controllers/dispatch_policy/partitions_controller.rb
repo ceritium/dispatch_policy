@@ -59,11 +59,12 @@ module DispatchPolicy
     helper_method :pagination_params
 
     def show
+      # Order matches the tick's claim order (claim_staged_jobs!) so the list
+      # reflects what would actually be admitted first, not the reverse.
       @recent_jobs = StagedJob
         .for_partition(@partition.policy_name, @partition.partition_key)
-        .order(:scheduled_at, :id)
+        .order(Arel.sql("priority DESC, scheduled_at ASC NULLS FIRST, id ASC"))
         .limit(50)
-      @inflight = InflightJob.where(policy_name: @partition.policy_name).limit(50)
     end
 
     def admit
@@ -86,19 +87,33 @@ module DispatchPolicy
     # huge backlog can't time the controller out — the operator clicks again
     # for the next batch.
     def drain
-      drained, remaining = self.class.drain_partition!(@partition)
-      notice = if remaining.positive?
-        "Drained #{drained} job(s); #{remaining} still pending — click drain again to continue."
-      else
-        "Drained #{drained} job(s); partition empty."
-      end
+      drained, due_remaining, scheduled_remaining =
+        self.class.drain_partition!(@partition)
+
+      notice =
+        if due_remaining.positive?
+          "Drained #{drained} job(s); #{due_remaining} still pending — click drain again to continue."
+        elsif scheduled_remaining.positive?
+          # The claim only picks up rows whose scheduled_at has arrived, so
+          # future-scheduled jobs can't be drained now. Saying "click again"
+          # would just loop forwarding zero.
+          "Drained #{drained} job(s); #{scheduled_remaining} scheduled for later remain."
+        else
+          "Drained #{drained} job(s); partition empty."
+        end
       redirect_to partition_path(@partition), notice: notice
     end
 
-    def self.drain_partition!(partition)
+    # Force-admits up to DRAIN_MAX_PER_REQUEST due jobs in DRAIN_BATCH_SIZE
+    # batches. Optional `cap` lets the policy-wide drain bound the TOTAL
+    # across partitions. Returns [drained, due_remaining, scheduled_remaining]
+    # — due_remaining is claimable-now work the cap left behind;
+    # scheduled_remaining is future-scheduled rows the claim can't touch yet.
+    def self.drain_partition!(partition, cap: DRAIN_MAX_PER_REQUEST)
+      cap     = [cap, DRAIN_MAX_PER_REQUEST].min
       drained = 0
-      while drained < DRAIN_MAX_PER_REQUEST
-        batch_limit = [DRAIN_BATCH_SIZE, DRAIN_MAX_PER_REQUEST - drained].min
+      while drained < cap
+        batch_limit = [DRAIN_BATCH_SIZE, cap - drained].min
         forwarded   = ManualAdmission.force!(
           policy_name:   partition.policy_name,
           partition_key: partition.partition_key,
@@ -108,8 +123,11 @@ module DispatchPolicy
 
         drained += forwarded
       end
-      remaining = partition.class.where(id: partition.id).pick(:pending_count) || 0
-      [drained, remaining]
+
+      scope               = StagedJob.for_partition(partition.policy_name, partition.partition_key)
+      due_remaining       = scope.due.count
+      scheduled_remaining = scope.count - due_remaining
+      [drained, due_remaining, scheduled_remaining]
     end
 
     private

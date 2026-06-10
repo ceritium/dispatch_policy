@@ -51,6 +51,11 @@ module DispatchPolicy
       # assuming the admission was lost. Raise it if your adapter backlog
       # can exceed an hour.
       @inflight_queued_stale_after = 60 * 60
+      # Seconds between heartbeat_at refreshes. Each beat briefly checks out
+      # an EXTRA connection (one per running job) from the role's pool, so
+      # the DB pool needs headroom above the worker concurrency — otherwise
+      # beats hit ConnectionTimeoutError and long jobs get swept as stale.
+      # Set to 0 to disable the heartbeat thread entirely.
       @inflight_heartbeat_interval = 30
       @real_adapter              = nil
       @logger                    = nil

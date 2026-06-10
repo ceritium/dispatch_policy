@@ -41,6 +41,12 @@ class ConcurrencyGateTest < Minitest::Test
     assert_equal 3, d.allowed
   end
 
+  # L5: a negative full_backoff puts next_eligible_at in the past, defeating
+  # the backoff (re-COUNT every tick). Reject it.
+  def test_negative_full_backoff_raises
+    assert_raises(ArgumentError) { DispatchPolicy::Gates::Concurrency.new(max: 5, full_backoff: -1) }
+  end
+
   def test_full_returns_zero_with_retry_after_to_prevent_busy_loop
     stub_repo_count(5)
     gate = DispatchPolicy::Gates::Concurrency.new(max: 5)

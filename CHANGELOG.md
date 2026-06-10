@@ -96,6 +96,33 @@
   raised `invalid input syntax for type timestamp`. `CursorPagination`
   now requires a parseable ISO8601 value for timestamp sorts, falling back
   to the first page otherwise.
+- `stage_many!` chunks its INSERT into batches of 1,000 rows so a bulk
+  `perform_all_later` larger than ~8,191 jobs no longer blows Postgres's
+  65,535 bind-param limit and fails the whole batch.
+- `InflightTracker.track` now inserts the inflight row and spawns the
+  heartbeat inside its `begin/ensure`, so a failure spawning the heartbeat
+  thread can't leave a ghost inflight row behind until the sweeper.
+- `Registry` reads (`fetch`/`names`/`each`/`size`) take the same mutex as
+  `register`/`clear` (snapshotting before iterating in `each`), removing a
+  data race on non-GVL runtimes (JRuby/TruffleRuby).
+- The DSL rejects `tick_admission_budget`/`admission_batch_size` of `0` or
+  negative (a silent full stop of the policy) and the `concurrency` /
+  `adaptive_concurrency` gates reject a negative `full_backoff` (which
+  would put `next_eligible_at` in the past and re-evaluate every tick).
+  `nil` still defers to config.
+- The policy-wide drain passes its remaining budget to each partition so
+  the total can't overshoot the 10,000 cap by nearly 2×, and a drain that
+  only leaves future-scheduled jobs now says "N scheduled for later
+  remain" instead of looping "click drain again" forever.
+- `partitions#show` lists recent staged jobs in the real admission order
+  (`priority DESC, scheduled_at NULLS FIRST, id`) and drops a dead,
+  mis-scoped `@inflight` query.
+
+### Internal
+- Corrected the `bulk_record_partition_denies!` comment: `claim_partitions`
+  runs autocommitted, so its `FOR UPDATE SKIP LOCKED` locks don't guard the
+  end-of-tick deny flush — the one-tick-loop-per-(policy,shard) invariant
+  and the `last_checked_at` bump do.
 
 ## 0.4.3
 

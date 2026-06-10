@@ -166,6 +166,23 @@ class PolicyDSLTest < Minitest::Test
                  "nil partition_by result is coerced to empty string"
   end
 
+  # L5: 0 (and negatives) are footguns — a 0 budget/batch silently stops the
+  # whole policy. Reject them at definition time; nil stays a no-op.
+  def test_zero_or_negative_budget_and_batch_size_raise
+    assert_raises(DispatchPolicy::InvalidPolicy) do
+      DispatchPolicy::PolicyDSL.build("p") do
+        partition_by ->(_c) { "k" }
+        tick_admission_budget 0
+      end
+    end
+    assert_raises(DispatchPolicy::InvalidPolicy) do
+      DispatchPolicy::PolicyDSL.build("p") do
+        partition_by ->(_c) { "k" }
+        admission_batch_size(-5)
+      end
+    end
+  end
+
   def test_nil_budget_and_batch_size_are_noops_not_errors
     # Passing nil explicitly means "defer to config default"; it must not
     # blow up in Integer(nil), matching how fairness(half_life:) guards nil.

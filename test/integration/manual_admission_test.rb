@@ -127,6 +127,32 @@ class ManualAdmissionTest < Minitest::Test
                  "force! must create an inflight row for the admitted job"
   end
 
+  # L7: future-scheduled jobs aren't claimable now, so force!/drain leaves
+  # them staged. The controller reports them as "scheduled for later"
+  # (via StagedJob.due) instead of looping "click drain again" forever.
+  def test_force_admit_skips_future_scheduled_jobs
+    stage_one_job! # due now
+    DispatchPolicy::Repository.stage!(
+      policy_name:   "manual_test",
+      partition_key: "k",
+      queue_name:    nil,
+      job_class:     "ManualAdmissionTest::ManualJob",
+      job_data:      { "job_id" => "future-1", "job_class" => "ManualAdmissionTest::ManualJob", "arguments" => [] },
+      context:       {},
+      scheduled_at:  Time.now.utc + 3600,
+      priority:      0
+    )
+
+    forwarded = DispatchPolicy::ManualAdmission.force!(
+      policy_name: "manual_test", partition_key: "k", limit: 100
+    )
+
+    assert_equal 1, forwarded, "only the due job is claimable"
+    remaining = DispatchPolicy::StagedJob.for_partition("manual_test", "k")
+    assert_equal 1, remaining.count, "the future-scheduled job stays staged"
+    assert_equal 0, remaining.due.count, "and it is not due yet"
+  end
+
   def test_empty_partition_forwards_zero_without_error
     assert_equal 0, DispatchPolicy::ManualAdmission.force!(
       policy_name: "manual_test", partition_key: "k", limit: 5

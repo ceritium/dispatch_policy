@@ -58,6 +58,7 @@ module DispatchPolicy
         unless @slow_factor > 0 && @slow_factor < 1
           raise ArgumentError, "overload_decrease_factor must be in (0, 1)"
         end
+        raise ArgumentError, "full_backoff must be >= 0" if @full_backoff.negative?
       end
 
       def name

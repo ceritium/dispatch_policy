@@ -17,6 +17,10 @@ module DispatchPolicy
         super()
         @max_proc     = max.respond_to?(:call) ? max : ->(_ctx) { max }
         @full_backoff = full_backoff.to_f
+        # A negative backoff sets next_eligible_at in the past, so the
+        # partition is re-evaluated (COUNT(*)) every tick — the opposite of
+        # what full_backoff is for.
+        raise ArgumentError, "full_backoff must be >= 0" if @full_backoff.negative?
       end
 
       def name

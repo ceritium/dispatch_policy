@@ -151,6 +151,29 @@ class RepositoryIntegrationTest < Minitest::Test
                  "resuming the policy makes its partitions claimable again"
   end
 
+  # L1: stage_many! must chunk so a batch larger than PG's bind-param limit
+  # (65_535 / 8 params per row ≈ 8_191 rows) doesn't fail the whole INSERT.
+  # 2_500 rows crosses two STAGE_MANY_BATCH (1_000) boundaries cheaply.
+  def test_stage_many_chunks_large_batches
+    rows = Array.new(2_500) do |i|
+      {
+        policy_name:   "bulk",
+        partition_key: "k",
+        queue_name:    nil,
+        job_class:     "J",
+        job_data:      { "job_id" => "j#{i}", "job_class" => "J", "arguments" => [] },
+        context:       {},
+        priority:      0
+      }
+    end
+
+    inserted = DispatchPolicy::Repository.stage_many!(rows)
+
+    assert_equal 2_500, inserted
+    assert_equal 2_500, DispatchPolicy::StagedJob.where(policy_name: "bulk").count
+    assert_equal 2_500, DispatchPolicy::Partition.find_by(policy_name: "bulk", partition_key: "k").pending_count
+  end
+
   def test_claim_staged_jobs_deletes_returning_and_updates_partition
     3.times do |i|
       DispatchPolicy::Repository.stage!(
