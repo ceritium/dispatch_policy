@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.5.0
+
 ### Upgrade notes
 - **New table `dispatch_policy_policy_settings`.** Required by the
   policy-level pause fix below. New installs get it from the updated
