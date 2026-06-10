@@ -17,13 +17,23 @@ class DispatchTickLoopJob < ApplicationJob
 <% if good_job? -%>
 
   include GoodJob::ActiveJobExtensions::Concurrency
-  # enqueue_limit + perform_limit, NOT total_limit. total_limit counts the
-  # currently-RUNNING job in its enqueue check (GoodJob counts `unfinished`,
-  # and finished_at is only set after perform), so the self-re-enqueue at the
-  # bottom of perform gets aborted and the tick chain silently dies after the
-  # first run. enqueue_limit's check excludes running jobs (advisory-locked),
-  # so the successor can be enqueued; perform_limit: 1 still guarantees a
-  # single concurrent execution per key.
+  # Two valid setups depending on whether you have a cron safety net:
+  #
+  # A) enqueue_limit: 1, perform_limit: 1  (default below — no cron required)
+  #    GoodJob's enqueue check excludes the running job (advisory-locked), so
+  #    the self-re-enqueue at the end of perform always succeeds. perform_limit
+  #    ensures a single concurrent execution. Downside: if a cron also fires
+  #    while the job is running, it enqueues a second copy (enqueue_limit = 0
+  #    from the cron's perspective); that second copy then hits perform_limit
+  #    and raises ConcurrencyExceededError, creating a retry gap.
+  #
+  # B) total_limit: 1  (use this if you have a cron safety net)
+  #    total_limit counts the running job, so the cron enqueue is blocked
+  #    instead of erroring. The self-chain at the end of perform is also
+  #    blocked (silently returns successfully_enqueued? == false), but the
+  #    cron reschedules the job within seconds — no ConcurrencyExceededError,
+  #    no retry gap. The "belt and braces" log below can be removed in this
+  #    setup as a blocked self-chain is expected and harmless.
   good_job_control_concurrency_with(
     enqueue_limit: 1,
     perform_limit: 1,
