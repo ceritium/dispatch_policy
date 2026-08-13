@@ -173,4 +173,41 @@ class ManualAdmissionTest < DispatchPolicy::IntegrationTest
     assert_match(/\A[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\z/,
                  received_ids.first, "regenerated id must be a UUID")
   end
+  # M12: a forced admission bypasses the gates, so it learns nothing about
+  # capacity and must not clear a backoff one of them asked for — doing so
+  # only makes the next tick re-claim the partition, re-evaluate it and
+  # back it off again.
+  def test_force_admit_preserves_a_gate_backoff
+    stage_one_job!
+    DispatchPolicy::Repository.bulk_record_partition_denies!([{
+      policy_name:      "manual_test",
+      partition_key:    "k",
+      gate_state_patch: {},
+      retry_after:      60
+    }])
+    backoff = DispatchPolicy::Partition.first.next_eligible_at
+    refute_nil backoff
+
+    DispatchPolicy::ManualAdmission.force!(
+      policy_name: "manual_test", partition_key: "k", limit: 5
+    )
+
+    assert_in_delta backoff.to_f, DispatchPolicy::Partition.first.next_eligible_at.to_f, 0.001,
+                    "force! must not wipe the throttle's backoff"
+  end
+
+  # M12: it IS an admission, so the fairness EWMA has to see it. Without
+  # the half-life the decay clause is skipped and a partition drained from
+  # the UI still looks under-admitted to the next tick's reorder.
+  def test_force_admit_feeds_the_fairness_decay
+    3.times { stage_one_job! }
+    assert_equal 0.0, DispatchPolicy::Partition.first.decayed_admits
+
+    DispatchPolicy::ManualAdmission.force!(
+      policy_name: "manual_test", partition_key: "k", limit: 3
+    )
+
+    assert_in_delta 3.0, DispatchPolicy::Partition.first.decayed_admits, 0.01,
+                    "manual admits must count towards recent activity like any other"
+  end
 end

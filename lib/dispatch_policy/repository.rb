@@ -223,7 +223,8 @@ module DispatchPolicy
     # many partitions into a single UPDATE…FROM(VALUES…) at the end of
     # the tick.
     def claim_staged_jobs!(policy_name:, partition_key:, limit:, retry_after:,
-                           gate_state_patch: nil, half_life_seconds: nil)
+                           gate_state_patch: nil, half_life_seconds: nil,
+                           preserve_next_eligible: false)
       raise ArgumentError, "claim_staged_jobs! requires limit > 0" unless limit.positive?
 
       sql_select = <<~SQL.squish
@@ -255,7 +256,8 @@ module DispatchPolicy
         admitted:          rows.size,
         gate_state_patch:  patch,
         retry_after:       retry_after,
-        half_life_seconds: half_life_seconds
+        half_life_seconds: half_life_seconds,
+        preserve_next_eligible: preserve_next_eligible
       )
 
       rows.map { |r| normalize_staged(r) }
@@ -272,9 +274,22 @@ module DispatchPolicy
     # last update, then `admitted` is added on top. This keeps fairness
     # state atomic with the admit (no separate write, no race) and
     # leaves the partitions row's lock undisturbed.
+    # `preserve_next_eligible` leaves any existing backoff alone instead of
+    # replacing it. The Tick wants the default: it has just evaluated the
+    # gates, so what they said supersedes whatever was there. A forced
+    # admission (the UI's admit/drain) bypassed the gates entirely and has
+    # therefore learned nothing about capacity — clearing the backoff there
+    # just makes the next tick re-claim the partition, re-evaluate it and
+    # back it off again.
     def record_partition_admit!(policy_name:, partition_key:, admitted:, gate_state_patch:,
-                                retry_after:, half_life_seconds: nil)
-      next_eligible_sql, next_eligible_params = next_eligible_clause(retry_after)
+                                retry_after:, half_life_seconds: nil,
+                                preserve_next_eligible: false)
+      next_eligible_sql, next_eligible_params =
+        if preserve_next_eligible
+          ["next_eligible_at", []]
+        else
+          next_eligible_clause(retry_after)
+        end
       gate_state_json = JSON.dump(gate_state_patch || {})
 
       params = [policy_name, partition_key, admitted, gate_state_json, *next_eligible_params]
