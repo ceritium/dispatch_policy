@@ -21,7 +21,15 @@ Bench.recreate_schema!
 scripts = Dir[File.join(__dir__, "bench_*.rb")]
             .reject { |p| %w[bench_helper.rb bench_real_adapter.rb bench_limits.rb].include?(File.basename(p)) }
             .sort
-filter  = ARGV.first
+
+# FILTER is the documented knob (see the Rakefile). ARGV is only ours
+# when this file is run directly — under `rake bench:all` ARGV holds the
+# rake task name, and "bench_claim".include?("bench:all") is false for
+# every script, so reading ARGV there silently ran NOTHING and reported
+# success. That is the exact "a benchmark stopped running" failure the
+# suite exists to catch, so it must not be possible to reintroduce by
+# invocation style.
+filter = ENV["FILTER"] || (ARGV.first unless defined?(Rake))
 
 scripts.each do |path|
   name = File.basename(path, ".rb")

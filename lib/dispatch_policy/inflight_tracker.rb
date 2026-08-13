@@ -13,12 +13,84 @@ module DispatchPolicy
   module InflightTracker
     extend ActiveSupport::Concern
 
-    class_methods do
-      def dispatch_policy_inflight_tracking
+    # Gate types whose admission decision is a COUNT(*) over
+    # dispatch_policy_inflight_jobs. A policy declaring one of these needs
+    # BOTH ends of the row lifecycle — the Tick pre-inserts on admission,
+    # the around_perform below releases on completion. A policy with none
+    # of them needs neither. See Policy#inflight_tracked_gate.
+    TRACKED_GATES = %i[concurrency adaptive_concurrency].freeze
+
+    included do
+      # Opt-in for a policy WITHOUT a tracked gate: "count my jobs in the
+      # dashboard anyway". Not a marker of whether the callback below was
+      # installed — including this module IS the installation, so the two
+      # can't disagree.
+      class_attribute :dispatch_policy_force_inflight_tracking,
+                      instance_writer: false, default: false
+
+      # The callback is installed by the mere act of including this
+      # module, and `track` decides per job whether to do anything. That
+      # is the whole point: creation (Tick/ManualAdmission, from the
+      # registered policy) and release (here) must never be able to
+      # disagree about which jobs are tracked. When installation was a
+      # separate step keyed on the `dispatch_policy` macro, a class wired
+      # through `dispatch_policy_name=` got rows created and never
+      # released, and its partition wedged at `max` for an hour at a time.
+      #
+      # ActiveSupport::Concern's append_features returns early when the
+      # target already has this module as an ancestor, so the railtie's
+      # include into ActiveJob::Base and a job class's own include add
+      # exactly one callback between them — nesting two `track` wrappers
+      # would record two adaptive observations per perform and let the
+      # inner `ensure` delete the row while the outer one still runs.
+      if respond_to?(:around_perform)
         around_perform do |job, block|
           DispatchPolicy::InflightTracker.track(job, &block)
         end
       end
+    end
+
+    class_methods do
+      # Track this class's jobs even when its policy declares no
+      # concurrency-family gate — the way to get a live in-flight count on
+      # the dashboard for, say, a throttle-only policy. Policies WITH such
+      # a gate are tracked without this: they're the ones the count exists
+      # for, so `track` reads the policy rather than trusting a class-level
+      # declaration to be remembered.
+      def dispatch_policy_inflight_tracking
+        self.dispatch_policy_force_inflight_tracking = true
+      end
+    end
+
+    # Creation half of the row lifecycle, called from inside the admission
+    # transaction by Tick and ManualAdmission. It lives next to the release
+    # half deliberately: the two must agree on when a row exists, and they
+    # drifted once already (audit H3).
+    #
+    # `partition_key` is the partition's canonical key, which is also the
+    # scope the concurrency gates count against: `partition_by` is
+    # policy-level, so both gates' `inflight_partition_key` is
+    # `policy.partition_for(ctx)` — the same value the staged row was
+    # filed under. Recomputing it per row cost a deep context copy, a
+    # registry lookup behind a mutex and a user proc call, inside the
+    # admission transaction, to arrive back at the value the caller
+    # already holds.
+    def self.pre_insert_admitted!(policy_name:, policy:, partition_key:, rows:)
+      # Skip only when we KNOW the policy has no gate that reads these
+      # rows. An unregistered policy — a web process whose registry never
+      # loaded the job class — is not evidence of that, and guessing
+      # "no rows" there under-counts the gate and over-admits. A row too
+      # many is reclaimed by the sweeper; a row too few is a correctness
+      # bug.
+      return if policy && policy.inflight_tracked_gate.nil?
+
+      inflight = rows.filter_map do |row|
+        ajid = row.dig("job_data", "job_id")
+        next unless ajid
+
+        { policy_name: policy_name, partition_key: partition_key, active_job_id: ajid }
+      end
+      Repository.insert_inflight!(inflight) if inflight.any?
     end
 
     def self.track(job)
@@ -26,7 +98,15 @@ module DispatchPolicy
       return yield unless policy_name
 
       policy = DispatchPolicy.registry.fetch(policy_name)
-      return yield unless policy
+      # The job names a policy this process can't see — renamed or removed
+      # while a tick still running the old code admitted it. That tick may
+      # have pre-inserted a row nothing else will ever delete, so release
+      # it: the DELETE keys on active_job_id alone and needs neither the
+      # policy nor its context. Without this the row holds a concurrency
+      # slot until the queued sweeper reclaims it an hour later.
+      return release_after(job) { yield } unless policy
+
+      return yield unless tracking?(policy, job.class)
 
       # Mirror the stage-time fallback in JobExtension.around_enqueue_for:
       # when the job carries no explicit queue, use the policy's default.
@@ -84,6 +164,33 @@ module DispatchPolicy
         rescue StandardError => e
           DispatchPolicy.config.logger&.warn("[dispatch_policy] failed to delete inflight row #{job.job_id}: #{e.class}: #{e.message}")
         end
+      end
+    end
+
+    # Whether this job's executions belong in dispatch_policy_inflight_jobs.
+    # The policy is the authority — a concurrency-family gate's admission
+    # decision is a COUNT(*) over those rows, so they are not optional —
+    # and the class-level opt-in only ADDS tracking for policies that have
+    # no such gate.
+    def self.tracking?(policy, job_class)
+      return true if policy.inflight_tracked_gate
+
+      job_class.respond_to?(:dispatch_policy_force_inflight_tracking) &&
+        job_class.dispatch_policy_force_inflight_tracking
+    end
+
+    # Runs the job, then deletes any inflight row filed under its id.
+    # Best-effort: a failure here must not turn a completed job into a
+    # failed one.
+    def self.release_after(job)
+      yield
+    ensure
+      begin
+        Repository.delete_inflight!(active_job_id: job.job_id)
+      rescue StandardError => e
+        DispatchPolicy.config.logger&.warn(
+          "[dispatch_policy] failed to release inflight row #{job.job_id}: #{e.class}: #{e.message}"
+        )
       end
     end
 

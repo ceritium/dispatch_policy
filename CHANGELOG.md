@@ -2,6 +2,98 @@
 
 ## Unreleased
 
+### Fixed
+
+- **Inflight rows are no longer created without a way to release them**
+  (audit 2026-08-13, H3). Admission pre-inserted a row in
+  `dispatch_policy_inflight_jobs` for every job it let through, while
+  the only thing that deletes those rows — `InflightTracker.track`'s
+  `around_perform` — had to be opted into per job class with
+  `dispatch_policy_inflight_tracking`. Two consequences, both silent:
+
+  - a policy with a `:concurrency` / `:adaptive_concurrency` gate whose
+    job class forgot the macro **wedged**: the gate counted rows nobody
+    removed, so the partition stopped admitting at `max` until the
+    `inflight_queued_stale_after` sweeper (1h) reclaimed them, then
+    wedged again;
+  - a policy *without* such a gate — where the README said the macro
+    wasn't needed — leaked one row per admitted job for an hour,
+    inflating the dashboard's in-flight count with finished jobs.
+
+  Both ends are now driven by the same fact, read from the registered
+  policy at runtime (`Policy#inflight_tracked_gate`):
+  `Tick`/`ManualAdmission` create rows for concurrency-family policies,
+  and `InflightTracker.track` releases them on the same condition.
+  Including `InflightTracker` is what installs the `around_perform`, and
+  `JobExtension` brings it along as a Concern dependency, so tracking
+  cannot be missing from a class that can be staged — including one
+  bound with `dispatch_policy_name = "x"` instead of the
+  `dispatch_policy` macro, which is public API and the only way to point
+  two classes at one policy.
+
+  `dispatch_policy_inflight_tracking` keeps working and now does one
+  thing: it ADDS tracking for a policy with no such gate (the live
+  in-flight count on the dashboard). It installs nothing, so forgetting
+  it can no longer wedge a partition, and declaring it twice — or
+  alongside the railtie's include — still tracks exactly once.
+
+  Two smaller asymmetries in the same lifecycle went with it: a worker
+  whose registry no longer has the policy (renamed mid-deploy) now still
+  releases the row a tick pre-inserted, and `ManualAdmission` no longer
+  skips the pre-insert just because the *web* process's registry hasn't
+  loaded that job class — it inserts unless it knows there is no tracked
+  gate, and warns.
+
+  No schema change, no action required on upgrade; existing job classes
+  keep working unchanged.
+
+- **A job class bound to a policy without the `dispatch_policy` macro is
+  now staged by both enqueue APIs** (audit review, R9). `around_enqueue`
+  was installed by the macro while `BulkEnqueue.stageable?` asked only
+  for a registered policy name, so a class bound with
+  `dispatch_policy_name = "x"` went through admission via
+  `ActiveJob.perform_all_later` and straight to the adapter via
+  `perform_later` — the same job class, with the throttle or concurrency
+  cap applying to only half of its enqueues.
+
+- **`:adaptive_concurrency` caps how far `current_max` can grow** (audit
+  2026-08-13, H5). AIMD added 1 per healthy perform without checking
+  whether the cap was the binding constraint and with no upper bound, so
+  a partition on a slow, healthy trickle climbed indefinitely: after 200
+  successful performs a gate declared with `initial_max: 2` sat at 202,
+  no longer limiting anything by the time the burst it exists for
+  arrived — and `current_max` is an integer column, so the drift ends in
+  `PG::NumericValueOutOfRange`. New `max:` option, defaulting to
+  `initial_max × 10`, applied both in the UPDATE and when the cap is read
+  (so a row written by an earlier version can't out-rank the current
+  configuration). `max` below `initial_max` raises at policy-definition
+  time. Existing policies get the default ceiling without any change; set
+  `max:` explicitly if the downstream can take more than 10×.
+
+### Changed
+
+- **`config.enabled = false` no longer stops the tick loop** (audit
+  2026-08-13, H4). It turns off *staging* — new `perform_later` calls go
+  straight to the adapter — but the loop used to exit as well, which
+  stranded everything already in `dispatch_policy_staged_jobs`: nothing
+  else hands those rows to the adapter, so the backlog was reachable
+  only through the dashboard's drain button. That is the opposite of the
+  documented purpose ("drain the staging table without taking traffic
+  offline"), which now actually works: flip the flag, watch the backlog
+  drain, then stop the tick job. **If you were using `enabled = false` as
+  a way to stop admission, it no longer does that** — stop the tick job,
+  or pause the policy from the dashboard (the pause flag is what
+  `claim_partitions` honors, and it also holds partitions created after
+  the pause).
+
+- **The dashboard's in-flight count for a policy with no
+  concurrency-family gate now reflects jobs that are actually running**,
+  and only when the job class declares `dispatch_policy_inflight_tracking`.
+  It previously counted every admission for an hour, including jobs that
+  had long since finished. For a tracked policy nothing changes: the
+  count still covers the whole admitted-to-finished window, queue wait
+  included.
+
 ## 0.5.0
 
 ### Upgrade notes

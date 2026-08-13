@@ -9,31 +9,7 @@ require_relative "../../app/models/dispatch_policy/inflight_job"
 # Their heartbeat_at never advances past admitted_at because the heartbeat
 # thread only starts once a worker begins performing. Reaping them at the
 # short cutoff would make the concurrency gate under-count and over-admit.
-class InflightSweepTest < Minitest::Test
-  def self.connect!
-    return @connected if defined?(@connected) && @connected
-
-    ActiveRecord::Base.establish_connection(
-      adapter:  "postgresql",
-      encoding: "unicode",
-      host:     ENV.fetch("DB_HOST", "localhost"),
-      username: ENV.fetch("DB_USER", ENV["USER"]),
-      password: ENV.fetch("DB_PASS", ""),
-      database: ENV.fetch("DB_NAME", "dispatch_policy_test")
-    )
-    ActiveRecord::Base.connection.execute("SELECT 1")
-    @connected = true
-  rescue StandardError => e
-    warn "[skip] Postgres not reachable: #{e.message}"
-    @connected = false
-  end
-
-  def setup
-    super
-    skip "no Postgres available" unless self.class.connect!
-    ActiveRecord::Base.connection.execute("DELETE FROM dispatch_policy_inflight_jobs")
-  end
-
+class InflightSweepTest < DispatchPolicy::IntegrationTest
   # admitted_at / heartbeat_at expressed as "seconds ago".
   def insert_row!(active_job_id, admitted_ago:, heartbeat_ago:)
     ActiveRecord::Base.connection.exec_query(

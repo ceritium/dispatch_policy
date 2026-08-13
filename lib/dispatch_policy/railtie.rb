@@ -6,6 +6,11 @@ module DispatchPolicy
   class Railtie < ::Rails::Railtie
     initializer "dispatch_policy.active_job" do
       ActiveSupport.on_load(:active_job) do
+        # Brings InflightTracker with it (JobExtension declares it as a
+        # Concern dependency), so every job class in the host app can both
+        # be staged and have its inflight row released — including classes
+        # bound to a policy through `dispatch_policy_name=` rather than the
+        # `dispatch_policy` macro.
         include DispatchPolicy::JobExtension
       end
 

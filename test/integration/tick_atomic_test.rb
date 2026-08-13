@@ -10,37 +10,14 @@ require_relative "../../app/models/dispatch_policy/tick_sample"
 # Verifies the atomic admission contract: when Forwarder.dispatch raises
 # from inside Tick's transaction, the entire admission is rolled back —
 # staged_jobs return, inflight rows disappear, partition counters revert.
-class TickAtomicAdmissionTest < Minitest::Test
+class TickAtomicAdmissionTest < DispatchPolicy::IntegrationTest
   class TestTickJob < ActiveJob::Base
     include DispatchPolicy::JobExtension
-    around_enqueue do |job, blk|
-      DispatchPolicy::JobExtension.around_enqueue_for(job, blk)
-    end
     def perform(*); end
-  end
-
-  def self.connect!
-    return @connected if defined?(@connected) && @connected
-
-    ActiveRecord::Base.establish_connection(
-      adapter:  "postgresql",
-      encoding: "unicode",
-      host:     ENV.fetch("DB_HOST", "localhost"),
-      username: ENV.fetch("DB_USER", ENV["USER"]),
-      password: ENV.fetch("DB_PASS", ""),
-      database: ENV.fetch("DB_NAME", "dispatch_policy_test")
-    )
-    ActiveRecord::Base.connection.execute("SELECT 1")
-    @connected = true
-  rescue StandardError => e
-    warn "[skip] Postgres not reachable: #{e.message}"
-    @connected = false
   end
 
   def setup
     super
-    skip "no Postgres available" unless self.class.connect!
-    truncate_tables!
 
     # Install BulkEnqueue patch (railtie installs it in real apps; in this
     # integration test we mirror that so Forwarder's bulk handoff path
@@ -54,6 +31,11 @@ class TickAtomicAdmissionTest < Minitest::Test
       context ->(_args) { {} }
       partition_by ->(_c) { "k" }
       gate :throttle, rate: 100, per: 60
+      # The concurrency gate is what makes the Tick pre-insert inflight
+      # rows at all (H3): they exist to be counted by a concurrency-family
+      # gate and are released by InflightTracker.track. Drop it and the
+      # inflight assertions below silently pass on an empty table.
+      gate :concurrency, max: 100
     end
     DispatchPolicy.registry.register(policy)
     TestTickJob.dispatch_policy_name = "atomic_test"
@@ -64,13 +46,6 @@ class TickAtomicAdmissionTest < Minitest::Test
   def teardown
     DispatchPolicy.reset_registry!
     Object.send(:remove_const, :AtomicTestJob) if Object.const_defined?(:AtomicTestJob)
-  end
-
-  def truncate_tables!
-    ActiveRecord::Base.connection.execute(
-      "TRUNCATE dispatch_policy_staged_jobs, dispatch_policy_partitions, " \
-      "dispatch_policy_inflight_jobs, dispatch_policy_tick_samples RESTART IDENTITY"
-    )
   end
 
   def stage_one_job!

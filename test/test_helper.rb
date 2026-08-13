@@ -14,24 +14,107 @@ ActiveJob::Base.queue_adapter = :test
 
 require_relative "../lib/dispatch_policy"
 
-# Database is only required for repository / integration tests.
-def with_test_db(&block)
-  ActiveRecord::Base.establish_connection(
-    adapter:  "postgresql",
-    encoding: "unicode",
-    host:     ENV.fetch("DB_HOST", "localhost"),
-    username: ENV.fetch("DB_USER", ENV["USER"]),
-    password: ENV.fetch("DB_PASS", ""),
-    database: ENV.fetch("DB_NAME", "dispatch_policy_test")
-  )
-  yield
-end
-
 module DispatchPolicy
   module TestHelpers
     def reset_dispatch_policy!
       DispatchPolicy.reset_config!
       DispatchPolicy.reset_registry!
+    end
+  end
+
+  # Postgres bootstrap shared by every case under test/integration.
+  #
+  # Each of those files used to carry its own copy: ten byte-identical
+  # `self.connect!` blocks, and truncate lists that had drifted apart —
+  # five files cleaned four tables, three cleaned five, none cleaned
+  # `dispatch_policy_policy_settings`. A test that leaves a paused policy
+  # behind therefore makes a LATER test's `claim_partitions` return
+  # nothing, and it fails somewhere else entirely.
+  #
+  # Worse, only three of the ten created the schema. On a fresh database
+  # whether the suite passed depended on which class Minitest's random
+  # seed happened to run first — `dropdb && createdb` + `rake test` went
+  # from green to 17 errors and back to green on a re-run, purely on
+  # ordering.
+  module PostgresTest
+    # Read from the gem so a new table can't be missed here — see
+    # Repository::ALL_TABLES.
+    TABLES = DispatchPolicy::Repository::ALL_TABLES
+
+    # Columns that must exist for the schema to count as current. Add to
+    # this when a migration adds a column, per the "Adding a table?"
+    # workflow in CLAUDE.md — that's what makes the suite rebuild a
+    # stale local database instead of failing on a missing column.
+    SCHEMA_COLUMNS = %w[total_admitted shard decayed_admits decayed_admits_at].freeze
+
+    module_function
+
+    # Memoized across the whole run rather than per class: ten classes
+    # used to open (and warn about) the same connection independently.
+    #
+    # Only SUCCESS is memoized. Caching a failure would let one transient
+    # hiccup — Postgres restarting, a momentary connection limit — skip
+    # every remaining integration test in the run, and (outside CI, where
+    # DISPATCH_POLICY_REQUIRE_DB makes it fatal) report green having
+    # exercised nothing but the unit tests. Retrying per class costs one
+    # failed connect attempt each when the database really is absent.
+    def connect!
+      return true if @connected
+
+      ActiveRecord::Base.establish_connection(
+        adapter:  "postgresql",
+        encoding: "unicode",
+        host:     ENV.fetch("DB_HOST", "localhost"),
+        username: ENV.fetch("DB_USER", ENV["USER"]),
+        password: ENV.fetch("DB_PASS", ""),
+        database: ENV.fetch("DB_NAME", "dispatch_policy_test")
+      )
+      ActiveRecord::Base.connection.execute("SELECT 1")
+      @connected = true
+    rescue StandardError => e
+      # Skipping is right for a contributor with no local Postgres, and
+      # wrong for CI: a misconfigured service container would skip every
+      # integration case and report a green build over an untested gem.
+      # DISPATCH_POLICY_REQUIRE_DB turns "no database" into a failure.
+      raise if ENV["DISPATCH_POLICY_REQUIRE_DB"] == "1"
+
+      # Warn once per run, not once per test class, while still leaving
+      # @connected unset so a later class retries.
+      unless @warned
+        warn "[skip] Postgres not reachable: #{e.message}"
+        @warned = true
+      end
+      false
+    end
+
+    def ensure_schema!
+      return if schema_present?
+
+      drop_partial_schema!
+      require_relative "../db/migrate/20260501000001_create_dispatch_policy_tables"
+      ActiveRecord::Migration.suppress_messages do
+        CreateDispatchPolicyTables.new.change
+      end
+    end
+
+    def schema_present?
+      conn = ActiveRecord::Base.connection
+      return false unless TABLES.all? { |t| conn.table_exists?(t) }
+
+      # Detect schema drift (e.g. new column added in a migration update).
+      cols = conn.columns("dispatch_policy_partitions").map(&:name)
+      SCHEMA_COLUMNS.all? { |c| cols.include?(c) }
+    end
+
+    def drop_partial_schema!
+      conn = ActiveRecord::Base.connection
+      TABLES.each { |t| conn.execute("DROP TABLE IF EXISTS #{t} CASCADE") }
+    end
+
+    def truncate_tables!
+      ActiveRecord::Base.connection.execute(
+        "TRUNCATE #{TABLES.join(', ')} RESTART IDENTITY"
+      )
     end
   end
 end
@@ -42,5 +125,20 @@ class Minitest::Test
 
   def setup
     reset_dispatch_policy!
+  end
+end
+
+module DispatchPolicy
+  # Base class for tests that need Postgres. Skips the whole case when no
+  # database is reachable, creates the schema if it's missing or stale,
+  # and hands every test a clean set of tables. Subclasses add their own
+  # policy registration after `super`.
+  class IntegrationTest < Minitest::Test
+    def setup
+      super
+      skip "no Postgres available" unless PostgresTest.connect!
+      PostgresTest.ensure_schema!
+      PostgresTest.truncate_tables!
+    end
   end
 end

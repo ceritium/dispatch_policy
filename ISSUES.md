@@ -1,4 +1,370 @@
-# Known issues — code audit 2026-06-10
+# Known issues — code audits
+
+Full-repo reviews, newest first. Each finding carries an ID its
+remediation plan refers to; IDs are unique across audits. Line numbers
+are as of the commit named in the audit heading.
+
+---
+
+# Audit 2026-08-13 — v0.5.0 (`d1eb259`)
+
+Second full-repo review, focused on admission correctness. Baseline
+before the review: 188 runs / 451 assertions green against a local
+Postgres. Everything marked **reproduced** below was verified with a
+throwaway integration test against real Postgres, not by reading alone.
+
+Verified clean (no findings): admit/dispatch atomicity and rollback,
+the pass-2 throttle double-spend guard (the in-memory `gate_state`
+mirror holds), the claim's anti-stagnation ordering, the parameter
+indexing of the decay UPDATE, and `exec_query` type casting — jsonb
+comes back as a String (hence `parse_jsonb`) while timestamps come back
+as UTC `Time`, so the `Time.parse` fallbacks in `Forwarder` and
+`InflightTracker` are dead code rather than a timezone bug. Also clean:
+the `database_role` wrapper and cursor pagination.
+
+## High
+
+> **Status:** H3, H4 and H5 fixed, each with regression tests
+> (`inflight_lifecycle_test.rb`, `master_switch_test.rb`,
+> `adaptive_concurrency_test.rb`). M10–M12 and L11–L17 are still open;
+> the plan below numbers them as phases 4–7.
+>
+> A review of the Phase 1 branch itself found that the first version of
+> the fix only closed the wedge for classes declaring their policy with
+> the `dispatch_policy` macro: creation was decided from the registered
+> policy at tick time, release from the macro call site, so a class bound
+> with `dispatch_policy_name = "x"` (public API, and the only way to
+> share one policy across classes) still got rows nothing released. See
+> **R1** below. The same review caught three stale CLAUDE.md invariants
+> the branch had invalidated — one of which instructed the reader to
+> reintroduce the leak — and three defects in the branch's own test and
+> benchmark tooling. All are fixed on the branch.
+
+### H3 — The Tick pre-inserts inflight rows that only an opt-in deletes
+
+`tick.rb:276-287` inserts one `dispatch_policy_inflight_jobs` row per
+admitted job regardless of which gates the policy declares. The only
+thing that removes it is `InflightTracker.track`'s `ensure`
+(`inflight_tracker.rb:82-86`), which exists only when the job class
+called `dispatch_policy_inflight_tracking` (`inflight_tracker.rb:17`) —
+an opt-in nothing validates. Two failure modes fall out of the
+asymmetry:
+
+**(a) Concurrency gate + a class that forgot the macro → the partition
+wedges.** Reproduced: `gate :concurrency, max: 2`, five jobs staged,
+thirteen consecutive ticks → two admitted, three never leave. The
+partition only unblocks when `inflight_queued_stale_after` (1h) reaps
+the rows, then wedges again — an effective limit of "max jobs per
+hour". No exception, no warning, nothing in the logs.
+
+**(b) No concurrency gate → one orphan row per admitted job for an
+hour.** `README.md:155` states inflight tracking is "only required if a
+concurrency gate is used", but the pre-insert happens either way. At
+1,000 admits/min that is ~60k dead rows in steady state, and the
+dashboard's "in flight" counts jobs that finished long ago.
+
+### H4 — `config.enabled = false` strands the staged backlog
+
+`tick_loop.rb:22-28` breaks out of the loop. Since `around_enqueue_for`
+(`job_extension.rb:30`) also sends new enqueues straight to the adapter,
+nothing ever looks at the rows already in `staged_jobs` again — they are
+reachable only through the UI's drain button. `config.rb:26-31`
+documents the opposite: *"Used during cutovers to drain the staging
+table without taking traffic offline"*. Reproduced: three staged rows
+survive five TickLoop iterations with `enabled = false`.
+
+### H5 — `:adaptive_concurrency` has no upper bound
+
+`repository.rb:829` applies `ELSE current_max + 1` on every healthy
+perform, with no check that the cap is the binding constraint, and the
+gate accepts no `max:` (`adaptive_concurrency.rb:32-62`). Reproduced:
+`initial_max: 2` plus 200 healthy observations → `current_max = 202`.
+A partition on a slow steady trickle drifts its cap towards the number
+of jobs it has ever run, so when the burst the gate exists for finally
+arrives it admits everything. Classic AIMD limiters (TCP, Netflix's
+concurrency-limits) always carry a ceiling and only grow while
+saturated. The `integer` column means the runaway eventually ends in
+`PG::NumericValueOutOfRange`.
+
+## Medium
+
+### M10 — Partitions holding only future-scheduled jobs are re-claimed every tick, forever
+
+`claim_partitions` selects on `pending_count > 0` (which counts
+future-scheduled rows) while `claim_staged_jobs!` filters
+`scheduled_at <= now()` (`repository.rb:216`). With zero rows claimed,
+`tick.rb:236` returns early and `record_partition_admit!` has already
+written `next_eligible_at = NULL`, so the partition is immediately
+eligible again. Reproduced with a single `set(wait: 1.day)` job: three
+ticks, three samples of `{"no_rows_claimed" => 1}`, `next_eligible_at`
+nil throughout. Each tick burns a `partition_batch_size` slot and a
+full transaction, and the denial breakdown fills with noise.
+
+### M11 — The 24h partition GC silently resets the token bucket
+
+`sweep_inactive_partitions!` (`repository.rb:854`) deletes rows with
+`pending_count = 0` after `partition_inactive_after` (24h), and the
+bucket lives in that row's `gate_state`. For any throttle whose window
+exceeds the cutoff that is a silent quota reset. Reproduced with
+`rate: 2, per: 7.days`: two admitted, 25h of simulated idleness, sweep,
+then two more admitted inside the same weekly window — four against a
+limit of two. `IDEAS.md:19-22` assumes losing the bucket is harmless;
+it is harmless only while `per < partition_inactive_after`.
+
+### M12 — `ManualAdmission.force!` wipes a live backoff and skips the fairness decay
+
+`manual_admission.rb:32-38` calls `claim_staged_jobs!` with
+`retry_after: nil` and without `half_life_seconds:`. Reproduced: a
+partition whose `next_eligible_at` was set by the throttle comes back
+with `next_eligible_at = nil` after a UI admit (the tick re-claims it,
+re-evaluates and re-backs it off — a wasted cycle), and
+`decayed_admits` stays at 1.0 after force-admitting three more jobs.
+The second half contradicts the M2 remediation note below
+("call `record_partition_admit!` so fairness decay sees manual
+admits"): it is called, but without the `half_life_seconds` that
+enables the decay clause.
+
+## Low
+
+- **L11** — `stage_many!` upserts partitions in input order
+  (`repository.rb:120`); two concurrent `perform_all_later` calls
+  touching the same partitions in opposite order can deadlock in
+  Postgres. Sorting the groups removes it.
+- **L12** — A gate raising inside `evaluate` surfaces as
+  `forward_failed` (`tick.rb:324-330`) and leaves `next_eligible_at`
+  untouched, so a broken gate is retried and logged on every tick.
+- **L13** — `forward_failures` counts partitions (`tick.rb:329`) but
+  `operator_hints.rb:92-101` and the views divide it by `jobs_admitted`
+  (jobs); the "failure %" is not a ratio.
+- **L14** — `decayed_admits_epoch` (`tick.rb:189`) calls `to_time`,
+  firing the Rails 8 deprecation on every tick.
+- **L15** — `sweep_inactive_partitions!` filters `status = 'active'`
+  (`repository.rb:859`), so a paused policy's empty partitions are
+  never collected.
+- **L16** — Setting `tick_admission_budget` silently makes
+  `admission_batch_size` irrelevant as the per-partition ceiling
+  (`tick.rb:60-66`), so a transaction can claim far more rows per
+  partition than configured. A documentation gap rather than a defect:
+  applying `min()` would cap throughput when few partitions are claimed
+  (pass-2 makes a single redistribution pass).
+- **L17** — `enqueue_after_transaction_commit` (Rails 7.2) is bypassed
+  for policy-managed jobs: the interception halts before `raw_enqueue`.
+  Harmless on a single database — staging runs in a savepoint of the
+  app's transaction, so a rollback drops it and the tick cannot see
+  uncommitted rows — but with `config.database_role` pointing at another
+  database the staged row commits independently and the job can run
+  before the app transaction commits.
+
+---
+
+# Review of the Phase 1 branch — all fixed on it
+
+A max-effort review of the H3 fix (and the tooling that shipped with it)
+before merge. Recorded because two of these are the same *shape* as the
+bug the branch set out to fix, and because the tooling defects are the
+kind that hide the next one.
+
+### R1 — The fix's two ends were still keyed on different things
+
+Creation asked the registered POLICY, at tick time
+(`Policy#inflight_tracked_gate`); release asked the CLASS, at macro time
+(the `dispatch_policy` call site installed the `around_perform`). Any
+other binding — `registry.register(policy)` +
+`Job.dispatch_policy_name = "x"`, which is public API, the only way to
+point two classes at one policy (a second macro call raises
+`PolicyAlreadyRegistered`), and the pattern several cases in this suite
+use — got rows created and never released: the original wedge, reachable
+through `ActiveJob.perform_all_later`, whose `stageable?` asks for
+nothing but a registered policy name.
+
+Fixed by making the include the installation: `InflightTracker`'s
+`included` block registers the callback, `JobExtension` declares it as a
+Concern dependency, and `track` decides per job from the registry. The
+macro survives as a flag that ADDS tracking for gate-less policies.
+
+### R2 — `track` returned before its `ensure` when the policy was unknown
+
+A worker whose registry lacks the policy (renamed or removed while an
+older tick was still admitting) stranded the row that tick had
+pre-inserted, holding a concurrency slot until the 1h sweeper. The
+DELETE keys on `active_job_id` alone, so it now runs regardless.
+
+### R3 — `ManualAdmission` read "policy not in this registry" as "no gate"
+
+The web process's registry is populated as a side effect of job classes
+loading, so under lazy loading — or a dashboard-only deployment — a
+policy the workers know perfectly well is absent there. Skipping the
+pre-insert in that case under-counts the gate and over-admits. It now
+inserts unless it knows there is no tracked gate, and warns.
+
+### R4 — Per-row recompute of a constant key, inside the admission TX
+
+The pre-insert recomputed `inflight_partition_key` for every admitted
+row: a deep context copy, a mutex-guarded registry fetch and a user proc
+call, to arrive back at the partition key the caller already held (both
+gates key on `policy.partition_for(ctx)` because `partition_by` is
+policy-level). Up to 5,000 recomputes per tick at default batch sizes,
+and the branch had just extended the cost to adaptive-only policies,
+which previously took the free path.
+
+### R5 — `rake bench:all` ran zero benchmarks and exited 0
+
+`run_all.rb` read its filter from `ARGV.first`, which under rake is the
+task name, so every script was filtered out. The CI job added in the
+same branch inherited it — a green build that benchmarked nothing, which
+is the exact failure mode that job exists to catch. `FILTER` (documented
+in the Rakefile) was dead for the same reason.
+
+### R6 — `RUNS=1` crashed every benchmark
+
+Wiring `RUNS` up made small values reachable for the first time, and the
+same commit dropped the guard covering them: one sample minus the
+discarded warmup left an empty array, and `median` then evaluated
+`nil + nil`, minutes into a run.
+
+### R7 — A failed connect disabled every remaining integration test
+
+The shared bootstrap memoized failure as readily as success, where the
+ten per-class copies it replaced memoized only success. One transient
+hiccup would skip the rest of the suite and — outside CI, where
+`DISPATCH_POLICY_REQUIRE_DB` makes it fatal — report green having run
+only the unit tests.
+
+### R9 — A class could be bound to a policy for one enqueue API but not the other
+
+Found while writing R1's regression test. `around_enqueue` was installed
+by the `dispatch_policy` macro, but `BulkEnqueue.stageable?` asks only
+for a registered policy name — so a class bound with
+`dispatch_policy_name = "x"` was admission-controlled through
+`ActiveJob.perform_all_later` and bypassed admission entirely through
+`perform_later`. One job class, two answers, decided by which API the
+caller happened to reach for; the throttle or concurrency cap silently
+does not apply to half of them.
+
+Same shape and same fix as R1: the callback is installed by
+`JobExtension`'s `included` block, and `around_enqueue_for` decides from
+the policy at enqueue time (it already returned the job to the adapter
+when there was none). Two integration cases could then drop their own
+hand-written `around_enqueue`, which is a small proof the global install
+covers what the macro used to. A `dispatch_policy_name` check now
+short-circuits ahead of the registry lookup, so jobs with no policy
+don't take the registry mutex on every enqueue.
+
+### R8 — Three CLAUDE.md invariants contradicted the new code
+
+Including "**`ManualAdmission.force!` also pre-inserts inflight rows**
+… Don't remove it", which a future session following literally would
+have used to reintroduce the leak. Also a stale "Adding a table?"
+pointer at a list the branch had deleted — with both new copies
+deferring to that workflow as their sync mechanism — and an overbroad
+"nothing touches `inflight_jobs`" claim the same file contradicts 80
+lines later.
+
+---
+
+# Remediation plan — audit 2026-08-13
+
+One branch/PR per phase, in this order. Every fix lands with a
+regression test. **No phase requires a schema change**, so there are no
+upgrade notes for existing installs.
+
+## Phase 1 — H3: inflight row lifecycle *(done — see R1, the deeper version)*
+
+The root cause is that creation is unconditional while deletion is
+opt-in. Close both ends:
+
+1. `JobExtension.dispatch_policy` auto-installs the `around_perform`
+   when the policy declares a gate from
+   `InflightTracker::TRACKED_GATES` (`:concurrency`,
+   `:adaptive_concurrency`). Idempotency via a
+   `dispatch_policy_inflight_tracking_installed` class attribute that
+   the public macro checks too — otherwise a job declaring both would
+   nest `track` and record two adaptive observations per perform.
+2. The railtie includes `DispatchPolicy::InflightTracker` into
+   `ActiveJob::Base` alongside `JobExtension`, so the macro exists
+   everywhere. Hosts' explicit `include` becomes redundant, not wrong.
+3. `Tick#admit_partition` and `ManualAdmission.force!` pre-insert only
+   for policies with a tracked gate. Without one, nobody reads the
+   table and the row is pure garbage.
+4. Update the CLAUDE.md invariant ("Every admitted job creates a row in
+   `inflight_jobs`") and the README's "only required if…" note.
+
+Tests: a concurrency policy whose job never calls the macro drains
+fully; a throttle-only policy creates no inflight rows on admit;
+declaring the macro on top of the auto-install runs `track` exactly
+once.
+
+## Phase 2 — H4: the master switch stops staging, not draining *(done)*
+
+Drop the `break` in `tick_loop.rb`. Final semantics: `enabled` governs
+enqueue interception only; work already staged keeps draining. Stopping
+admission outright already has two better mechanisms — stop the
+`DispatchTickLoopJob`, or pause the policy from the UI (which
+`claim_partitions` honors). Fix the `config.rb` comment, document
+`enabled` in the README (it appears only in a CHANGELOG line today) and
+flag the behavior change in the CHANGELOG.
+
+## Phase 3 — H5: ceiling for `:adaptive_concurrency` *(done)*
+
+1. New `max:` option, defaulting to `initial_max * 10`; validate
+   `max >= initial_max`.
+2. `repository.rb`: wrap the CASE in
+   `LEAST($max, GREATEST($min, …))`.
+3. Clamp on read in `evaluate` as well, for rows written before the
+   change.
+
+The refinement "only grow while `in_flight >= current_max * 0.8`" needs
+the live in-flight count at observation time; record it in `IDEAS.md`
+rather than widening this PR.
+
+## Phase 4 — M10: back off to the next `scheduled_at`
+
+New `Repository.defer_partition_to_next_scheduled!` issuing a single
+`UPDATE … SET next_eligible_at = (SELECT MIN(scheduled_at) … WHERE
+scheduled_at > now()) WHERE … AND next_eligible_at IS NULL`, called
+from the `rows.empty?` branch inside the same transaction. The
+`IS NULL` guard keeps it from stomping a backoff a gate just set; a
+NULL subquery result (another tick took the rows) correctly leaves the
+partition immediately eligible. Uses `idx_dp_staged_admission` and only
+runs when the claim came back empty.
+
+## Phase 5 — M11: the GC must not drop a bucket that is still spending
+
+A partition may only be deleted once its bucket would have refilled,
+i.e. `last_admit_at + per` — which is exactly what a per-policy cutoff
+expresses, since the sweep already keys on `last_admit_at`.
+
+1. `Gates::Throttle` exposes `static_per` (nil when `per` is a proc).
+2. `sweep_inactive_partitions!` accepts `policy_name:` /
+   `except_policies:`.
+3. `TickLoop.sweep!` walks the registry using
+   `max(partition_inactive_after, static_per)` per policy, plus one
+   catch-all pass for unregistered policy names. N+1 DELETEs every 50
+   ticks, N = number of policies.
+4. A dynamic `per` cannot be bounded: keep the default cutoff and warn
+   once at boot. Correct the claim in `IDEAS.md:19-22`.
+
+## Phase 6 — M12: manual admission
+
+Add `preserve_next_eligible:` to `record_partition_admit!` /
+`claim_staged_jobs!` (when true the SET becomes
+`next_eligible_at = next_eligible_at`; the Tick keeps clearing it,
+which is right after a successful admit), and have
+`ManualAdmission.force!` pass it along with the policy's
+`half_life_seconds`.
+
+## Phase 7 — L11–L15 cleanup, one PR
+
+Sort the groups in `stage_many!`; give the `admit_partition` rescue a
+short `config.forward_failure_backoff` (default 5s) pushed through
+`pending_denies`; feed `partitions_admitted` to `OperatorHints` so the
+failure ratio compares like with like; drop the `to_time` call in
+`decayed_admits_epoch`; drop `status = 'active'` from the partition
+sweep. L16 and L17 are documentation only (README).
+
+---
+
+# Audit 2026-06-10 — all fixed, shipped in 0.5.0
 
 Findings from a full-repo review (admission core, enqueue/tracking path,
 gates/policy DSL, dashboard/engine). Each issue has an ID used by the
@@ -220,7 +586,7 @@ raise a 500"; the implementation doesn't deliver that for timestamps.
 
 ---
 
-# Remediation plan (high + medium)
+# Remediation plan — audit 2026-06-10 (high + medium)
 
 One branch/PR per phase, in this order. Every fix lands with a
 regression test (unit where possible, integration under

@@ -17,7 +17,7 @@ require_relative "../../app/models/dispatch_policy/adaptive_concurrency_stats"
 # Tables, locks, code paths are all distinct — the only contract is
 # that the per-partition admit_count comes out as
 # `min(fair_share, current_max - in_flight)`.
-class AdaptiveWithFairnessIntegrationTest < Minitest::Test
+class AdaptiveWithFairnessIntegrationTest < DispatchPolicy::IntegrationTest
   POLICY = "adaptive_fair_test"
 
   # Concrete job class so Forwarder.dispatch can deserialize the staged
@@ -27,28 +27,8 @@ class AdaptiveWithFairnessIntegrationTest < Minitest::Test
     def perform(*); end
   end
 
-  def self.connect!
-    return @connected if defined?(@connected) && @connected
-
-    ActiveRecord::Base.establish_connection(
-      adapter:  "postgresql",
-      encoding: "unicode",
-      host:     ENV.fetch("DB_HOST", "localhost"),
-      username: ENV.fetch("DB_USER", ENV["USER"]),
-      password: ENV.fetch("DB_PASS", ""),
-      database: ENV.fetch("DB_NAME", "dispatch_policy_test")
-    )
-    ActiveRecord::Base.connection.execute("SELECT 1")
-    @connected = true
-  rescue StandardError => e
-    warn "[skip] Postgres not reachable: #{e.message}"
-    @connected = false
-  end
-
   def setup
     super
-    skip "no Postgres available" unless self.class.connect!
-    truncate_tables!
 
     DispatchPolicy.reset_registry!
     policy = DispatchPolicy::PolicyDSL.build(POLICY) do
@@ -59,14 +39,6 @@ class AdaptiveWithFairnessIntegrationTest < Minitest::Test
       tick_admission_budget 12
     end
     DispatchPolicy.registry.register(policy)
-  end
-
-  def truncate_tables!
-    ActiveRecord::Base.connection.execute(
-      "TRUNCATE dispatch_policy_staged_jobs, dispatch_policy_partitions, " \
-      "dispatch_policy_inflight_jobs, dispatch_policy_tick_samples, " \
-      "dispatch_policy_adaptive_concurrency_stats RESTART IDENTITY"
-    )
   end
 
   def stage_n!(tenant, n)

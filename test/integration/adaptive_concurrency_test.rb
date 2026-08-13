@@ -12,53 +12,8 @@ require_relative "../../app/models/dispatch_policy/adaptive_concurrency_stats"
 # Repository so they stay DB-less; here we run the SQL itself and
 # pin its arithmetic across all four code branches (seed, +1 grow,
 # slow-shrink, fail-shrink).
-class AdaptiveConcurrencyIntegrationTest < Minitest::Test
+class AdaptiveConcurrencyIntegrationTest < DispatchPolicy::IntegrationTest
   POLICY = "adaptive_test"
-
-  def self.connect!
-    return @connected if defined?(@connected) && @connected
-
-    ActiveRecord::Base.establish_connection(
-      adapter:  "postgresql",
-      encoding: "unicode",
-      host:     ENV.fetch("DB_HOST", "localhost"),
-      username: ENV.fetch("DB_USER", ENV["USER"]),
-      password: ENV.fetch("DB_PASS", ""),
-      database: ENV.fetch("DB_NAME", "dispatch_policy_test")
-    )
-    ActiveRecord::Base.connection.execute("SELECT 1")
-    @connected = true
-  rescue StandardError => e
-    warn "[skip] Postgres not reachable: #{e.message}"
-    @connected = false
-  end
-
-  def setup
-    super
-    skip "no Postgres available" unless self.class.connect!
-    ensure_schema!
-    truncate_tables!
-  end
-
-  def ensure_schema!
-    cols_present = ActiveRecord::Base.connection.table_exists?("dispatch_policy_adaptive_concurrency_stats")
-    return if cols_present
-    ActiveRecord::Base.connection.execute(
-      "DROP TABLE IF EXISTS dispatch_policy_staged_jobs, dispatch_policy_partitions, " \
-      "dispatch_policy_inflight_jobs, dispatch_policy_tick_samples, " \
-      "dispatch_policy_adaptive_concurrency_stats CASCADE"
-    )
-    require_relative "../../db/migrate/20260501000001_create_dispatch_policy_tables"
-    ActiveRecord::Migration.suppress_messages { CreateDispatchPolicyTables.new.change }
-  end
-
-  def truncate_tables!
-    ActiveRecord::Base.connection.execute(
-      "TRUNCATE dispatch_policy_staged_jobs, dispatch_policy_partitions, " \
-      "dispatch_policy_inflight_jobs, dispatch_policy_tick_samples, " \
-      "dispatch_policy_adaptive_concurrency_stats RESTART IDENTITY"
-    )
-  end
 
   def seed!(initial_max: 4)
     DispatchPolicy::Repository.adaptive_seed!(
@@ -68,8 +23,10 @@ class AdaptiveConcurrencyIntegrationTest < Minitest::Test
     )
   end
 
+  # `max` defaults high enough here that only the tests written for the
+  # ceiling see it; the growth/shrink cases are about the AIMD arithmetic.
   def record!(queue_lag_ms:, succeeded:, alpha: 0.5, target: 1000.0,
-              fail_factor: 0.5, slow_factor: 0.95, min: 1)
+              fail_factor: 0.5, slow_factor: 0.95, min: 1, max: 10_000)
     DispatchPolicy::Repository.adaptive_record!(
       policy_name:   POLICY,
       partition_key: "k",
@@ -79,7 +36,8 @@ class AdaptiveConcurrencyIntegrationTest < Minitest::Test
       target_lag_ms: target,
       fail_factor:   fail_factor,
       slow_factor:   slow_factor,
-      min:           min
+      min:           min,
+      max:           max
     )
   end
 
@@ -100,6 +58,27 @@ class AdaptiveConcurrencyIntegrationTest < Minitest::Test
   end
 
   # ----- additive grow ----------------------------------------------------
+
+  # H5: growth is +1 per healthy perform regardless of whether the cap is
+  # the binding constraint, so without a ceiling a partition on a slow,
+  # healthy trickle climbs forever: the gate stops limiting long before
+  # the integer column finally overflows. Reproduced at 200 observations
+  # from initial_max 2, which used to leave current_max at 202.
+  def test_healthy_observations_cannot_grow_the_cap_past_max
+    seed!(initial_max: 2)
+    200.times { record!(queue_lag_ms: 0, succeeded: true, max: 20) }
+
+    assert_equal 20, stats.current_max,
+                 "the ceiling must hold no matter how many healthy performs land"
+    assert_equal 200, stats.sample_count, "and observations must still be recorded"
+  end
+
+  def test_the_ceiling_does_not_interfere_below_it
+    seed!(initial_max: 4)
+    3.times { record!(queue_lag_ms: 0, succeeded: true, max: 20) }
+
+    assert_equal 7, stats.current_max, "growth below the ceiling is untouched"
+  end
 
   def test_fast_success_grows_current_max_by_one
     seed!(initial_max: 4)

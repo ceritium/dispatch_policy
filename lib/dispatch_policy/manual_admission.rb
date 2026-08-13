@@ -26,6 +26,22 @@ module DispatchPolicy
     def force!(policy_name:, partition_key:, limit:)
       return 0 unless limit.positive?
 
+      # Unlike Tick — which raises on an unknown policy — this runs in the
+      # web process, whose registry is populated as a side effect of job
+      # classes being loaded. Under lazy loading, or in a deployment that
+      # serves the dashboard without ever referencing a job class, the
+      # policy can legitimately be missing here while the workers know it
+      # perfectly well. InflightTracker.pre_insert_admitted! therefore
+      # errs toward inserting when the policy is unknown; warn so the
+      # operator learns why the UI is guessing.
+      policy = DispatchPolicy.registry.fetch(policy_name)
+      if policy.nil?
+        DispatchPolicy.config.logger&.warn(
+          "[dispatch_policy] force-admitting #{policy_name}/#{partition_key} but this process's " \
+          "registry doesn't know that policy; pre-inserting inflight rows conservatively"
+        )
+      end
+
       forwarded = 0
       Repository.with_connection do
         ActiveRecord::Base.transaction(requires_new: true) do
@@ -40,22 +56,18 @@ module DispatchPolicy
 
           rows.each { |row| row["job_data"]["job_id"] = SecureRandom.uuid }
 
-          # Pre-insert an inflight row per admitted job, exactly like
-          # Tick#admit_partition does. Without it the concurrency gate's
-          # COUNT(*) misses these jobs until each one starts performing and
-          # InflightTracker.track inserts its own row — an over-admission
-          # window proportional to how many jobs were force-admitted. The
-          # key is the canonical partition value, which for a policy-level
-          # partition_by is exactly the staged partition_key (see
-          # Concurrency#inflight_partition_key). Runs inside the same TX, so
-          # a rolled-back claim takes the inflight rows with it.
-          inflight_rows = rows.filter_map do |row|
-            ajid = row.dig("job_data", "job_id")
-            next unless ajid
-
-            { policy_name: policy_name, partition_key: partition_key, active_job_id: ajid }
-          end
-          Repository.insert_inflight!(inflight_rows) if inflight_rows.any?
+          # Pre-insert an inflight row per admitted job, through the same
+          # helper the Tick uses. Without it the concurrency gate's COUNT(*)
+          # misses these jobs until each one starts performing — an
+          # over-admission window proportional to how many jobs were
+          # force-admitted. Runs inside the same TX, so a rolled-back claim
+          # takes the inflight rows with it.
+          InflightTracker.pre_insert_admitted!(
+            policy_name:   policy_name,
+            policy:        policy,
+            partition_key: partition_key,
+            rows:          rows
+          )
 
           Forwarder.dispatch(rows)
           forwarded = rows.size

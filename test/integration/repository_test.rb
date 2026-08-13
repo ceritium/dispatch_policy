@@ -7,73 +7,7 @@ require_relative "../../app/models/dispatch_policy/partition"
 require_relative "../../app/models/dispatch_policy/inflight_job"
 require_relative "../../app/models/dispatch_policy/tick_sample"
 
-class RepositoryIntegrationTest < Minitest::Test
-  def self.connect!
-    return @connected if defined?(@connected) && @connected
-
-    ActiveRecord::Base.establish_connection(
-      adapter:  "postgresql",
-      encoding: "unicode",
-      host:     ENV.fetch("DB_HOST", "localhost"),
-      username: ENV.fetch("DB_USER", ENV["USER"]),
-      password: ENV.fetch("DB_PASS", ""),
-      database: ENV.fetch("DB_NAME", "dispatch_policy_test")
-    )
-    ActiveRecord::Base.connection.execute("SELECT 1")
-    @connected = true
-  rescue StandardError => e
-    warn "[skip] Postgres not reachable: #{e.message}"
-    @connected = false
-  end
-
-  def setup
-    super
-    skip "no Postgres available" unless self.class.connect!
-    ensure_schema!
-    truncate_tables!
-  end
-
-  def ensure_schema!
-    return if schema_present?
-
-    drop_partial_schema!
-    require_relative "../../db/migrate/20260501000001_create_dispatch_policy_tables"
-    ActiveRecord::Migration.suppress_messages do
-      CreateDispatchPolicyTables.new.change
-    end
-  end
-
-  TABLES = %w[
-    dispatch_policy_staged_jobs
-    dispatch_policy_partitions
-    dispatch_policy_inflight_jobs
-    dispatch_policy_tick_samples
-    dispatch_policy_adaptive_concurrency_stats
-    dispatch_policy_policy_settings
-  ].freeze
-
-  def schema_present?
-    conn = ActiveRecord::Base.connection
-    return false unless TABLES.all? { |t| conn.table_exists?(t) }
-
-    # Detect schema drift (e.g. new column added in a migration update).
-    cols = conn.columns("dispatch_policy_partitions").map(&:name)
-    return false unless %w[total_admitted shard decayed_admits decayed_admits_at].all? { |c| cols.include?(c) }
-
-    true
-  end
-
-  def drop_partial_schema!
-    conn = ActiveRecord::Base.connection
-    TABLES.each { |t| conn.execute("DROP TABLE IF EXISTS #{t} CASCADE") }
-  end
-
-  def truncate_tables!
-    ActiveRecord::Base.connection.execute(
-      "TRUNCATE #{TABLES.join(", ")} RESTART IDENTITY"
-    )
-  end
-
+class RepositoryIntegrationTest < DispatchPolicy::IntegrationTest
   def test_stage_creates_staged_and_partition_rows
     DispatchPolicy::Repository.stage!(
       policy_name:   "p1",

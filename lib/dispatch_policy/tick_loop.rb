@@ -19,14 +19,18 @@ module DispatchPolicy
       loop do
         break if stop_when.call
 
-        unless DispatchPolicy.config.enabled
-          # Master switch off: stop polling. The job that drives
-          # TickLoop.run will re-schedule itself; we exit cleanly so
-          # the next iteration sees the flag and stops too.
-          logger&.info("[dispatch_policy] TickLoop exiting because config.enabled = false")
-          break
-        end
-
+        # NOTE: `config.enabled` is deliberately not consulted here. It
+        # governs the ENQUEUE side — whether new perform_later calls are
+        # intercepted — and turning it off is how you stop taking new
+        # traffic into staging during a cutover. Work already staged still
+        # has to come out: the tick is the only thing that admits it, and
+        # with staging disabled nothing else will ever put those rows back
+        # into the adapter. Breaking out of this loop stranded the backlog
+        # where only the dashboard's drain button could reach it, which is
+        # the opposite of the "drain the staging table without taking
+        # traffic offline" the option exists for. To actually stop
+        # admitting, stop the tick job or pause the policy from the UI
+        # (which claim_partitions honors).
         names = policy_names(policy_name)
         if names.empty?
           pause(config.idle_pause)

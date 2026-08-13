@@ -19,38 +19,14 @@ require_relative "../../app/models/dispatch_policy/tick_sample"
 #      redistributed in the same tick.
 #   4. The decay update is atomic with the admit (no partial state on
 #      crash) and survives the per-partition transaction.
-class FairnessIntegrationTest < Minitest::Test
+class FairnessIntegrationTest < DispatchPolicy::IntegrationTest
   class TestFairJob < ActiveJob::Base
     include DispatchPolicy::JobExtension
-    around_enqueue do |job, blk|
-      DispatchPolicy::JobExtension.around_enqueue_for(job, blk)
-    end
     def perform(*); end
-  end
-
-  def self.connect!
-    return @connected if defined?(@connected) && @connected
-
-    ActiveRecord::Base.establish_connection(
-      adapter:  "postgresql",
-      encoding: "unicode",
-      host:     ENV.fetch("DB_HOST", "localhost"),
-      username: ENV.fetch("DB_USER", ENV["USER"]),
-      password: ENV.fetch("DB_PASS", ""),
-      database: ENV.fetch("DB_NAME", "dispatch_policy_test")
-    )
-    ActiveRecord::Base.connection.execute("SELECT 1")
-    @connected = true
-  rescue StandardError => e
-    warn "[skip] Postgres not reachable: #{e.message}"
-    @connected = false
   end
 
   def setup
     super
-    skip "no Postgres available" unless self.class.connect!
-    ensure_schema!
-    truncate_tables!
 
     DispatchPolicy.reset_registry!
     policy = DispatchPolicy::PolicyDSL.build("fair_test") do
@@ -62,27 +38,6 @@ class FairnessIntegrationTest < Minitest::Test
     end
     DispatchPolicy.registry.register(policy)
     TestFairJob.dispatch_policy_name = "fair_test"
-  end
-
-  def truncate_tables!
-    ActiveRecord::Base.connection.execute(
-      "TRUNCATE dispatch_policy_staged_jobs, dispatch_policy_partitions, " \
-      "dispatch_policy_inflight_jobs, dispatch_policy_tick_samples RESTART IDENTITY"
-    )
-  end
-
-  def ensure_schema!
-    cols = ActiveRecord::Base.connection.columns("dispatch_policy_partitions").map(&:name)
-    return if (cols & %w[decayed_admits decayed_admits_at]).size == 2
-    # Drop and reload via the migration to align with new fairness columns.
-    ActiveRecord::Base.connection.execute(
-      "DROP TABLE IF EXISTS dispatch_policy_staged_jobs, dispatch_policy_partitions, " \
-      "dispatch_policy_inflight_jobs, dispatch_policy_tick_samples CASCADE"
-    )
-    require_relative "../../db/migrate/20260501000001_create_dispatch_policy_tables"
-    ActiveRecord::Migration.suppress_messages do
-      CreateDispatchPolicyTables.new.change
-    end
   end
 
   def stage_n!(partition_key, n)

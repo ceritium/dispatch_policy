@@ -269,22 +269,15 @@ module DispatchPolicy
           end
 
           # Pre-insert an inflight row per admitted job so the concurrency
-          # gate sees them immediately. With a concurrency gate, use its
-          # (coarser) partition key so the gate's COUNT(*) keeps aggregating
-          # correctly across staged sub-partitions.
-          concurrency_gate = @policy.gates.find { |g| g.name == :concurrency }
-          inflight_rows = rows.filter_map do |row|
-            ajid = row.dig("job_data", "job_id")
-            next unless ajid
-
-            key = if concurrency_gate
-              concurrency_gate.inflight_partition_key(@policy_name, Context.wrap(row["context"]))
-            else
-              row["partition_key"]
-            end
-            { policy_name: @policy_name, partition_key: key, active_job_id: ajid }
-          end
-          Repository.insert_inflight!(inflight_rows) if inflight_rows.any?
+          # gate counts them immediately, rather than only once a worker
+          # picks each one up. InflightTracker owns the rule — it also owns
+          # the release side, and the two must not drift.
+          InflightTracker.pre_insert_admitted!(
+            policy_name:   @policy_name,
+            policy:        @policy,
+            partition_key: partition["partition_key"],
+            rows:          rows
+          )
 
           # Re-enqueue to the real adapter *inside this transaction*. The
           # adapter (good_job / solid_queue) shares ActiveRecord::Base's

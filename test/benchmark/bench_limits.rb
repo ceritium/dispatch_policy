@@ -206,6 +206,16 @@ if USE_GOOD_JOB && ActiveRecord::Base.connection.table_exists?("good_jobs")
               wall: "#{seconds}s")
     end
   end
+else
+  # Say so instead of silently printing a report that's missing two of
+  # the five scenarios this file's header advertises — a reader who
+  # doesn't know the good_job gate is here reads the output as complete.
+  Bench.section("Forwarder.dispatch / Tick.run ceilings against good_job") do |sec|
+    reason = "skipped (needs the dummy DB: BENCH_DB_NAME=dispatch_policy_dummy, " \
+             "after bin/dummy setup good_job)"
+    sec.row("dispatch batch-size ceiling", 0.0, status: reason)
+    sec.row("admission_batch_size ceiling", 0.0, status: reason)
+  end
 end
 
 # ----------------------------------------------------------------------

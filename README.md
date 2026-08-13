@@ -152,7 +152,11 @@ ActiveJob#perform_later
 
 ```ruby
 class FetchEndpointJob < ApplicationJob
-  dispatch_policy_inflight_tracking      # only required if a concurrency gate is used
+  # In-flight tracking needs no declaration: a concurrency /
+  # adaptive_concurrency policy is tracked because the gate's admission
+  # decision counts those rows. Declare it only to get a live in-flight
+  # count on the dashboard for a policy WITHOUT such a gate:
+  #   dispatch_policy_inflight_tracking
 
   dispatch_policy :endpoints do
     context ->(args) {
@@ -247,8 +251,13 @@ window. Prefer expressing low rates via a longer `per`.
 
 Caps the number of admitted-but-not-yet-completed jobs per partition.
 Counts rows in `dispatch_policy_inflight_jobs` keyed by the policy's
-canonical partition. Decremented by `InflightTracker.track`'s
-`around_perform`; reaped by a periodic sweeper if a worker crashes.
+canonical partition: admission inserts one per job, `InflightTracker.
+track`'s `around_perform` removes it when the job finishes, and a
+periodic sweeper reaps it if a worker crashes. Both ends read the
+policy, so declaring this gate is all it takes — however the job class
+is bound to the policy, and whether or not it declares anything else.
+The two are useless apart: a row nobody removes holds a slot until the
+`inflight_queued_stale_after` sweeper (1h) reclaims it.
 
 ```ruby
 gate :concurrency,
@@ -270,7 +279,8 @@ AIMD loop on a per-partition stats row in
 gate :adaptive_concurrency,
      initial_max:   3,
      target_lag_ms: 1000,   # acceptable queue wait before backoff
-     min:           1       # floor; a partition can't lock out
+     min:           1,      # floor; a partition can't lock out
+     max:           30      # ceiling; defaults to initial_max × 10
 ```
 
 - **Feedback signal**: `admitted_at → perform_start` (queue wait in
@@ -280,6 +290,12 @@ gate :adaptive_concurrency,
 - **Growth**: `current_max += 1` per fast success.
 - **Slow shrink**: `current_max *= 0.95` when EWMA lag > target.
 - **Failure shrink**: `current_max *= 0.5` when `perform` raises.
+- **Ceiling**: `current_max` never exceeds `max` (default
+  `initial_max × 10`). Growth is unconditional on success — it doesn't
+  check whether the cap is what's actually limiting you — so a partition
+  running a slow, healthy trickle would otherwise drift up for hours and
+  not be limiting anything by the time a burst arrives. Set `max` to the
+  most concurrency the downstream can take.
 - **Safety valve**: when `in_flight == 0` the gate floors `remaining`
   at `initial_max` so a partition that AIMD shrunk to `min` during
   a past burst can re-grow when it idles.
@@ -565,11 +581,26 @@ DispatchPolicy.configure do |c|
   c.tick_admission_budget      = nil     # global cap on admissions per tick; nil = none
   c.adapter_throughput_target  = nil     # jobs/sec; UI shows admit rate as % of this
   c.database_role              = nil     # AR role ALL gem DB access runs against (multi-DB)
+  c.enabled                    = true    # false = stop STAGING; see below
 end
 ```
 
 You can override `admission_batch_size`, `fairness_half_life_seconds`,
 and `tick_admission_budget` per policy via the DSL.
+
+### `enabled` — the enqueue-side master switch
+
+`enabled = false` makes `perform_later` and `perform_all_later` hand
+jobs straight to the real adapter: nothing new enters staging, and the
+gem is a no-op for new work. **The tick keeps running**, on purpose —
+whatever is already staged still has to be admitted, and with staging
+off nothing else will ever put those rows into the adapter. That's what
+makes the flag usable for a cutover: flip it, watch the backlog drain,
+then stop the tick job.
+
+It is not a way to stop admission. For that, stop the tick job, or pause
+the policy from the dashboard — the pause flag is what `claim_partitions`
+consults, and it holds partitions that first appear after the pause too.
 
 ## `partitions.context` is refreshed on every enqueue
 
