@@ -54,10 +54,30 @@ class InflightLifecycleTest < DispatchPolicy::IntegrationTest
     def perform(*); end
   end
 
+  # Bound to a policy WITHOUT the `dispatch_policy` macro — the class only
+  # names one. This is public API (dispatch_policy_name is a public
+  # class_attribute), it is the only way to point two classes at one
+  # policy since a second macro call raises PolicyAlreadyRegistered, and
+  # it is what several of this suite's own cases do. Admission keys off
+  # the POLICY, so if release keyed off the macro instead, these jobs
+  # would be admitted, counted, and never released.
+  class NoMacroJob < ActiveJob::Base
+    include DispatchPolicy::JobExtension
+
+    SHARED_POLICY = DispatchPolicy::PolicyDSL.build("inflight_lifecycle_no_macro") do
+      context ->(_args) { {} }
+      partition_by ->(_c) { "k" }
+      gate :concurrency, max: 2, full_backoff: 0
+    end
+
+    self.dispatch_policy_name = "inflight_lifecycle_no_macro"
+
+    def perform(*); end
+  end
+
   # The macro BEFORE the policy block — the order the dummy app's jobs use.
   class MacroFirstJob < ActiveJob::Base
     include DispatchPolicy::JobExtension
-    include DispatchPolicy::InflightTracker
 
     dispatch_policy_inflight_tracking
 
@@ -71,7 +91,7 @@ class InflightLifecycleTest < DispatchPolicy::IntegrationTest
   end
 
   # …and AFTER it, which is the order that would nest two `track` wrappers
-  # if the macro weren't idempotent.
+  # if including the module twice installed two callbacks.
   class MacroLastJob < ActiveJob::Base
     include DispatchPolicy::JobExtension
     include DispatchPolicy::InflightTracker
@@ -87,6 +107,34 @@ class InflightLifecycleTest < DispatchPolicy::IntegrationTest
     def perform(*); end
   end
 
+  # A gate-less policy that opts in by hand: nothing needs these rows for
+  # admission, but the operator wants a live in-flight count. Records what
+  # the table looked like MID-perform, which is the only moment the row is
+  # supposed to exist.
+  class OptedInJob < ActiveJob::Base
+    include DispatchPolicy::JobExtension
+
+    dispatch_policy_inflight_tracking
+
+    POLICY = dispatch_policy("inflight_lifecycle_opt_in") do
+      context ->(_args) { {} }
+      partition_by ->(_c) { "k" }
+      gate :throttle, rate: 100, per: 60
+    end
+
+    class << self
+      attr_accessor :rows_during_perform
+    end
+
+    def perform(*)
+      self.class.rows_during_perform = DispatchPolicy::InflightJob.count
+    end
+  end
+
+  ALL_JOB_CLASSES = [
+    ForgotTheMacroJob, ThrottleOnlyJob, MacroFirstJob, MacroLastJob, OptedInJob
+  ].freeze
+
   def setup
     super
 
@@ -94,9 +142,10 @@ class InflightLifecycleTest < DispatchPolicy::IntegrationTest
     # reset_dispatch_policy! wipes the registry before every test, so put
     # them back without re-running the macro (which would stack another
     # around_enqueue callback per test).
-    [ForgotTheMacroJob, ThrottleOnlyJob, MacroFirstJob, MacroLastJob].each do |klass|
+    ALL_JOB_CLASSES.each do |klass|
       DispatchPolicy.registry.register(klass::POLICY, owner: klass.name)
     end
+    DispatchPolicy.registry.register(NoMacroJob::SHARED_POLICY, owner: NoMacroJob.name)
 
     # No heartbeat thread: these tests are about insert/delete, and a
     # thread per perform only makes them slower and flakier.
@@ -193,10 +242,71 @@ class InflightLifecycleTest < DispatchPolicy::IntegrationTest
     end
   end
 
-  def test_auto_install_marks_the_class_and_is_not_repeated
-    assert ForgotTheMacroJob.dispatch_policy_inflight_tracking_installed,
-           "a concurrency policy must install the tracking callback on its job class"
-    refute ThrottleOnlyJob.dispatch_policy_inflight_tracking_installed,
-           "a gate-less policy must not pay for tracking it doesn't need"
+  # The hole the first version of this fix left open: it installed the
+  # release callback from inside the `dispatch_policy` macro, while
+  # admission decided from the registered policy. A class that only names
+  # its policy got rows created and never released — the original wedge,
+  # through supported plumbing.
+  def test_a_class_bound_without_the_macro_still_releases_its_rows
+    # perform_all_later is the entry point that stages a macro-less class:
+    # BulkEnqueue.stageable? asks only for a registered policy name, so
+    # these jobs are admitted exactly like any other. (The single-job
+    # around_enqueue is installed by the macro, so `perform_later` alone
+    # would hand them straight to the adapter.)
+    unless ActiveJob.singleton_class.include?(DispatchPolicy::JobExtension::BulkEnqueue)
+      ActiveJob.singleton_class.prepend(DispatchPolicy::JobExtension::BulkEnqueue)
+    end
+
+    capturing_adapter_enqueues do |received|
+      ActiveJob.perform_all_later(NoMacroJob.new, NoMacroJob.new, NoMacroJob.new)
+      assert_equal 3, DispatchPolicy::StagedJob.count, "the bulk path must stage them"
+
+      DispatchPolicy::Tick.run(policy_name: "inflight_lifecycle_no_macro")
+
+      assert_equal 2, received.size, "concurrency max: 2 admits two jobs"
+      assert_equal 2, DispatchPolicy::InflightJob.count,
+                   "admission pre-inserts from the POLICY, macro or no macro"
+
+      received.each(&:perform_now)
+
+      assert_equal 0, DispatchPolicy::InflightJob.count,
+                   "performing must release the rows; if it doesn't, the partition is wedged " \
+                   "at max until the 1h sweeper — the H3 bug, reachable without the macro"
+
+      DispatchPolicy::Tick.run(policy_name: "inflight_lifecycle_no_macro")
+      assert_equal 3, received.size, "the freed slots must let the last job through"
+    end
+  end
+
+  # A gate-less policy that opts in by hand still gets tracked: the class
+  # attribute ADDS tracking, it never gates it.
+  def test_the_manual_opt_in_tracks_a_gate_less_policy
+    OptedInJob.rows_during_perform = nil
+    OptedInJob.new.perform_now
+
+    assert_equal 1, OptedInJob.rows_during_perform,
+                 "the opt-in must produce a row for the dashboard to count while the job runs"
+    assert_equal 0, DispatchPolicy::InflightJob.count,
+                 "and release it when the job finishes"
+  end
+
+  # A worker whose registry no longer has the policy (renamed or removed
+  # while an older tick was still admitting) must still release the row a
+  # tick pre-inserted, rather than leave it holding a slot for an hour.
+  def test_a_job_whose_policy_vanished_still_releases_its_row
+    job = ForgotTheMacroJob.new
+    DispatchPolicy::Repository.insert_inflight!([{
+      policy_name:   "inflight_lifecycle_conc",
+      partition_key: "k",
+      active_job_id: job.job_id
+    }])
+    assert_equal 1, DispatchPolicy::InflightJob.count
+
+    DispatchPolicy.registry.clear
+
+    job.perform_now
+
+    assert_equal 0, DispatchPolicy::InflightJob.count,
+                 "an unknown policy is no reason to strand a row keyed on active_job_id alone"
   end
 end

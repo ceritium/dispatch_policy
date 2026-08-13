@@ -8,16 +8,15 @@ module DispatchPolicy
   module JobExtension
     extend ActiveSupport::Concern
 
+    # Staging a job and releasing its inflight row are two halves of one
+    # lifecycle, so they arrive together: anything that can be admitted can
+    # also be released. ActiveSupport::Concern includes this dependency
+    # into the class first and only once, whether it arrives via the
+    # railtie (ActiveJob::Base) or a direct include in a job class.
+    include InflightTracker
+
     included do
       class_attribute :dispatch_policy_name, instance_writer: false
-      # Defined here as well as in InflightTracker (both guarded) so the
-      # flag exists on every class that can call `dispatch_policy`,
-      # whichever module lands first — the railtie includes both, while
-      # `dispatch_policy` includes InflightTracker on demand.
-      unless respond_to?(:dispatch_policy_inflight_tracking_installed)
-        class_attribute :dispatch_policy_inflight_tracking_installed,
-                        instance_writer: false, default: false
-      end
     end
 
     class_methods do
@@ -28,21 +27,6 @@ module DispatchPolicy
 
         around_enqueue do |job, block|
           DispatchPolicy::JobExtension.around_enqueue_for(job, block)
-        end
-
-        # A concurrency-family gate decides admission by counting rows in
-        # dispatch_policy_inflight_jobs. Tick pre-inserts one per admitted
-        # job and the ONLY thing that removes it is InflightTracker.track's
-        # ensure — so a job class that forgets the opt-in macro doesn't just
-        # lose a metric: the partition wedges at `max` until the stale
-        # sweeper (inflight_queued_stale_after, 1h) reaps the rows, then
-        # wedges again. Install the callback here rather than trusting the
-        # host to remember. Idempotent, so a class that also declares it by
-        # hand still tracks exactly once. The `include` is a no-op when the
-        # railtie already put the module on ActiveJob::Base.
-        if policy.inflight_tracked_gate
-          include DispatchPolicy::InflightTracker
-          dispatch_policy_inflight_tracking
         end
 
         policy
