@@ -1,0 +1,117 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  # The benchmarks are opt-in: they seed 100k partitions and take minutes,
+  # which is not what you want on every push. Run them from the Actions tab
+  # when a change could plausibly move admission cost.
+  workflow_dispatch:
+    inputs:
+      run_benchmarks:
+        description: "Also run the benchmark suite"
+        type: boolean
+        default: false
+
+jobs:
+  test:
+    # The matrix is not decoration — both axes protect a claim the code
+    # makes about itself:
+    #   ruby 3.1  → gemspec's required_ruby_version floor
+    #   pg 13     → repository.rb avoids date_bin specifically so the gem
+    #               runs on Postgres 12/13; nothing checked that until now
+    name: "ruby ${{ matrix.ruby }} / postgres ${{ matrix.postgres }}"
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - ruby: "3.1"
+            postgres: "13"
+          - ruby: "3.3"
+            postgres: "16"
+
+    services:
+      postgres:
+        image: postgres:${{ matrix.postgres }}
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: dispatch_policy_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      DB_HOST: localhost
+      DB_USER: postgres
+      DB_PASS: postgres
+      DB_NAME: dispatch_policy_test
+      # No database must never look like a passing build.
+      DISPATCH_POLICY_REQUIRE_DB: "1"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: ${{ matrix.ruby }}
+          bundler-cache: true
+
+      # A fresh database every run is the point: the integration cases
+      # create their own schema (see DispatchPolicy::IntegrationTest), and
+      # until that was true the suite only passed because a previous local
+      # run had left the tables behind.
+      - name: Run tests
+        run: bundle exec rake test
+
+  benchmarks:
+    name: "benchmarks (manual)"
+    if: github.event_name == 'workflow_dispatch' && inputs.run_benchmarks
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: dispatch_policy_bench
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      DB_HOST: localhost
+      DB_USER: postgres
+      DB_PASS: postgres
+      DB_NAME: dispatch_policy_bench
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.3"
+          bundler-cache: true
+
+      # Shared CI runners are noisy neighbours, so treat the absolute
+      # numbers as indicative and compare runs on the same runner class.
+      # The value here is catching a benchmark that stops RUNNING — which
+      # is exactly what went unnoticed while `rake bench:all` was broken.
+      - name: Run benchmarks
+        run: bundle exec rake bench:all
+
+      - name: Publish report
+        if: always()
+        run: echo "See the 'Run benchmarks' step output for the Markdown report."

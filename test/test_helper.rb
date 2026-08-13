@@ -70,6 +70,12 @@ module DispatchPolicy
       ActiveRecord::Base.connection.execute("SELECT 1")
       @connected = true
     rescue StandardError => e
+      # Skipping is right for a contributor with no local Postgres, and
+      # wrong for CI: a misconfigured service container would skip every
+      # integration case and report a green build over an untested gem.
+      # DISPATCH_POLICY_REQUIRE_DB turns "no database" into a failure.
+      raise if ENV["DISPATCH_POLICY_REQUIRE_DB"] == "1"
+
       warn "[skip] Postgres not reachable: #{e.message}"
       @connected = false
     end
