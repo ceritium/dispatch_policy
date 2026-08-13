@@ -7,6 +7,12 @@ module DispatchPolicy
     initializer "dispatch_policy.active_job" do
       ActiveSupport.on_load(:active_job) do
         include DispatchPolicy::JobExtension
+        # Makes `dispatch_policy_inflight_tracking` available on every job
+        # class. `dispatch_policy` installs the callback itself for
+        # concurrency-family policies; declaring the macro by hand stays
+        # supported for policies that want an in-flight count without
+        # such a gate.
+        include DispatchPolicy::InflightTracker
       end
 
       ActiveSupport.on_load(:active_job) do

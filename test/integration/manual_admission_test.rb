@@ -46,6 +46,10 @@ class ManualAdmissionTest < Minitest::Test
       context ->(_args) { {} }
       partition_by ->(_c) { "k" }
       gate :throttle, rate: 100, per: 60
+      # force! only pre-inserts inflight rows for policies with a
+      # concurrency-family gate (H3) — they're the only ones that read
+      # the table and the only ones whose jobs release the rows again.
+      gate :concurrency, max: 100
     end
     DispatchPolicy.registry.register(policy)
     ManualJob.dispatch_policy_name = "manual_test"

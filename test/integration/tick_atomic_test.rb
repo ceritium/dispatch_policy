@@ -54,6 +54,11 @@ class TickAtomicAdmissionTest < Minitest::Test
       context ->(_args) { {} }
       partition_by ->(_c) { "k" }
       gate :throttle, rate: 100, per: 60
+      # The concurrency gate is what makes the Tick pre-insert inflight
+      # rows at all (H3): they exist to be counted by a concurrency-family
+      # gate and are released by InflightTracker.track. Drop it and the
+      # inflight assertions below silently pass on an empty table.
+      gate :concurrency, max: 100
     end
     DispatchPolicy.registry.register(policy)
     TestTickJob.dispatch_policy_name = "atomic_test"

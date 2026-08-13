@@ -2,6 +2,35 @@
 
 ## Unreleased
 
+### Fixed
+
+- **Inflight rows are no longer created without a way to release them**
+  (audit 2026-08-13, H3). Admission pre-inserted a row in
+  `dispatch_policy_inflight_jobs` for every job it let through, while
+  the only thing that deletes those rows — `InflightTracker.track`'s
+  `around_perform` — had to be opted into per job class with
+  `dispatch_policy_inflight_tracking`. Two consequences, both silent:
+
+  - a policy with a `:concurrency` / `:adaptive_concurrency` gate whose
+    job class forgot the macro **wedged**: the gate counted rows nobody
+    removed, so the partition stopped admitting at `max` until the
+    `inflight_queued_stale_after` sweeper (1h) reclaimed them, then
+    wedged again;
+  - a policy *without* such a gate — where the README said the macro
+    wasn't needed — leaked one row per admitted job for an hour,
+    inflating the dashboard's in-flight count with finished jobs.
+
+  Both ends are now driven by the same condition
+  (`Policy#inflight_tracked_gate`): `dispatch_policy` installs the
+  tracking callback when the policy declares a concurrency-family gate,
+  and `Tick`/`ManualAdmission` pre-insert only for those policies.
+  Declaring `dispatch_policy_inflight_tracking` by hand still works, is
+  now idempotent (two nested wrappers used to record two adaptive
+  observations per perform), and remains the way to get a live
+  in-flight count for a policy without such a gate. No schema change,
+  no action required on upgrade; existing job classes that declare the
+  macro keep working unchanged.
+
 ## 0.5.0
 
 ### Upgrade notes

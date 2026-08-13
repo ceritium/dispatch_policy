@@ -269,22 +269,29 @@ module DispatchPolicy
           end
 
           # Pre-insert an inflight row per admitted job so the concurrency
-          # gate sees them immediately. With a concurrency gate, use its
-          # (coarser) partition key so the gate's COUNT(*) keeps aggregating
+          # gate sees them immediately, keyed by the gate's own
+          # inflight_partition_key so its COUNT(*) keeps aggregating
           # correctly across staged sub-partitions.
-          concurrency_gate = @policy.gates.find { |g| g.name == :concurrency }
-          inflight_rows = rows.filter_map do |row|
-            ajid = row.dig("job_data", "job_id")
-            next unless ajid
+          #
+          # Only for policies that declare a concurrency-family gate: no
+          # other code reads this table, and the row is released by
+          # InflightTracker.track's ensure, which `dispatch_policy`
+          # installs for exactly those policies. Writing rows for a policy
+          # without such a gate leaves one orphan per admitted job until
+          # the inflight_queued_stale_after sweeper (1h) reaps it, which
+          # also makes the dashboard's in-flight count report jobs that
+          # finished long ago.
+          tracked_gate = @policy.inflight_tracked_gate
+          if tracked_gate
+            inflight_rows = rows.filter_map do |row|
+              ajid = row.dig("job_data", "job_id")
+              next unless ajid
 
-            key = if concurrency_gate
-              concurrency_gate.inflight_partition_key(@policy_name, Context.wrap(row["context"]))
-            else
-              row["partition_key"]
+              key = tracked_gate.inflight_partition_key(@policy_name, Context.wrap(row["context"]))
+              { policy_name: @policy_name, partition_key: key, active_job_id: ajid }
             end
-            { policy_name: @policy_name, partition_key: key, active_job_id: ajid }
+            Repository.insert_inflight!(inflight_rows) if inflight_rows.any?
           end
-          Repository.insert_inflight!(inflight_rows) if inflight_rows.any?
 
           # Re-enqueue to the real adapter *inside this transaction*. The
           # adapter (good_job / solid_queue) shares ActiveRecord::Base's

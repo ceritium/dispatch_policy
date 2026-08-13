@@ -52,6 +52,19 @@ module DispatchPolicy
       value.nil? ? "" : value.to_s
     end
 
+    # The gate whose admission decision is a COUNT(*) over
+    # dispatch_policy_inflight_jobs, or nil when the policy declares
+    # none. Two things hang off it: the Tick only pre-inserts inflight
+    # rows for policies that have one (nobody else reads the table), and
+    # JobExtension.dispatch_policy installs the around_perform that
+    # releases those rows for exactly those policies. A policy may
+    # declare both :concurrency and :adaptive_concurrency; either one
+    # keys the row the same way, since inflight_partition_key is
+    # policy.partition_for(ctx) in both.
+    def inflight_tracked_gate
+      @gates.find { |g| InflightTracker::TRACKED_GATES.include?(g.name) }
+    end
+
     # The shard a partition belongs to. Stable per (policy, partition_key)
     # via first-writer-wins in Repository.upsert_partition!. If no shard_by
     # is declared the partition lives on the "default" shard.

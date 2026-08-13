@@ -24,6 +24,11 @@ the `database_role` wrapper and cursor pagination.
 
 ## High
 
+> **Status:** H3 fixed (Phase 1) — regression test in
+> `test/integration/inflight_lifecycle_test.rb`, which fails on the
+> pre-fix code with the wedge, the orphan row and the missing
+> auto-install. H4, H5 and everything below are still open.
+
 ### H3 — The Tick pre-inserts inflight rows that only an opt-in deletes
 
 `tick.rb:276-287` inserts one `dispatch_policy_inflight_jobs` row per

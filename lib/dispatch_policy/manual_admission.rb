@@ -26,6 +26,13 @@ module DispatchPolicy
     def force!(policy_name:, partition_key:, limit:)
       return 0 unless limit.positive?
 
+      # Same rule as Tick#admit_partition: only policies with a
+      # concurrency-family gate get inflight rows, because only they read
+      # the table and only they have the around_perform that releases the
+      # rows again. An unregistered policy name (a partition whose policy
+      # was removed from the code) gets none — we can't know its gates.
+      tracked_gate = DispatchPolicy.registry.fetch(policy_name)&.inflight_tracked_gate
+
       forwarded = 0
       Repository.with_connection do
         ActiveRecord::Base.transaction(requires_new: true) do
@@ -49,13 +56,15 @@ module DispatchPolicy
           # partition_by is exactly the staged partition_key (see
           # Concurrency#inflight_partition_key). Runs inside the same TX, so
           # a rolled-back claim takes the inflight rows with it.
-          inflight_rows = rows.filter_map do |row|
-            ajid = row.dig("job_data", "job_id")
-            next unless ajid
+          if tracked_gate
+            inflight_rows = rows.filter_map do |row|
+              ajid = row.dig("job_data", "job_id")
+              next unless ajid
 
-            { policy_name: policy_name, partition_key: partition_key, active_job_id: ajid }
+              { policy_name: policy_name, partition_key: partition_key, active_job_id: ajid }
+            end
+            Repository.insert_inflight!(inflight_rows) if inflight_rows.any?
           end
-          Repository.insert_inflight!(inflight_rows) if inflight_rows.any?
 
           Forwarder.dispatch(rows)
           forwarded = rows.size

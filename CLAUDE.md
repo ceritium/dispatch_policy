@@ -71,8 +71,8 @@ dispatch_policy_policy_settings               one row per policy — pause flag
   gates is valid — the pipeline returns `admit_count = max_budget`
   and the in-tick fairness reorder (decay + fair_share) still
   applies. Useful for "balance N tenants without rate-limiting any
-  of them". Without a concurrency gate the job doesn't need
-  `dispatch_policy_inflight_tracking` either.
+  of them". Without a concurrency gate nothing touches
+  `inflight_jobs` at all — no pre-insert, no `around_perform`.
 - **`partitions.context` is refreshed on every `perform_later`** via
   UPSERT. Gates read that ctx, NOT `staged_jobs.context` (which is
   historical). This lets a change in the host DB (e.g. new
@@ -139,11 +139,21 @@ dispatch_policy_policy_settings               one row per policy — pause flag
 - **Adding a table?** Update `test/integration/repository_test.rb`'s
   `TABLES` list (drift detection rebuilds the schema) AND both the
   migration and the generator template, per the workflow below.
-- **Every admitted job creates a row in `inflight_jobs`**, whether or
-  not there's a concurrency gate. The key is always
-  `policy.partition_for(ctx)` (same canonical scope as the staged
-  partition_key), since `partition_by` is policy-level. The UI counts
-  by `policy_name` and always reports a real value.
+- **`inflight_jobs` rows exist only for concurrency-family policies,
+  and creation/release are installed together.** `Policy#
+  inflight_tracked_gate` (`:concurrency` / `:adaptive_concurrency`,
+  listed in `InflightTracker::TRACKED_GATES`) decides both ends: the
+  Tick and `ManualAdmission` pre-insert a row per admitted job ONLY
+  for those policies, and `dispatch_policy` auto-installs the
+  `around_perform` that releases it on exactly the same condition.
+  They must stay in sync — unconditional creation with an opt-in
+  release is what wedged a partition at `max` for an hour when a job
+  class forgot `dispatch_policy_inflight_tracking` (H3). The key is
+  always `policy.partition_for(ctx)` (same canonical scope as the
+  staged partition_key), since `partition_by` is policy-level.
+  Declaring the macro by hand is still supported and idempotent —
+  that's how a policy WITHOUT such a gate gets a live in-flight count
+  on the dashboard.
 - **`:adaptive_concurrency` updates `current_max` in a single SQL
   statement.** The UPDATE in `Repository.adaptive_record!` uses the
   POST-update `ewma_latency_ms` value in its CASE expression — so

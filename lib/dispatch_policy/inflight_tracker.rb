@@ -13,8 +13,39 @@ module DispatchPolicy
   module InflightTracker
     extend ActiveSupport::Concern
 
+    # Gate types whose admission decision is a COUNT(*) over
+    # dispatch_policy_inflight_jobs. A policy declaring one of these needs
+    # BOTH ends of the row lifecycle — the Tick pre-inserts on admission,
+    # the around_perform below releases on completion. A policy with none
+    # of them needs neither. See Policy#inflight_tracked_gate.
+    TRACKED_GATES = %i[concurrency adaptive_concurrency].freeze
+
+    included do
+      # Guarded: JobExtension.dispatch_policy includes this module on
+      # demand and the railtie includes it into ActiveJob::Base, so the
+      # same class can be reached twice. A second class_attribute call
+      # would reset the flag to false and let the around_perform be
+      # installed a second time.
+      unless respond_to?(:dispatch_policy_inflight_tracking_installed)
+        class_attribute :dispatch_policy_inflight_tracking_installed,
+                        instance_writer: false, default: false
+      end
+    end
+
     class_methods do
+      # Installs the around_perform that keeps dispatch_policy_inflight_jobs
+      # in sync while the job runs. `dispatch_policy` calls this for you
+      # whenever the policy declares a concurrency-family gate, so most
+      # hosts never need it; declare it by hand when you want a live
+      # in-flight count on the dashboard for a policy WITHOUT such a gate.
+      #
+      # Idempotent. Two nested `track` wrappers would record two adaptive
+      # observations per perform, and the inner `ensure` would delete the
+      # inflight row while the outer wrapper is still running.
       def dispatch_policy_inflight_tracking
+        return if dispatch_policy_inflight_tracking_installed
+
+        self.dispatch_policy_inflight_tracking_installed = true
         around_perform do |job, block|
           DispatchPolicy::InflightTracker.track(job, &block)
         end
