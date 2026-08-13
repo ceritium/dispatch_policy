@@ -24,7 +24,7 @@ require_relative "../../app/models/dispatch_policy/adaptive_concurrency_stats"
 #
 # Now `dispatch_policy` installs the callback for concurrency-family
 # policies, and the Tick only pre-inserts for those same policies.
-class InflightLifecycleTest < Minitest::Test
+class InflightLifecycleTest < DispatchPolicy::IntegrationTest
   # Deliberately does NOT declare dispatch_policy_inflight_tracking: the
   # whole point is that a host that forgets it is still correct.
   class ForgotTheMacroJob < ActiveJob::Base
@@ -87,28 +87,8 @@ class InflightLifecycleTest < Minitest::Test
     def perform(*); end
   end
 
-  def self.connect!
-    return @connected if defined?(@connected) && @connected
-
-    ActiveRecord::Base.establish_connection(
-      adapter:  "postgresql",
-      encoding: "unicode",
-      host:     ENV.fetch("DB_HOST", "localhost"),
-      username: ENV.fetch("DB_USER", ENV["USER"]),
-      password: ENV.fetch("DB_PASS", ""),
-      database: ENV.fetch("DB_NAME", "dispatch_policy_test")
-    )
-    ActiveRecord::Base.connection.execute("SELECT 1")
-    @connected = true
-  rescue StandardError => e
-    warn "[skip] Postgres not reachable: #{e.message}"
-    @connected = false
-  end
-
   def setup
     super
-    skip "no Postgres available" unless self.class.connect!
-    truncate_tables!
 
     # The class bodies above registered their policies at load time;
     # reset_dispatch_policy! wipes the registry before every test, so put
@@ -125,14 +105,6 @@ class InflightLifecycleTest < Minitest::Test
 
   def teardown
     DispatchPolicy.reset_registry!
-  end
-
-  def truncate_tables!
-    ActiveRecord::Base.connection.execute(
-      "TRUNCATE dispatch_policy_staged_jobs, dispatch_policy_partitions, " \
-      "dispatch_policy_inflight_jobs, dispatch_policy_tick_samples, " \
-      "dispatch_policy_adaptive_concurrency_stats RESTART IDENTITY"
-    )
   end
 
   # Captures the job instances the adapter receives, so the test can run

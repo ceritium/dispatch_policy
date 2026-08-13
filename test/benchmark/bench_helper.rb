@@ -49,22 +49,37 @@ module Bench
     ERR
   end
 
+  # Every table the migration creates. Each bench_*.rb calls
+  # recreate_schema!, so one table left behind makes the NEXT call fail
+  # with DuplicateTable — which is how `rake bench:all` died on script
+  # two. Keep in sync with the migration: see the "Adding a table?"
+  # workflow in CLAUDE.md.
+  TABLES = %w[
+    dispatch_policy_staged_jobs
+    dispatch_policy_partitions
+    dispatch_policy_inflight_jobs
+    dispatch_policy_tick_samples
+    dispatch_policy_adaptive_concurrency_stats
+    dispatch_policy_policy_settings
+  ].freeze
+
   def recreate_schema!
     require_relative "../../db/migrate/20260501000001_create_dispatch_policy_tables"
     ActiveRecord::Base.connection.execute(
-      "DROP TABLE IF EXISTS dispatch_policy_staged_jobs, " \
-      "dispatch_policy_partitions, dispatch_policy_inflight_jobs, " \
-      "dispatch_policy_tick_samples CASCADE"
+      "DROP TABLE IF EXISTS #{TABLES.join(', ')} CASCADE"
     )
     ActiveRecord::Migration.suppress_messages do
       CreateDispatchPolicyTables.new.change
     end
   end
 
+  # Same six tables. Leaving adaptive stats or a paused policy_settings
+  # row behind silently changes what the NEXT scenario measures — a stale
+  # `paused` row makes claim_partitions return nothing, so the tick
+  # benchmarks would time an empty loop and report it as a great number.
   def truncate!
     ActiveRecord::Base.connection.execute(
-      "TRUNCATE dispatch_policy_staged_jobs, dispatch_policy_partitions, " \
-      "dispatch_policy_inflight_jobs, dispatch_policy_tick_samples RESTART IDENTITY"
+      "TRUNCATE #{TABLES.join(', ')} RESTART IDENTITY"
     )
   end
 
@@ -125,7 +140,12 @@ module Bench
     DispatchPolicy.reset_registry!
     policy = DispatchPolicy::PolicyDSL.build(policy_name) do
       context ->(_args) { {} }
-      gate :throttle, rate: 1_000_000, per: 60, partition_by: ->(_c) { "k" }
+      # partition_by is policy-level and required; the per-gate
+      # `partition_by:` these benchmarks used to pass was removed from the
+      # DSL. The value is irrelevant here — the seeded rows carry their own
+      # partition_key and the throttle's bucket lives on the partition row.
+      partition_by ->(_c) { "k" }
+      gate :throttle, rate: 1_000_000, per: 60
       admission_batch_size batch_size
       fairness half_life: half_life if half_life
       tick_admission_budget tick_cap if tick_cap
@@ -141,13 +161,37 @@ module Bench
     ((Process.clock_gettime(Process::CLOCK_MONOTONIC) - t0) * 1_000).round(2)
   end
 
+  # RUNS overrides the per-call-site default. The Rakefile advertises it
+  # ("RUNS=10 to increase samples") and print_report prints it, but until
+  # this existed nothing read it — the footer claimed a sample count the
+  # run never used. Raise it when a scenario's numbers move more between
+  # runs than the difference you're trying to measure.
+  RUNS_USED = []
+
+  def runs_for(default)
+    n = ENV["RUNS"] ? Integer(ENV["RUNS"]) : default
+    RUNS_USED << n unless RUNS_USED.include?(n)
+    n
+  end
+
+  # True median. `sorted[size / 2]` picks the upper of the two middle
+  # samples on an even count, so the default 5 runs (4 after warmup)
+  # reported the 3rd-fastest of 4 — biased high, and at 3 runs it was
+  # simply "the slower of two" under the name "median".
+  def median(samples)
+    sorted = samples.sort
+    mid    = sorted.size / 2
+    return sorted[mid] if sorted.size.odd?
+
+    ((sorted[mid - 1] + sorted[mid]) / 2.0).round(2)
+  end
+
   # Median over N runs, with the first run discarded as warmup.
   def measure_median_ms(runs: 5, &block)
+    runs    = runs_for(runs)
     samples = runs.times.map { measure_ms(&block) }
     samples.shift # warmup
-    return samples.first if samples.size == 1
-    sorted = samples.sort
-    sorted[sorted.size / 2]
+    median(samples)
   end
 
   # Same as measure_median_ms but lets the caller pass a setup proc
@@ -156,14 +200,13 @@ module Bench
   # the next iteration would otherwise measure "tick with nothing to
   # do".
   def measure_median_ms_with_setup(runs: 5, setup:, work:)
+    runs    = runs_for(runs)
     samples = runs.times.map do
       setup.call
       measure_ms { work.call }
     end
     samples.shift
-    return samples.first if samples.size == 1
-    sorted = samples.sort
-    sorted[sorted.size / 2]
+    median(samples)
   end
 
   # ---- report sections -----------------------------------------------------
@@ -197,9 +240,19 @@ module Bench
         puts "| #{cells.join(' | ')} |"
       end
     end
-    puts "\n_(median of #{ENV.fetch('RUNS', '5')} runs, first discarded as warmup)_"
+    # Report what the run actually used, not what RUNS says: call sites
+    # pass their own default (the slow scenarios use 3), so printing
+    # ENV["RUNS"] || 5 was wrong in both directions.
+    counts = RUNS_USED.sort
+    label  = case counts.size
+             when 0 then "1 run"
+             when 1 then "#{counts.first} runs"
+             else "#{counts.min}–#{counts.max} runs depending on the scenario"
+             end
+    puts "\n_(median of #{label}, first discarded as warmup; set RUNS to override)_"
     # Clear so run_all.rb can `load` the next script without double-printing
     # accumulated sections from the previous one.
     REPORT.clear
+    RUNS_USED.clear
   end
 end

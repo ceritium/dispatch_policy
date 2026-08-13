@@ -12,34 +12,14 @@ require_relative "../../app/models/dispatch_policy/tick_sample"
 # Tick: a failing Forwarder.dispatch must roll the claim back so the
 # staged rows survive, and the adapter must receive a freshly regenerated
 # active_job_id (not the staged payload's job_id).
-class ManualAdmissionTest < Minitest::Test
+class ManualAdmissionTest < DispatchPolicy::IntegrationTest
   class ManualJob < ActiveJob::Base
     include DispatchPolicy::JobExtension
     def perform(*); end
   end
 
-  def self.connect!
-    return @connected if defined?(@connected) && @connected
-
-    ActiveRecord::Base.establish_connection(
-      adapter:  "postgresql",
-      encoding: "unicode",
-      host:     ENV.fetch("DB_HOST", "localhost"),
-      username: ENV.fetch("DB_USER", ENV["USER"]),
-      password: ENV.fetch("DB_PASS", ""),
-      database: ENV.fetch("DB_NAME", "dispatch_policy_test")
-    )
-    ActiveRecord::Base.connection.execute("SELECT 1")
-    @connected = true
-  rescue StandardError => e
-    warn "[skip] Postgres not reachable: #{e.message}"
-    @connected = false
-  end
-
   def setup
     super
-    skip "no Postgres available" unless self.class.connect!
-    truncate_tables!
 
     DispatchPolicy.reset_registry!
     policy = DispatchPolicy::PolicyDSL.build("manual_test") do
@@ -57,13 +37,6 @@ class ManualAdmissionTest < Minitest::Test
 
   def teardown
     DispatchPolicy.reset_registry!
-  end
-
-  def truncate_tables!
-    ActiveRecord::Base.connection.execute(
-      "TRUNCATE dispatch_policy_staged_jobs, dispatch_policy_partitions, " \
-      "dispatch_policy_inflight_jobs, dispatch_policy_tick_samples RESTART IDENTITY"
-    )
   end
 
   def stage_one_job!

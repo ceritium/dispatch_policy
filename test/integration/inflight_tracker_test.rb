@@ -4,31 +4,7 @@ require_relative "../test_helper"
 require_relative "../../app/models/dispatch_policy/application_record"
 require_relative "../../app/models/dispatch_policy/inflight_job"
 
-class InflightTrackerHeartbeatTest < Minitest::Test
-  def self.connect!
-    return @connected if defined?(@connected) && @connected
-
-    ActiveRecord::Base.establish_connection(
-      adapter:  "postgresql",
-      encoding: "unicode",
-      host:     ENV.fetch("DB_HOST", "localhost"),
-      username: ENV.fetch("DB_USER", ENV["USER"]),
-      password: ENV.fetch("DB_PASS", ""),
-      database: ENV.fetch("DB_NAME", "dispatch_policy_test")
-    )
-    ActiveRecord::Base.connection.execute("SELECT 1")
-    @connected = true
-  rescue StandardError => e
-    warn "[skip] Postgres not reachable: #{e.message}"
-    @connected = false
-  end
-
-  def setup
-    super
-    skip "no Postgres available" unless self.class.connect!
-    ActiveRecord::Base.connection.execute("DELETE FROM dispatch_policy_inflight_jobs")
-  end
-
+class InflightTrackerHeartbeatTest < DispatchPolicy::IntegrationTest
   def test_heartbeat_thread_refreshes_heartbeat_at_during_perform
     DispatchPolicy.config.inflight_heartbeat_interval = 0.05
 
