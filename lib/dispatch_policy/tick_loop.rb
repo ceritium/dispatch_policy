@@ -84,10 +84,68 @@ module DispatchPolicy
         cutoff_seconds:        cfg.inflight_stale_after,
         queued_cutoff_seconds: cfg.inflight_queued_stale_after
       )
-      Repository.sweep_inactive_partitions!(cutoff_seconds: cfg.partition_inactive_after)
+      sweep_inactive_partitions!(cfg)
       Repository.sweep_old_tick_samples!(cutoff_seconds: cfg.metrics_retention)
     rescue StandardError => e
       DispatchPolicy.config.logger&.error("[dispatch_policy] sweep error: #{e.class}: #{e.message}")
+    end
+
+    # One DELETE per registered policy plus one for the rest, rather than
+    # a single global DELETE, because the right cutoff is per-policy: a
+    # throttle's token bucket lives in the partition row's `gate_state`,
+    # so collecting the row while its refill window is still running hands
+    # that tenant a fresh quota. `rate: 2, per: 7.days` plus a day of
+    # quiet used to mean four admits in one week. The cutoff for a
+    # throttled policy is therefore at least its window.
+    #
+    # N+1 statements every `sweep_every_ticks` iterations, N = number of
+    # registered policies. Both the per-policy and the catch-all DELETE
+    # filter on the same indexed columns as before.
+    def sweep_inactive_partitions!(cfg)
+      default_cutoff = cfg.partition_inactive_after.to_i
+      registered     = []
+
+      DispatchPolicy.registry.each do |policy|
+        registered << policy.name
+        window = policy.static_throttle_window
+        warn_unbounded_sweep(policy) if window.nil? && throttled?(policy)
+
+        Repository.sweep_inactive_partitions!(
+          cutoff_seconds: window ? [default_cutoff, window.ceil].max : default_cutoff,
+          policy_name:    policy.name
+        )
+      end
+
+      # Partitions whose policy this process doesn't know — most often one
+      # that was deleted from the code. Nothing can tell us its window, so
+      # the default cutoff applies; without this pass those rows would
+      # never be collected at all.
+      Repository.sweep_inactive_partitions!(
+        cutoff_seconds:  default_cutoff,
+        except_policies: registered
+      )
+    end
+
+    def throttled?(policy)
+      policy.gates.any? { |g| g.name == :throttle }
+    end
+
+    # Once per process per policy: a dynamic `per` can't be resolved
+    # without a context, so the sweeper can only use the default cutoff.
+    # Harmless while the window is shorter than partition_inactive_after,
+    # which is the usual case — hence a warning, not an error.
+    def warn_unbounded_sweep(policy)
+      @warned_unbounded_sweep ||= {}
+      return if @warned_unbounded_sweep[policy.name]
+
+      @warned_unbounded_sweep[policy.name] = true
+      DispatchPolicy.config.logger&.warn(
+        "[dispatch_policy] policy #{policy.name.inspect} throttles with a dynamic `per`, so the " \
+        "partition sweeper can't tell how long its token bucket takes to refill and falls back to " \
+        "partition_inactive_after (#{DispatchPolicy.config.partition_inactive_after}s). If any " \
+        "resolved window is longer than that, a swept partition starts again on a full bucket. " \
+        "Use a static `per`, or raise partition_inactive_after above the longest window."
+      )
     end
   end
 end

@@ -906,12 +906,32 @@ module DispatchPolicy
 
     # ----------------------------------------------------------------------------
 
-    def sweep_inactive_partitions!(cutoff_seconds:)
+    # `policy_name` sweeps one policy (with its own cutoff — see
+    # TickLoop.sweep!, which gives a throttled policy a cutoff at least as
+    # long as its refill window). `except_policies` is the complement: one
+    # pass at the default cutoff for every partition whose policy isn't
+    # registered in this process, so rows left behind by a deleted policy
+    # are still collected.
+    def sweep_inactive_partitions!(cutoff_seconds:, policy_name: nil, except_policies: [])
+      params = [cutoff_seconds.to_i]
+      filter = ""
+      if policy_name
+        params << policy_name
+        filter = "AND policy_name = $#{params.size}"
+      elsif except_policies.any?
+        placeholders = except_policies.map do |name|
+          params << name
+          "$#{params.size}"
+        end
+        filter = "AND policy_name NOT IN (#{placeholders.join(', ')})"
+      end
+
       connection.exec_query(
         <<~SQL.squish,
           DELETE FROM #{PARTITIONS_TABLE}
           WHERE pending_count = 0
             AND status = 'active'
+            #{filter}
             AND (
               (last_admit_at IS NOT NULL AND last_admit_at < now() - ($1 || ' seconds')::interval)
               OR
@@ -919,7 +939,7 @@ module DispatchPolicy
             )
         SQL
         "sweep_inactive_partitions",
-        [cutoff_seconds.to_i]
+        params
       )
     end
 

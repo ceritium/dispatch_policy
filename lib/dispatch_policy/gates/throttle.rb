@@ -16,17 +16,26 @@ module DispatchPolicy
     class Throttle < Gate
       attr_reader :rate_proc, :per_proc
 
+      # The refill window when it is a fixed number of seconds, nil when
+      # `per` is a proc and can only be known per-context at admission
+      # time. The partition sweeper reads this: the bucket lives in the
+      # partition row's gate_state, so deleting the row inside a window
+      # that is still being spent hands the tenant a fresh quota.
+      attr_reader :static_per
+
       def initialize(rate:, per:)
         super()
         @rate_proc = rate.respond_to?(:call) ? rate : ->(_ctx) { rate }
         if per.respond_to?(:call)
           # Dynamic window (per-ctx), symmetric with a dynamic rate. Validated
           # per-evaluate since the value isn't known until admission time.
-          @per_proc = ->(ctx) { duration_seconds(per.call(ctx)) }
+          @per_proc   = ->(ctx) { duration_seconds(per.call(ctx)) }
+          @static_per = nil
         else
           fixed = duration_seconds(per)
           raise ArgumentError, "throttle :per must be > 0 (got #{fixed})" unless fixed.positive?
-          @per_proc = ->(_ctx) { fixed }
+          @per_proc   = ->(_ctx) { fixed }
+          @static_per = fixed
         end
       end
 
