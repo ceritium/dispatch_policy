@@ -23,11 +23,15 @@ module DispatchPolicy
                   :adapter_throughput_target
 
     def initialize
-      # Master switch. When false, the around_enqueue and the BulkEnqueue
-      # patch pass through to the real adapter without staging — all of
-      # the gem's machinery becomes a no-op for new perform_later calls.
-      # The TickLoop also exits early. Used during cutovers to drain
-      # the staging table without taking traffic offline.
+      # Master switch for the ENQUEUE side. When false, the around_enqueue
+      # and the BulkEnqueue patch pass through to the real adapter without
+      # staging, so the gem becomes a no-op for new perform_later calls.
+      # The TickLoop keeps running: whatever is already staged still needs
+      # admitting, and with staging off nothing else will ever hand those
+      # rows to the adapter. That is what makes this usable for a cutover
+      # — flip it, watch the backlog drain, then stop the tick job. To
+      # stop admission itself, stop the tick job or pause the policy from
+      # the dashboard (claim_partitions honors the pause flag).
       @enabled                   = true
       @tick_max_duration         = 25
       @partition_batch_size      = 50

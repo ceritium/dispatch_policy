@@ -581,11 +581,26 @@ DispatchPolicy.configure do |c|
   c.tick_admission_budget      = nil     # global cap on admissions per tick; nil = none
   c.adapter_throughput_target  = nil     # jobs/sec; UI shows admit rate as % of this
   c.database_role              = nil     # AR role ALL gem DB access runs against (multi-DB)
+  c.enabled                    = true    # false = stop STAGING; see below
 end
 ```
 
 You can override `admission_batch_size`, `fairness_half_life_seconds`,
 and `tick_admission_budget` per policy via the DSL.
+
+### `enabled` — the enqueue-side master switch
+
+`enabled = false` makes `perform_later` and `perform_all_later` hand
+jobs straight to the real adapter: nothing new enters staging, and the
+gem is a no-op for new work. **The tick keeps running**, on purpose —
+whatever is already staged still has to be admitted, and with staging
+off nothing else will ever put those rows into the adapter. That's what
+makes the flag usable for a cutover: flip it, watch the backlog drain,
+then stop the tick job.
+
+It is not a way to stop admission. For that, stop the tick job, or pause
+the policy from the dashboard — the pause flag is what `claim_partitions`
+consults, and it holds partitions that first appear after the pause too.
 
 ## `partitions.context` is refreshed on every enqueue
 

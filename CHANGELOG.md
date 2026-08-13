@@ -72,6 +72,20 @@
 
 ### Changed
 
+- **`config.enabled = false` no longer stops the tick loop** (audit
+  2026-08-13, H4). It turns off *staging* — new `perform_later` calls go
+  straight to the adapter — but the loop used to exit as well, which
+  stranded everything already in `dispatch_policy_staged_jobs`: nothing
+  else hands those rows to the adapter, so the backlog was reachable
+  only through the dashboard's drain button. That is the opposite of the
+  documented purpose ("drain the staging table without taking traffic
+  offline"), which now actually works: flip the flag, watch the backlog
+  drain, then stop the tick job. **If you were using `enabled = false` as
+  a way to stop admission, it no longer does that** — stop the tick job,
+  or pause the policy from the dashboard (the pause flag is what
+  `claim_partitions` honors, and it also holds partitions created after
+  the pause).
+
 - **The dashboard's in-flight count for a policy with no
   concurrency-family gate now reflects jobs that are actually running**,
   and only when the job class declares `dispatch_policy_inflight_tracking`.
