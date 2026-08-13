@@ -71,8 +71,10 @@ dispatch_policy_policy_settings               one row per policy — pause flag
   gates is valid — the pipeline returns `admit_count = max_budget`
   and the in-tick fairness reorder (decay + fair_share) still
   applies. Useful for "balance N tenants without rate-limiting any
-  of them". Without a concurrency gate nothing touches
-  `inflight_jobs` at all — no pre-insert, no `around_perform`.
+  of them". Nothing writes `inflight_jobs` for such a policy unless
+  its job class opts in with `dispatch_policy_inflight_tracking`
+  (which buys a dashboard count, nothing else — no admission decision
+  reads those rows).
 - **`partitions.context` is refreshed on every `perform_later`** via
   UPSERT. Gates read that ctx, NOT `staged_jobs.context` (which is
   historical). This lets a change in the host DB (e.g. new
@@ -126,34 +128,50 @@ dispatch_policy_policy_settings               one row per policy — pause flag
   AR access (`lookup_admitted_at`, the heartbeat thread) wraps
   explicitly. Staging tables and the adapter's table must live in the
   same DB for atomicity to hold.
-- **`ManualAdmission.force!` (UI admit/drain) also pre-inserts inflight
-  rows** in the same TX as the claim, just like the Tick. Don't remove
-  it: without it the concurrency gate under-counts force-admitted jobs
-  until each one starts performing (over-admission window).
+- **`ManualAdmission.force!` (UI admit/drain) pre-inserts inflight rows**
+  in the same TX as the claim, through the same
+  `InflightTracker.pre_insert_admitted!` the Tick uses. Don't remove it:
+  without it the concurrency gate under-counts force-admitted jobs until
+  each one starts performing (over-admission window). It runs in the web
+  process, whose registry is only populated as a side effect of job
+  classes loading, so an unknown policy there means "we can't see it",
+  NOT "it has no gate" — the helper inserts unless it knows there is no
+  tracked gate, and `force!` warns. Erring the other way over-admits.
 - **Inflight rows are reaped on `discard.active_job`.** The railtie
   subscribes and calls `InflightTracker.handle_discard`, deleting the
   row by `active_job_id`. This covers jobs killed BEFORE around_perform
   (e.g. `discard_on ActiveJob::DeserializationError`), whose `ensure`
   never runs — otherwise the Tick's pre-inserted row sits until the
   `inflight_queued_stale_after` sweeper (1h), holding a slot.
-- **Adding a table?** Update `test/integration/repository_test.rb`'s
-  `TABLES` list (drift detection rebuilds the schema) AND both the
-  migration and the generator template, per the workflow below.
-- **`inflight_jobs` rows exist only for concurrency-family policies,
-  and creation/release are installed together.** `Policy#
-  inflight_tracked_gate` (`:concurrency` / `:adaptive_concurrency`,
-  listed in `InflightTracker::TRACKED_GATES`) decides both ends: the
-  Tick and `ManualAdmission` pre-insert a row per admitted job ONLY
-  for those policies, and `dispatch_policy` auto-installs the
-  `around_perform` that releases it on exactly the same condition.
-  They must stay in sync — unconditional creation with an opt-in
-  release is what wedged a partition at `max` for an hour when a job
-  class forgot `dispatch_policy_inflight_tracking` (H3). The key is
-  always `policy.partition_for(ctx)` (same canonical scope as the
-  staged partition_key), since `partition_by` is policy-level.
-  Declaring the macro by hand is still supported and idempotent —
-  that's how a policy WITHOUT such a gate gets a live in-flight count
-  on the dashboard.
+- **Adding a table?** Add it to `Repository::ALL_TABLES` — the test
+  bootstrap (`PostgresTest`) and the benchmark harness (`Bench`) both
+  read that list to create, drop and truncate, so a table missing from
+  it silently breaks schema rebuilds and leaks state between tests —
+  AND update both the migration and the generator template, per the
+  workflow below. Column added? Add it to
+  `PostgresTest::SCHEMA_COLUMNS` too; that's the drift check that
+  rebuilds a stale local database.
+- **Inflight tracking is decided from the POLICY at runtime, never
+  from where the class was declared.** `Policy#inflight_tracked_gate`
+  (`:concurrency` / `:adaptive_concurrency`, listed in
+  `InflightTracker::TRACKED_GATES`) drives creation —
+  `InflightTracker.pre_insert_admitted!`, called by both Tick and
+  `ManualAdmission` — and `InflightTracker.track` reads the same fact
+  to decide whether to release. **Including `InflightTracker` IS
+  installing the callback** (its `included` block registers the
+  `around_perform`), and `JobExtension` declares it as a Concern
+  dependency, so anything that can be staged can be released. Do NOT
+  reintroduce a per-class "installed" flag or install the callback
+  from the `dispatch_policy` macro: that made creation policy-driven
+  and release macro-driven, and a class bound with
+  `dispatch_policy_name = "x"` — public API, and the only way to share
+  one policy across classes — got rows nothing ever deleted, wedging
+  the partition at `max` for an hour at a time. The key is always
+  `policy.partition_for(ctx)`, which is by construction the staged
+  `partition_key` the callers already hold, so don't recompute it per
+  row. `dispatch_policy_inflight_tracking` only sets a flag that ADDS
+  tracking for a policy WITHOUT such a gate (a live in-flight count on
+  the dashboard); it installs nothing.
 - **`:adaptive_concurrency` updates `current_max` in a single SQL
   statement.** The UPDATE in `Repository.adaptive_record!` uses the
   POST-update `ewma_latency_ms` value in its CASE expression — so
@@ -246,8 +264,11 @@ bundle exec rake test                        # 101 runs / 225 asserts
 #   2. Edit lib/generators/.../create_dispatch_policy_tables.rb.tt
 #   3. For the live dummy app, ALTER TABLE manually (no incremental
 #      migrations because v0.1 ships a single migration)
-#   4. test/integration/repository_test.rb#schema_present? detects
-#      drift via known columns; add the new one to the check.
+#   4. Add the table to Repository::ALL_TABLES (the test bootstrap and
+#      the benchmark harness both build their DDL from it); for a new
+#      COLUMN, add it to PostgresTest::SCHEMA_COLUMNS in
+#      test/test_helper.rb, which is the drift check that rebuilds a
+#      stale local database.
 #   5. CHANGELOG: add/extend an "Upgrade notes" subsection under
 #      Unreleased stating the schema change and the exact SQL/steps an
 #      EXISTING install must run (the gem ships a single migration, so

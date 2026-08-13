@@ -20,16 +20,42 @@
     wasn't needed — leaked one row per admitted job for an hour,
     inflating the dashboard's in-flight count with finished jobs.
 
-  Both ends are now driven by the same condition
-  (`Policy#inflight_tracked_gate`): `dispatch_policy` installs the
-  tracking callback when the policy declares a concurrency-family gate,
-  and `Tick`/`ManualAdmission` pre-insert only for those policies.
-  Declaring `dispatch_policy_inflight_tracking` by hand still works, is
-  now idempotent (two nested wrappers used to record two adaptive
-  observations per perform), and remains the way to get a live
-  in-flight count for a policy without such a gate. No schema change,
-  no action required on upgrade; existing job classes that declare the
-  macro keep working unchanged.
+  Both ends are now driven by the same fact, read from the registered
+  policy at runtime (`Policy#inflight_tracked_gate`):
+  `Tick`/`ManualAdmission` create rows for concurrency-family policies,
+  and `InflightTracker.track` releases them on the same condition.
+  Including `InflightTracker` is what installs the `around_perform`, and
+  `JobExtension` brings it along as a Concern dependency, so tracking
+  cannot be missing from a class that can be staged — including one
+  bound with `dispatch_policy_name = "x"` instead of the
+  `dispatch_policy` macro, which is public API and the only way to point
+  two classes at one policy.
+
+  `dispatch_policy_inflight_tracking` keeps working and now does one
+  thing: it ADDS tracking for a policy with no such gate (the live
+  in-flight count on the dashboard). It installs nothing, so forgetting
+  it can no longer wedge a partition, and declaring it twice — or
+  alongside the railtie's include — still tracks exactly once.
+
+  Two smaller asymmetries in the same lifecycle went with it: a worker
+  whose registry no longer has the policy (renamed mid-deploy) now still
+  releases the row a tick pre-inserted, and `ManualAdmission` no longer
+  skips the pre-insert just because the *web* process's registry hasn't
+  loaded that job class — it inserts unless it knows there is no tracked
+  gate, and warns.
+
+  No schema change, no action required on upgrade; existing job classes
+  keep working unchanged.
+
+### Changed
+
+- **The dashboard's in-flight count for a policy with no
+  concurrency-family gate now reflects jobs that are actually running**,
+  and only when the job class declares `dispatch_policy_inflight_tracking`.
+  It previously counted every admission for an hour, including jobs that
+  had long since finished. For a tracked policy nothing changes: the
+  count still covers the whole admitted-to-finished window, queue wait
+  included.
 
 ## 0.5.0
 

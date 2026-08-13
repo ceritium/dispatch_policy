@@ -152,10 +152,10 @@ ActiveJob#perform_later
 
 ```ruby
 class FetchEndpointJob < ApplicationJob
-  # Not needed for a concurrency / adaptive_concurrency policy:
-  # `dispatch_policy` installs the in-flight tracking callback itself.
-  # Declare it (it's idempotent) only when you want a live in-flight
-  # count on the dashboard for a policy WITHOUT such a gate.
+  # In-flight tracking needs no declaration: a concurrency /
+  # adaptive_concurrency policy is tracked because the gate's admission
+  # decision counts those rows. Declare it only to get a live in-flight
+  # count on the dashboard for a policy WITHOUT such a gate:
   #   dispatch_policy_inflight_tracking
 
   dispatch_policy :endpoints do
@@ -253,9 +253,10 @@ Caps the number of admitted-but-not-yet-completed jobs per partition.
 Counts rows in `dispatch_policy_inflight_jobs` keyed by the policy's
 canonical partition: admission inserts one per job, `InflightTracker.
 track`'s `around_perform` removes it when the job finishes, and a
-periodic sweeper reaps it if a worker crashes. Declaring this gate
-installs that `around_perform` on the job class for you — the two are
-useless apart, since a row nobody removes holds a slot until the
+periodic sweeper reaps it if a worker crashes. Both ends read the
+policy, so declaring this gate is all it takes — however the job class
+is bound to the policy, and whether or not it declares anything else.
+The two are useless apart: a row nobody removes holds a slot until the
 `inflight_queued_stale_after` sweeper (1h) reclaims it.
 
 ```ruby
