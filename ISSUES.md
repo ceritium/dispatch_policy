@@ -24,10 +24,20 @@ the `database_role` wrapper and cursor pagination.
 
 ## High
 
-> **Status:** H3 fixed (Phase 1) — regression test in
-> `test/integration/inflight_lifecycle_test.rb`, which fails on the
-> pre-fix code with the wedge, the orphan row and the missing
-> auto-install. H4, H5 and everything below are still open.
+> **Status:** H3 fixed (Phase 1) — regression tests in
+> `test/integration/inflight_lifecycle_test.rb`. H4, H5 and everything
+> below are still open.
+>
+> A review of the Phase 1 branch itself found that the first version of
+> the fix only closed the wedge for classes declaring their policy with
+> the `dispatch_policy` macro: creation was decided from the registered
+> policy at tick time, release from the macro call site, so a class bound
+> with `dispatch_policy_name = "x"` (public API, and the only way to
+> share one policy across classes) still got rows nothing released. See
+> **R1** below. The same review caught three stale CLAUDE.md invariants
+> the branch had invalidated — one of which instructed the reader to
+> reintroduce the leak — and three defects in the branch's own test and
+> benchmark tooling. All are fixed on the branch.
 
 ### H3 — The Tick pre-inserts inflight rows that only an opt-in deletes
 
@@ -143,6 +153,91 @@ enables the decay clause.
   uncommitted rows — but with `config.database_role` pointing at another
   database the staged row commits independently and the job can run
   before the app transaction commits.
+
+---
+
+# Review of the Phase 1 branch — all fixed on it
+
+A max-effort review of the H3 fix (and the tooling that shipped with it)
+before merge. Recorded because two of these are the same *shape* as the
+bug the branch set out to fix, and because the tooling defects are the
+kind that hide the next one.
+
+### R1 — The fix's two ends were still keyed on different things
+
+Creation asked the registered POLICY, at tick time
+(`Policy#inflight_tracked_gate`); release asked the CLASS, at macro time
+(the `dispatch_policy` call site installed the `around_perform`). Any
+other binding — `registry.register(policy)` +
+`Job.dispatch_policy_name = "x"`, which is public API, the only way to
+point two classes at one policy (a second macro call raises
+`PolicyAlreadyRegistered`), and the pattern several cases in this suite
+use — got rows created and never released: the original wedge, reachable
+through `ActiveJob.perform_all_later`, whose `stageable?` asks for
+nothing but a registered policy name.
+
+Fixed by making the include the installation: `InflightTracker`'s
+`included` block registers the callback, `JobExtension` declares it as a
+Concern dependency, and `track` decides per job from the registry. The
+macro survives as a flag that ADDS tracking for gate-less policies.
+
+### R2 — `track` returned before its `ensure` when the policy was unknown
+
+A worker whose registry lacks the policy (renamed or removed while an
+older tick was still admitting) stranded the row that tick had
+pre-inserted, holding a concurrency slot until the 1h sweeper. The
+DELETE keys on `active_job_id` alone, so it now runs regardless.
+
+### R3 — `ManualAdmission` read "policy not in this registry" as "no gate"
+
+The web process's registry is populated as a side effect of job classes
+loading, so under lazy loading — or a dashboard-only deployment — a
+policy the workers know perfectly well is absent there. Skipping the
+pre-insert in that case under-counts the gate and over-admits. It now
+inserts unless it knows there is no tracked gate, and warns.
+
+### R4 — Per-row recompute of a constant key, inside the admission TX
+
+The pre-insert recomputed `inflight_partition_key` for every admitted
+row: a deep context copy, a mutex-guarded registry fetch and a user proc
+call, to arrive back at the partition key the caller already held (both
+gates key on `policy.partition_for(ctx)` because `partition_by` is
+policy-level). Up to 5,000 recomputes per tick at default batch sizes,
+and the branch had just extended the cost to adaptive-only policies,
+which previously took the free path.
+
+### R5 — `rake bench:all` ran zero benchmarks and exited 0
+
+`run_all.rb` read its filter from `ARGV.first`, which under rake is the
+task name, so every script was filtered out. The CI job added in the
+same branch inherited it — a green build that benchmarked nothing, which
+is the exact failure mode that job exists to catch. `FILTER` (documented
+in the Rakefile) was dead for the same reason.
+
+### R6 — `RUNS=1` crashed every benchmark
+
+Wiring `RUNS` up made small values reachable for the first time, and the
+same commit dropped the guard covering them: one sample minus the
+discarded warmup left an empty array, and `median` then evaluated
+`nil + nil`, minutes into a run.
+
+### R7 — A failed connect disabled every remaining integration test
+
+The shared bootstrap memoized failure as readily as success, where the
+ten per-class copies it replaced memoized only success. One transient
+hiccup would skip the rest of the suite and — outside CI, where
+`DISPATCH_POLICY_REQUIRE_DB` makes it fatal — report green having run
+only the unit tests.
+
+### R8 — Three CLAUDE.md invariants contradicted the new code
+
+Including "**`ManualAdmission.force!` also pre-inserts inflight rows**
+… Don't remove it", which a future session following literally would
+have used to reintroduce the leak. Also a stale "Adding a table?"
+pointer at a list the branch had deleted — with both new copies
+deferring to that workflow as their sync mechanism — and an overbroad
+"nothing touches `inflight_jobs`" claim the same file contradicts 80
+lines later.
 
 ---
 

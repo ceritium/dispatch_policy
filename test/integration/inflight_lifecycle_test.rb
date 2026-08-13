@@ -162,14 +162,32 @@ class InflightLifecycleTest < DispatchPolicy::IntegrationTest
   def capturing_adapter_enqueues
     received = []
     adapter  = ActiveJob::Base.queue_adapter.singleton_class
+
     adapter.alias_method(:__orig_enqueue, :enqueue)
     adapter.define_method(:enqueue) do |job|
       received << job
       __orig_enqueue(job)
     end
+
+    # Forwarder sends immediate rows through ActiveJob.perform_all_later,
+    # which uses the adapter's enqueue_all when it has one and falls back
+    # to per-job enqueue when it doesn't. Today's TestAdapter has no
+    # enqueue_all, so capturing :enqueue alone happens to work — and would
+    # silently stop working, leaving `received` empty and the assertions
+    # below measuring nothing, the day ActiveJob gives it one.
+    captures_bulk = adapter.method_defined?(:enqueue_all) || adapter.private_method_defined?(:enqueue_all)
+    if captures_bulk
+      adapter.alias_method(:__orig_enqueue_all, :enqueue_all)
+      adapter.define_method(:enqueue_all) do |jobs|
+        received.concat(jobs)
+        __orig_enqueue_all(jobs)
+      end
+    end
+
     yield received
   ensure
     adapter.alias_method(:enqueue, :__orig_enqueue)
+    adapter.alias_method(:enqueue_all, :__orig_enqueue_all) if captures_bulk
   end
 
   def test_concurrency_policy_drains_even_when_the_job_class_forgot_the_macro
