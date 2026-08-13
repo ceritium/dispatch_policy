@@ -183,11 +183,17 @@ module DispatchPolicy
       end
     end
 
+    # exec_query gives us a Time for timestamp columns; the other branches
+    # are for callers that hand us a raw value. `to_time` is deliberately
+    # not used: on a String it triggers Rails 8's timezone-preservation
+    # deprecation, once per claimed partition per tick.
     def decayed_admits_epoch(value)
-      return nil if value.nil?
-      return value.to_f if value.is_a?(Numeric)
-      return value.to_time.to_f if value.respond_to?(:to_time)
-      Time.parse(value.to_s).to_f
+      case value
+      when nil     then nil
+      when Numeric then value.to_f
+      when Time    then value.to_f
+      else Time.parse(value.to_s).to_f
+      end
     rescue ArgumentError, TypeError
       nil
     end
@@ -329,6 +335,23 @@ module DispatchPolicy
         "[dispatch_policy] forward failed for #{@policy_name}/#{partition['partition_key']}: " \
         "#{e.class}: #{e.message}"
       )
+      # Back the partition off before trying again. Whatever raised — the
+      # adapter refusing enqueues, a gate with a bug — is not going to be
+      # fixed by the next tick a fraction of a second later, and retrying
+      # immediately burns a claim slot and a transaction every iteration
+      # while filling the log with the same line. The deny is queued for
+      # the same bulk flush the gate denials use, with an empty gate_state
+      # patch: we have no idea what the gates decided, so we must not
+      # persist a guess.
+      backoff = @config.forward_failure_backoff
+      if backoff && backoff.to_f.positive?
+        pending_denies << {
+          policy_name:      @policy_name,
+          partition_key:    partition["partition_key"],
+          gate_state_patch: {},
+          retry_after:      backoff.to_f
+        }
+      end
       { admitted: 0, failures: 1, reasons: ["forward_failed"] }
     end
 

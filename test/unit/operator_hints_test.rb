@@ -88,9 +88,13 @@ class OperatorHintsTest < Minitest::Test
     refute(hints.any? { |h| h.message.include?("Inflow > outflow") })
   end
 
+  # L13: forward_failures counts PARTITIONS whose admission raised, so the
+  # denominator is partitions_seen. Against jobs_admitted the ratio mixed
+  # units — with a healthy 100 jobs per partition, every partition failing
+  # read as a reassuring 1%.
   def test_forward_failure_rate_thresholds
-    warn_hints = call(jobs_admitted: 1_000, forward_failures: 20) # 2%
-    crit_hints = call(jobs_admitted: 1_000, forward_failures: 100) # 10%
+    warn_hints = call(partitions_seen: 1_000, forward_failures: 20)  # 2%
+    crit_hints = call(partitions_seen: 1_000, forward_failures: 100) # 10%
 
     warn = warn_hints.find { |h| h.message.start_with?("Forward failures") }
     crit = crit_hints.find { |h| h.message.start_with?("Forward failures") }
@@ -99,8 +103,19 @@ class OperatorHintsTest < Minitest::Test
   end
 
   def test_no_forward_failure_hint_below_1_percent
-    hints = call(jobs_admitted: 1_000, forward_failures: 5) # 0.5%
+    hints = call(partitions_seen: 1_000, forward_failures: 5) # 0.5%
     refute(hints.any? { |h| h.message.start_with?("Forward failures") })
+  end
+
+  def test_forward_failures_are_not_diluted_by_jobs_per_partition
+    # Every partition the tick touched failed. Measured against
+    # jobs_admitted this was 1% — a warning at most; it is 100%.
+    hints = call(partitions_seen: 10, forward_failures: 10, jobs_admitted: 1_000)
+
+    hint = hints.find { |h| h.message.start_with?("Forward failures") }
+    refute_nil hint, "every partition failing must raise a hint"
+    assert_equal :critical, hint.level
+    assert_includes hint.message, "100.0% of partitions"
   end
 
   def test_never_checked_partitions_warns

@@ -485,6 +485,16 @@ inflight tracking and its heartbeat thread, sweeps, and the admin UI
 operator actions hit the same DB the tick writes). Staging tables and
 the adapter's table must live in the same DB for atomicity to hold.
 
+> **`enqueue_after_transaction_commit` does not apply to staged jobs.**
+> Staging happens in the `around_enqueue`, before ActiveJob's
+> after-commit deferral would kick in. On a single database that is
+> equivalent or safer — the staged row is written inside your
+> transaction, so a rollback takes it with it and no tick can see it.
+> With `database_role` pointing at a *separate* database it is not: the
+> staged row commits independently, so a job can be admitted and run
+> before the transaction that enqueued it commits (or at all, if it
+> rolls back). Enqueue after commit yourself if that matters.
+
 ### Job identity across staging and adapter
 
 `Tick.admit_partition` regenerates the ActiveJob `job_id` for every
@@ -582,8 +592,17 @@ DispatchPolicy.configure do |c|
   c.adapter_throughput_target  = nil     # jobs/sec; UI shows admit rate as % of this
   c.database_role              = nil     # AR role ALL gem DB access runs against (multi-DB)
   c.enabled                    = true    # false = stop STAGING; see below
+  c.forward_failure_backoff    = 5       # seconds a partition waits after an admission raised
 end
 ```
+
+> **`tick_admission_budget` overrides `admission_batch_size`, it doesn't
+> combine with it.** When the budget is set, each claimed partition's
+> ceiling becomes `ceil(budget / partitions_claimed)` — so with a budget
+> of 500 and one partition claimed, that partition may take 500 rows in a
+> single transaction regardless of `admission_batch_size`. Size the
+> budget for the worst case (few partitions, deep backlog), not just for
+> the total rate you want.
 
 You can override `admission_batch_size`, `fairness_half_life_seconds`,
 and `tick_admission_budget` per policy via the DSL.

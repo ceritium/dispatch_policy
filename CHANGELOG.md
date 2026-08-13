@@ -70,6 +70,60 @@
   time. Existing policies get the default ceiling without any change; set
   `max:` explicitly if the downstream can take more than 10×.
 
+- **A partition holding only future-scheduled work no longer spins**
+  (audit 2026-08-13, M10). `claim_partitions` counts scheduled rows in
+  `pending_count` while `claim_staged_jobs!` only takes due ones, so such
+  a partition was claimed, found empty and left immediately eligible —
+  a transaction and a `partition_batch_size` slot burned every tick until
+  the job came due. It now parks on the soonest `scheduled_at`, without
+  overwriting a backoff a gate asked for.
+
+- **The partition sweeper no longer resets a token bucket that is still
+  spending** (audit 2026-08-13, M11). The bucket lives in the partition
+  row's `gate_state`, so collecting the row inside the throttle's refill
+  window handed the tenant a fresh quota: `rate: 2, per: 7.days` plus a
+  day of quiet admitted two more inside the same week. The sweep is now
+  per-policy at `max(partition_inactive_after, window)`, plus a
+  catch-all pass for partitions whose policy is no longer registered. A
+  dynamic `per` can't be resolved without a context, so those keep the
+  default cutoff and log a warning once per process.
+
+- **`ManualAdmission.force!` (UI admit/drain) keeps a gate's backoff and
+  feeds the fairness EWMA** (audit 2026-08-13, M12). It passed
+  `retry_after: nil`, wiping whatever backoff a gate had set even though
+  a forced admission bypasses the gates and has learned nothing about
+  capacity — so the next tick re-claimed the partition, re-evaluated it
+  and backed it off again. It also never passed `half_life_seconds`, so
+  the decay clause was skipped and manual admits stayed invisible to the
+  in-tick fairness reorder.
+
+- **A failed admission backs its partition off** (audit 2026-08-13, L12)
+  instead of being retried every tick. New `config.forward_failure_backoff`
+  (default 5s, 0 disables). Whatever raised — the adapter refusing
+  enqueues, a gate with a bug — is not fixed by the next tick moments
+  later, and retrying immediately burned a claim slot and a transaction
+  per iteration while repeating one error into the log.
+
+- **The forward-failure percentage compares like with like** (audit
+  2026-08-13, L13). `forward_failures` counts partitions, but the
+  dashboard and the operator hints divided it by `jobs_admitted`: with a
+  healthy 100 jobs per partition, *every* partition failing showed up as
+  a reassuring 1%. The denominator is now `partitions_seen`.
+
+- **Empty partitions of a paused policy are collected** (audit
+  2026-08-13, L15). The sweep required `status = 'active'`, so pausing —
+  exactly when partitions go empty and stay that way — meant they
+  accumulated forever. The policy-level pause flag lives in its own
+  table, so it still applies when the partition reappears.
+
+- **Concurrent `perform_all_later` calls can't deadlock on partition
+  upserts** (audit 2026-08-13, L11): the per-partition UPSERTs are now
+  issued in a deterministic order, so two batches touching the same
+  partitions take their row locks in the same sequence.
+
+- **No more Rails 8 deprecation on every tick** (audit 2026-08-13, L14):
+  `decayed_admits_epoch` no longer calls `to_time` on a String.
+
 ### Changed
 
 - **`config.enabled = false` no longer stops the tick loop** (audit

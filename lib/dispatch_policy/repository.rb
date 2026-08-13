@@ -134,7 +134,13 @@ module DispatchPolicy
           )
         end
 
-        rows.group_by { |r| [r[:policy_name], r[:partition_key]] }.each do |(policy_name, partition_key), group|
+        # Sorted so concurrent bulk enqueues touching the same partitions
+        # take their row locks in the same order. Two perform_all_later
+        # calls that happened to list partitions A,B and B,A could
+        # otherwise each hold one and wait for the other — a deadlock
+        # Postgres resolves by killing one of the transactions, losing
+        # that whole batch's staging.
+        rows.group_by { |r| [r[:policy_name], r[:partition_key]] }.sort_by(&:first).each do |(policy_name, partition_key), group|
           upsert_partition!(
             policy_name:   policy_name,
             partition_key: partition_key,
@@ -927,6 +933,13 @@ module DispatchPolicy
     # pass at the default cutoff for every partition whose policy isn't
     # registered in this process, so rows left behind by a deleted policy
     # are still collected.
+    #
+    # `status` is deliberately not filtered. It used to require 'active',
+    # which meant a paused policy's empty partitions were never collected
+    # at all — pausing is when partitions are MOST likely to go empty and
+    # stay that way. Nothing is lost by collecting one: the pause flag
+    # lives in dispatch_policy_policy_settings, so it still applies when
+    # the partition reappears.
     def sweep_inactive_partitions!(cutoff_seconds:, policy_name: nil, except_policies: [])
       params = [cutoff_seconds.to_i]
       filter = ""
@@ -945,7 +958,6 @@ module DispatchPolicy
         <<~SQL.squish,
           DELETE FROM #{PARTITIONS_TABLE}
           WHERE pending_count = 0
-            AND status = 'active'
             #{filter}
             AND (
               (last_admit_at IS NOT NULL AND last_admit_at < now() - ($1 || ' seconds')::interval)

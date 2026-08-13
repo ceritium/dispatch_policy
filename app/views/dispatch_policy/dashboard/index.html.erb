@@ -20,7 +20,8 @@
       </thead>
       <tbody>
         <% @windows.each do |label, m| %>
-          <% fail_pct = m[:jobs_admitted].positive? ? (m[:forward_failures].to_f / m[:jobs_admitted] * 100) : 0.0 %>
+          <%# forward_failures counts partitions, so the denominator must be partitions too %>
+        <% fail_pct = m[:partitions_seen].positive? ? (m[:forward_failures].to_f / m[:partitions_seen] * 100) : 0.0 %>
           <tr>
             <td><strong><%= label %></strong></td>
             <td class="dp-num"><%= format_count(m[:jobs_admitted]) %></td>
