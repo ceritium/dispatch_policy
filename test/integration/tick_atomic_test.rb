@@ -13,9 +13,6 @@ require_relative "../../app/models/dispatch_policy/tick_sample"
 class TickAtomicAdmissionTest < DispatchPolicy::IntegrationTest
   class TestTickJob < ActiveJob::Base
     include DispatchPolicy::JobExtension
-    around_enqueue do |job, blk|
-      DispatchPolicy::JobExtension.around_enqueue_for(job, blk)
-    end
     def perform(*); end
   end
 

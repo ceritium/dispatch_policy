@@ -17,6 +17,24 @@ module DispatchPolicy
 
     included do
       class_attribute :dispatch_policy_name, instance_writer: false
+
+      # Installed once, for the same reason the inflight callback is: so
+      # that whether a job is staged depends on the POLICY it names at
+      # enqueue time, not on where its class happened to be declared.
+      # Installing this from the `dispatch_policy` macro instead left a
+      # class bound with `dispatch_policy_name = "x"` half-wired — the
+      # bulk path staged it (BulkEnqueue.stageable? asks only for a
+      # registered name) while `perform_later` handed the same job
+      # straight to the adapter, so one job class admitted or bypassed
+      # admission depending on which enqueue API the caller reached for.
+      # `around_enqueue_for` already returns the job to the adapter when
+      # there is no policy, so this is a no-op for every other job in the
+      # host app.
+      if respond_to?(:around_enqueue)
+        around_enqueue do |job, block|
+          DispatchPolicy::JobExtension.around_enqueue_for(job, block)
+        end
+      end
     end
 
     class_methods do
@@ -24,11 +42,6 @@ module DispatchPolicy
         policy = PolicyDSL.build(name.to_s, &block)
         DispatchPolicy.registry.register(policy, owner: self.name)
         self.dispatch_policy_name = policy.name
-
-        around_enqueue do |job, block|
-          DispatchPolicy::JobExtension.around_enqueue_for(job, block)
-        end
-
         policy
       end
     end
@@ -38,7 +51,14 @@ module DispatchPolicy
       return block.call if Bypass.active?
       return block.call unless DispatchPolicy.config.enabled
 
-      policy = DispatchPolicy.registry.fetch(job.class.dispatch_policy_name)
+      # Cheap class_attribute read before anything else: this callback now
+      # runs for every ActiveJob enqueue in the host app, and jobs with no
+      # policy must not pay for a registry lookup (which takes the
+      # registry's mutex) to find that out.
+      policy_name = job.class.dispatch_policy_name
+      return block.call unless policy_name
+
+      policy = DispatchPolicy.registry.fetch(policy_name)
       return block.call unless policy
 
       if retry_attempt?(job) && policy.bypass_retries?

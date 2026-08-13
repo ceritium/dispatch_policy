@@ -266,11 +266,6 @@ class InflightLifecycleTest < DispatchPolicy::IntegrationTest
   # its policy got rows created and never released — the original wedge,
   # through supported plumbing.
   def test_a_class_bound_without_the_macro_still_releases_its_rows
-    # perform_all_later is the entry point that stages a macro-less class:
-    # BulkEnqueue.stageable? asks only for a registered policy name, so
-    # these jobs are admitted exactly like any other. (The single-job
-    # around_enqueue is installed by the macro, so `perform_later` alone
-    # would hand them straight to the adapter.)
     unless ActiveJob.singleton_class.include?(DispatchPolicy::JobExtension::BulkEnqueue)
       ActiveJob.singleton_class.prepend(DispatchPolicy::JobExtension::BulkEnqueue)
     end
@@ -294,6 +289,26 @@ class InflightLifecycleTest < DispatchPolicy::IntegrationTest
       DispatchPolicy::Tick.run(policy_name: "inflight_lifecycle_no_macro")
       assert_equal 3, received.size, "the freed slots must let the last job through"
     end
+  end
+
+  # R9: the same class must be staged by BOTH enqueue APIs. Staging used
+  # to be installed by the `dispatch_policy` macro while the bulk path
+  # asked only for a registered policy name, so a class bound with
+  # `dispatch_policy_name=` was admission-controlled through
+  # perform_all_later and bypassed admission entirely through
+  # perform_later — the same job, two answers, depending on which API the
+  # caller reached for.
+  def test_both_enqueue_paths_stage_a_class_bound_without_the_macro
+    NoMacroJob.perform_later
+    assert_equal 1, DispatchPolicy::StagedJob.count,
+                 "perform_later must stage a job whose policy is registered, macro or not"
+
+    unless ActiveJob.singleton_class.include?(DispatchPolicy::JobExtension::BulkEnqueue)
+      ActiveJob.singleton_class.prepend(DispatchPolicy::JobExtension::BulkEnqueue)
+    end
+    ActiveJob.perform_all_later(NoMacroJob.new)
+    assert_equal 2, DispatchPolicy::StagedJob.count,
+                 "and the bulk path must agree with it"
   end
 
   # A gate-less policy that opts in by hand still gets tracked: the class

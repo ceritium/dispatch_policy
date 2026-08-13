@@ -229,6 +229,26 @@ hiccup would skip the rest of the suite and — outside CI, where
 `DISPATCH_POLICY_REQUIRE_DB` makes it fatal — report green having run
 only the unit tests.
 
+### R9 — A class could be bound to a policy for one enqueue API but not the other
+
+Found while writing R1's regression test. `around_enqueue` was installed
+by the `dispatch_policy` macro, but `BulkEnqueue.stageable?` asks only
+for a registered policy name — so a class bound with
+`dispatch_policy_name = "x"` was admission-controlled through
+`ActiveJob.perform_all_later` and bypassed admission entirely through
+`perform_later`. One job class, two answers, decided by which API the
+caller happened to reach for; the throttle or concurrency cap silently
+does not apply to half of them.
+
+Same shape and same fix as R1: the callback is installed by
+`JobExtension`'s `included` block, and `around_enqueue_for` decides from
+the policy at enqueue time (it already returned the job to the adapter
+when there was none). Two integration cases could then drop their own
+hand-written `around_enqueue`, which is a small proof the global install
+covers what the macro used to. A `dispatch_policy_name` check now
+short-circuits ahead of the registry lookup, so jobs with no policy
+don't take the registry mutex on every enqueue.
+
 ### R8 — Three CLAUDE.md invariants contradicted the new code
 
 Including "**`ManualAdmission.force!` also pre-inserts inflight rows**
