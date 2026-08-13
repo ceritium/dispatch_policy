@@ -279,7 +279,8 @@ AIMD loop on a per-partition stats row in
 gate :adaptive_concurrency,
      initial_max:   3,
      target_lag_ms: 1000,   # acceptable queue wait before backoff
-     min:           1       # floor; a partition can't lock out
+     min:           1,      # floor; a partition can't lock out
+     max:           30      # ceiling; defaults to initial_max × 10
 ```
 
 - **Feedback signal**: `admitted_at → perform_start` (queue wait in
@@ -289,6 +290,12 @@ gate :adaptive_concurrency,
 - **Growth**: `current_max += 1` per fast success.
 - **Slow shrink**: `current_max *= 0.95` when EWMA lag > target.
 - **Failure shrink**: `current_max *= 0.5` when `perform` raises.
+- **Ceiling**: `current_max` never exceeds `max` (default
+  `initial_max × 10`). Growth is unconditional on success — it doesn't
+  check whether the cap is what's actually limiting you — so a partition
+  running a slow, healthy trickle would otherwise drift up for hours and
+  not be limiting anything by the time a burst arrives. Set `max` to the
+  most concurrency the downstream can take.
 - **Safety valve**: when `in_flight == 0` the gate floors `remaining`
   at `initial_max` so a partition that AIMD shrunk to `min` during
   a past burst can re-grow when it idles.

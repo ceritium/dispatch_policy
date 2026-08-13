@@ -23,8 +23,10 @@ class AdaptiveConcurrencyIntegrationTest < DispatchPolicy::IntegrationTest
     )
   end
 
+  # `max` defaults high enough here that only the tests written for the
+  # ceiling see it; the growth/shrink cases are about the AIMD arithmetic.
   def record!(queue_lag_ms:, succeeded:, alpha: 0.5, target: 1000.0,
-              fail_factor: 0.5, slow_factor: 0.95, min: 1)
+              fail_factor: 0.5, slow_factor: 0.95, min: 1, max: 10_000)
     DispatchPolicy::Repository.adaptive_record!(
       policy_name:   POLICY,
       partition_key: "k",
@@ -34,7 +36,8 @@ class AdaptiveConcurrencyIntegrationTest < DispatchPolicy::IntegrationTest
       target_lag_ms: target,
       fail_factor:   fail_factor,
       slow_factor:   slow_factor,
-      min:           min
+      min:           min,
+      max:           max
     )
   end
 
@@ -55,6 +58,27 @@ class AdaptiveConcurrencyIntegrationTest < DispatchPolicy::IntegrationTest
   end
 
   # ----- additive grow ----------------------------------------------------
+
+  # H5: growth is +1 per healthy perform regardless of whether the cap is
+  # the binding constraint, so without a ceiling a partition on a slow,
+  # healthy trickle climbs forever: the gate stops limiting long before
+  # the integer column finally overflows. Reproduced at 200 observations
+  # from initial_max 2, which used to leave current_max at 202.
+  def test_healthy_observations_cannot_grow_the_cap_past_max
+    seed!(initial_max: 2)
+    200.times { record!(queue_lag_ms: 0, succeeded: true, max: 20) }
+
+    assert_equal 20, stats.current_max,
+                 "the ceiling must hold no matter how many healthy performs land"
+    assert_equal 200, stats.sample_count, "and observations must still be recorded"
+  end
+
+  def test_the_ceiling_does_not_interfere_below_it
+    seed!(initial_max: 4)
+    3.times { record!(queue_lag_ms: 0, succeeded: true, max: 20) }
+
+    assert_equal 7, stats.current_max, "growth below the ceiling is untouched"
+  end
 
   def test_fast_success_grows_current_max_by_one
     seed!(initial_max: 4)

@@ -215,3 +215,27 @@ table, and a small but real semantic decision (replace vs ignore,
 inflight vs staged). If a third case lands that doesn't fit a cron
 key or a digest guard, that's the trigger to design this for real
 instead of speculating about edge cases now.
+
+## `:adaptive_concurrency` — only grow while the cap is binding
+
+**Symptom.** AIMD's additive increase fires on every healthy perform,
+whether or not `current_max` is what's actually limiting the partition.
+A partition running two jobs at a time under a cap of 50 still gets
+`+1` per success. H5 (audit 2026-08-13) put a ceiling on the resulting
+drift, which stops it running away, but the growth signal is still
+measuring the wrong thing: it answers "did this job go well?" instead
+of "would more concurrency have helped?".
+
+**Possible design.** Grow only when the partition is at or near
+saturation — e.g. `in_flight >= current_max * 0.8` at admission time.
+That needs the live in-flight count to reach `record_observation`,
+which today runs in the worker's `around_perform` and has no idea what
+the tick saw. Options: carry the admission-time in-flight count on the
+`inflight_jobs` row (a column, written by the pre-insert and read back
+by `lookup_admitted_at`'s query, which is already fetching that row),
+or have the gate record its own saturation observation from `evaluate`.
+
+**Why deferred.** The ceiling removes the operational danger, and the
+column-plus-plumbing version is a schema change that wants a real
+workload to justify its shape. Worth doing if someone reports a cap
+sitting at `max` on a partition that never actually saturates.

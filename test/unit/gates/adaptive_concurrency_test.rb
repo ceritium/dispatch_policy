@@ -173,4 +173,46 @@ class AdaptiveConcurrencyGateTest < Minitest::Test
     assert_raises(ArgumentError) { Gate.new(initial_max: 1, target_lag_ms: 1000, min: 0) }
     assert_raises(ArgumentError) { Gate.new(initial_max: 1, target_lag_ms: 1000, min: 5) }
   end
+
+  # H5: the cap needs a ceiling. AIMD grows +1 per healthy perform whether
+  # or not the cap is the binding constraint, so an unbounded gate drifts
+  # up on a slow, healthy trickle and isn't limiting anything by the time
+  # the burst it exists for arrives.
+  def test_max_defaults_to_a_multiple_of_initial_max
+    assert_equal 30, Gate.new(initial_max: 3, target_lag_ms: 1000).max
+  end
+
+  def test_max_below_initial_max_raises
+    assert_raises(ArgumentError) do
+      Gate.new(initial_max: 10, target_lag_ms: 1000, max: 9)
+    end
+  end
+
+  def test_max_clamps_current_max_on_read
+    # A row written before `max` existed (or by a deploy configured with a
+    # higher one) must not out-rank the current configuration.
+    stub_repo(:adaptive_seed!)       { |**| }
+    stub_repo(:adaptive_current_max) { |**| 500 }
+    stub_repo(:count_inflight)       { |**| 20 }
+
+    gate = make_gate(initial_max: 4, min: 1, max: 20)
+    d    = gate.evaluate(DispatchPolicy::Context.wrap({}), partition, 100)
+
+    assert_equal 0, d.allowed,
+                 "cap must be read as max=20 with 20 in flight, not the row's 500"
+  end
+
+  def test_record_observation_passes_max_to_the_repository
+    recorded = nil
+    stub_repo(:adaptive_seed!)   { |**| }
+    stub_repo(:adaptive_record!) { |**kw| recorded = kw }
+
+    make_gate(initial_max: 4, max: 40).record_observation(
+      policy_name: "p", partition_key: "k", queue_lag_ms: 0, succeeded: true
+    )
+
+    assert_equal 40, recorded[:max],
+                 "the ceiling has to reach the UPDATE — clamping only on read " \
+                 "lets current_max climb until the integer column overflows"
+  end
 end

@@ -824,12 +824,18 @@ module DispatchPolicy
     # reads the row's current value at the start of the UPDATE.
     #
     # ewma_latency_ms_new = ewma_latency_ms * (1 - α) + α * queue_lag_ms
-    # current_max_new     = GREATEST(min,
+    # current_max_new     = LEAST(max, GREATEST(min,
     #                         FAILED?         FLOOR(current_max * fail_factor)
     #                         OVERLOADED?     FLOOR(current_max * slow_factor)
-    #                         else            current_max + 1)
+    #                         else            current_max + 1))
+    #
+    # The LEAST is what stops the additive increase from running away:
+    # growth is +1 per healthy perform whether or not the cap is the
+    # binding constraint, so without it a partition on a slow, healthy
+    # trickle climbs indefinitely — the gate quietly stops limiting, and
+    # the integer column eventually overflows.
     def adaptive_record!(policy_name:, partition_key:, queue_lag_ms:, succeeded:,
-                         alpha:, target_lag_ms:, fail_factor:, slow_factor:, min:)
+                         alpha:, target_lag_ms:, fail_factor:, slow_factor:, min:, max:)
       connection.exec_query(
         <<~SQL.squish,
           UPDATE #{ADAPTIVE_TABLE}
@@ -837,14 +843,14 @@ module DispatchPolicy
             ewma_latency_ms = ewma_latency_ms * (1 - $3::double precision)
                               + $3::double precision * $4::double precision,
             sample_count    = sample_count + 1,
-            current_max     = GREATEST($5::int, CASE
+            current_max     = LEAST($10::int, GREATEST($5::int, CASE
               WHEN $6::boolean = FALSE
                 THEN FLOOR(current_max * $7::double precision)::int
               WHEN (ewma_latency_ms * (1 - $3::double precision)
                     + $3::double precision * $4::double precision) > $8::double precision
                 THEN FLOOR(current_max * $9::double precision)::int
               ELSE current_max + 1
-            END),
+            END)),
             last_observed_at = now(),
             updated_at       = now()
           WHERE policy_name = $1 AND partition_key = $2
@@ -852,7 +858,7 @@ module DispatchPolicy
         "adaptive_record",
         [policy_name, partition_key, alpha.to_f, queue_lag_ms.to_f,
          min.to_i, succeeded ? true : false,
-         fail_factor.to_f, target_lag_ms.to_f, slow_factor.to_f]
+         fail_factor.to_f, target_lag_ms.to_f, slow_factor.to_f, max.to_i]
       )
     end
 

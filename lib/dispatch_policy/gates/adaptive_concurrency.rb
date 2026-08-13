@@ -25,11 +25,18 @@ module DispatchPolicy
       DEFAULT_EWMA_ALPHA   = 0.5  # weight of the new sample in the EWMA
       DEFAULT_FAIL_FACTOR  = 0.5  # halve on perform raise
       DEFAULT_SLOW_FACTOR  = 0.95 # gentle shrink on overload
+      # How far above initial_max the cap may climb when nothing pushes
+      # back. AIMD grows by +1 per healthy perform whether or not the cap
+      # is the binding constraint, so a partition on a slow, healthy
+      # trickle drifts towards "every job I have ever run" — and by the
+      # time the burst this gate exists for arrives, it isn't limiting
+      # anything. Every practical AIMD limiter carries a ceiling.
+      DEFAULT_MAX_MULTIPLE = 10
 
-      attr_reader :initial_max, :target_lag_ms, :min,
+      attr_reader :initial_max, :target_lag_ms, :min, :max,
                   :ewma_alpha, :fail_factor, :slow_factor, :full_backoff
 
-      def initialize(initial_max:, target_lag_ms:, min: 1,
+      def initialize(initial_max:, target_lag_ms:, min: 1, max: nil,
                      ewma_alpha: DEFAULT_EWMA_ALPHA,
                      failure_decrease_factor: DEFAULT_FAIL_FACTOR,
                      overload_decrease_factor: DEFAULT_SLOW_FACTOR,
@@ -38,6 +45,7 @@ module DispatchPolicy
         @initial_max   = Integer(initial_max)
         @target_lag_ms = Float(target_lag_ms)
         @min           = Integer(min)
+        @max           = max.nil? ? @initial_max * DEFAULT_MAX_MULTIPLE : Integer(max)
         @ewma_alpha    = Float(ewma_alpha)
         @fail_factor   = Float(failure_decrease_factor)
         @slow_factor   = Float(overload_decrease_factor)
@@ -45,6 +53,7 @@ module DispatchPolicy
         raise ArgumentError, "target_lag_ms must be > 0" unless @target_lag_ms.positive?
         raise ArgumentError, "min must be >= 1"          unless @min >= 1
         raise ArgumentError, "initial_max must be >= min" unless @initial_max >= @min
+        raise ArgumentError, "max must be >= initial_max" unless @max >= @initial_max
         # Out-of-range tuning knobs invert the AIMD loop instead of erroring:
         # alpha=0 freezes the EWMA at its seed so the cap grows unbounded;
         # a decrease factor >= 1 turns the multiplicative *decrease* into an
@@ -81,7 +90,10 @@ module DispatchPolicy
           policy_name:   policy_name,
           partition_key: key
         ) || @initial_max
-        cap = [cap, @min].max
+        # Clamp on read as well as on write: a stats row written before
+        # `max` was introduced (or by a deploy configured with a higher
+        # one) must not out-rank the current configuration.
+        cap = cap.clamp(@min, @max)
 
         in_flight = Repository.count_inflight(
           policy_name:   policy_name,
@@ -131,7 +143,8 @@ module DispatchPolicy
           target_lag_ms: @target_lag_ms,
           fail_factor:   @fail_factor,
           slow_factor:   @slow_factor,
-          min:           @min
+          min:           @min,
+          max:           @max
         )
       end
     end
