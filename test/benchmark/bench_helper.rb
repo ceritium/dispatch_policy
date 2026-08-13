@@ -49,19 +49,12 @@ module Bench
     ERR
   end
 
-  # Every table the migration creates. Each bench_*.rb calls
-  # recreate_schema!, so one table left behind makes the NEXT call fail
-  # with DuplicateTable — which is how `rake bench:all` died on script
-  # two. Keep in sync with the migration: see the "Adding a table?"
-  # workflow in CLAUDE.md.
-  TABLES = %w[
-    dispatch_policy_staged_jobs
-    dispatch_policy_partitions
-    dispatch_policy_inflight_jobs
-    dispatch_policy_tick_samples
-    dispatch_policy_adaptive_concurrency_stats
-    dispatch_policy_policy_settings
-  ].freeze
+  # Read from the gem rather than kept in sync by hand: a table missing
+  # from this list leaves a stale table behind, and the NEXT bench_*.rb's
+  # recreate_schema! then dies with DuplicateTable — which is exactly how
+  # `rake bench:all` broke. Repository::ALL_TABLES is the one place to
+  # update when a table is added.
+  TABLES = DispatchPolicy::Repository::ALL_TABLES
 
   def recreate_schema!
     require_relative "../../db/migrate/20260501000001_create_dispatch_policy_tables"
@@ -73,8 +66,8 @@ module Bench
     end
   end
 
-  # Same six tables. Leaving adaptive stats or a paused policy_settings
-  # row behind silently changes what the NEXT scenario measures — a stale
+  # Same list. Leaving adaptive stats or a paused policy_settings row
+  # behind silently changes what the NEXT scenario measures — a stale
   # `paused` row makes claim_partitions return nothing, so the tick
   # benchmarks would time an empty loop and report it as a great number.
   def truncate!
@@ -166,11 +159,28 @@ module Bench
   # this existed nothing read it — the footer claimed a sample count the
   # run never used. Raise it when a scenario's numbers move more between
   # runs than the difference you're trying to measure.
-  RUNS_USED = []
+  # The first run of every scenario is discarded as warmup, so two is the
+  # smallest value that still leaves a measurement. RUNS=1 (a natural
+  # choice for a smoke run) used to leave zero samples and crash inside
+  # median with `nil + nil`, several minutes into seeding; a non-numeric
+  # or empty RUNS raised ArgumentError from Integer(). Both now say what
+  # they did instead of failing obscurely.
+  MIN_RUNS = 2
+  private_constant :MIN_RUNS
 
   def runs_for(default)
-    n = ENV["RUNS"] ? Integer(ENV["RUNS"]) : default
-    RUNS_USED << n unless RUNS_USED.include?(n)
+    raw = ENV["RUNS"]
+    return default if raw.nil? || raw.empty?
+
+    n = Integer(raw, exception: false)
+    if n.nil?
+      warn "[bench] ignoring RUNS=#{raw.inspect} (not an integer); using #{default}"
+      return default
+    end
+    if n < MIN_RUNS
+      warn "[bench] RUNS=#{n} is below the #{MIN_RUNS} needed after the warmup run; using #{MIN_RUNS}"
+      return MIN_RUNS
+    end
     n
   end
 
@@ -179,6 +189,8 @@ module Bench
   # reported the 3rd-fastest of 4 — biased high, and at 3 runs it was
   # simply "the slower of two" under the name "median".
   def median(samples)
+    return 0.0 if samples.empty?
+
     sorted = samples.sort
     mid    = sorted.size / 2
     return sorted[mid] if sorted.size.odd?
@@ -240,19 +252,14 @@ module Bench
         puts "| #{cells.join(' | ')} |"
       end
     end
-    # Report what the run actually used, not what RUNS says: call sites
-    # pass their own default (the slow scenarios use 3), so printing
-    # ENV["RUNS"] || 5 was wrong in both directions.
-    counts = RUNS_USED.sort
-    label  = case counts.size
-             when 0 then "1 run"
-             when 1 then "#{counts.first} runs"
-             else "#{counts.min}–#{counts.max} runs depending on the scenario"
-             end
-    puts "\n_(median of #{label}, first discarded as warmup; set RUNS to override)_"
+    # Describe the knob, not a count: call sites pass their own default
+    # (the slow scenarios use 3), and a section may mix medians with
+    # single measurements, so any single number in this footer is a claim
+    # about some rows that isn't true of the others.
+    sampling = ENV["RUNS"].to_s.empty? ? "each scenario's default" : "RUNS=#{ENV['RUNS']}"
+    puts "\n_(timed rows are medians over #{sampling} runs, first discarded as warmup)_"
     # Clear so run_all.rb can `load` the next script without double-printing
     # accumulated sections from the previous one.
     REPORT.clear
-    RUNS_USED.clear
   end
 end

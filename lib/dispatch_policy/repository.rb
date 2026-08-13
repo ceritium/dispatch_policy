@@ -17,6 +17,23 @@ module DispatchPolicy
     ADAPTIVE_TABLE       = "dispatch_policy_adaptive_concurrency_stats"
     POLICY_SETTINGS_TABLE = "dispatch_policy_policy_settings"
 
+    # Every table the gem owns, i.e. everything the single migration
+    # creates. The canonical list: the test bootstrap and the benchmark
+    # harness both build their schema/truncate/drop statements from this
+    # instead of keeping hand-synced copies, which is how a new table
+    # used to be missed in one of them (a stale table then fails the next
+    # `recreate_schema!` with DuplicateTable, and a table missing from a
+    # truncate leaks state into the following test). Adding a table means
+    # adding it here — see the "Adding a table?" workflow in CLAUDE.md.
+    ALL_TABLES = [
+      STAGED_TABLE,
+      PARTITIONS_TABLE,
+      INFLIGHT_TABLE,
+      SAMPLES_TABLE,
+      ADAPTIVE_TABLE,
+      POLICY_SETTINGS_TABLE
+    ].freeze
+
     module_function
 
     def connection
