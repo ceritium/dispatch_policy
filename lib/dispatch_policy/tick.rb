@@ -233,7 +233,17 @@ module DispatchPolicy
           # the partition's counters and gate_state commit even when the
           # actual DELETE returned zero rows (e.g. all staged rows are
           # scheduled in the future, or another tick raced us to them).
-          next if rows.empty?
+          if rows.empty?
+            # Nothing was claimable although pending_count says there is
+            # work: it is all scheduled for later. Park the partition
+            # until the soonest one is due instead of re-claiming and
+            # re-evaluating it on every tick until then.
+            Repository.defer_partition_to_next_scheduled!(
+              policy_name:   @policy_name,
+              partition_key: partition["partition_key"]
+            )
+            next
+          end
 
           # Decouple the active_job_id we hand to the adapter from the
           # staged payload's job_id. Adapters that use active_job_id as

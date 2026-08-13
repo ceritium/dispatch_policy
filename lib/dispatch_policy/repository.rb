@@ -327,6 +327,38 @@ module DispatchPolicy
       )
     end
 
+    # Park a partition until its soonest future-scheduled job is due.
+    #
+    # `claim_partitions` selects on `pending_count > 0`, which counts rows
+    # scheduled for later, while `claim_staged_jobs!` only takes rows whose
+    # `scheduled_at` has arrived. A partition holding nothing but future
+    # work therefore claims, finds nothing, and — with `next_eligible_at`
+    # left NULL — is immediately eligible again: a full transaction and a
+    # `partition_batch_size` slot burned every tick until the job is due,
+    # with `no_rows_claimed` filling the denial breakdown meanwhile.
+    #
+    # Only sets the value when there is no backoff already: a gate that
+    # just asked for one is asking about capacity, which outranks this.
+    # A NULL result (another tick took the rows in between) leaves the
+    # partition immediately eligible, which is correct.
+    def defer_partition_to_next_scheduled!(policy_name:, partition_key:)
+      connection.exec_query(
+        <<~SQL.squish,
+          UPDATE #{PARTITIONS_TABLE} p
+          SET next_eligible_at = (
+                SELECT MIN(s.scheduled_at) FROM #{STAGED_TABLE} s
+                WHERE s.policy_name = $1 AND s.partition_key = $2
+                  AND s.scheduled_at > now()
+              ),
+              updated_at = now()
+          WHERE p.policy_name = $1 AND p.partition_key = $2
+            AND p.next_eligible_at IS NULL
+        SQL
+        "defer_partition_to_next_scheduled",
+        [policy_name, partition_key]
+      )
+    end
+
     # Bulk-update many partitions whose pipeline this tick decided to deny.
     # One UPDATE…FROM(VALUES…) instead of one UPDATE per partition, which
     # cuts a tick with `partition_batch_size = 50` from ~50 round-trips on
