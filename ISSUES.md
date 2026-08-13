@@ -24,9 +24,10 @@ the `database_role` wrapper and cursor pagination.
 
 ## High
 
-> **Status:** H3 fixed (Phase 1) — regression tests in
-> `test/integration/inflight_lifecycle_test.rb`. H4, H5 and everything
-> below are still open.
+> **Status:** H3, H4 and H5 fixed, each with regression tests
+> (`inflight_lifecycle_test.rb`, `master_switch_test.rb`,
+> `adaptive_concurrency_test.rb`). M10–M12 and L11–L17 are still open;
+> the plan below numbers them as phases 4–7.
 >
 > A review of the Phase 1 branch itself found that the first version of
 > the fix only closed the wedge for classes declaring their policy with
@@ -267,7 +268,7 @@ One branch/PR per phase, in this order. Every fix lands with a
 regression test. **No phase requires a schema change**, so there are no
 upgrade notes for existing installs.
 
-## Phase 1 — H3: inflight row lifecycle
+## Phase 1 — H3: inflight row lifecycle *(done — see R1, the deeper version)*
 
 The root cause is that creation is unconditional while deletion is
 opt-in. Close both ends:
@@ -293,7 +294,7 @@ fully; a throttle-only policy creates no inflight rows on admit;
 declaring the macro on top of the auto-install runs `track` exactly
 once.
 
-## Phase 2 — H4: the master switch stops staging, not draining
+## Phase 2 — H4: the master switch stops staging, not draining *(done)*
 
 Drop the `break` in `tick_loop.rb`. Final semantics: `enabled` governs
 enqueue interception only; work already staged keeps draining. Stopping
@@ -303,7 +304,7 @@ admission outright already has two better mechanisms — stop the
 `enabled` in the README (it appears only in a CHANGELOG line today) and
 flag the behavior change in the CHANGELOG.
 
-## Phase 3 — H5: ceiling for `:adaptive_concurrency`
+## Phase 3 — H5: ceiling for `:adaptive_concurrency` *(done)*
 
 1. New `max:` option, defaulting to `initial_max * 10`; validate
    `max >= initial_max`.
