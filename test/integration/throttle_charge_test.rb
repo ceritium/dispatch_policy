@@ -17,46 +17,19 @@ require_relative "../../app/models/dispatch_policy/tick_sample"
 #   - another tick grabbed rows under SKIP LOCKED.
 # Before the fix the bucket was drained by `allowed` regardless, leaking
 # tokens and dragging the effective rate below the configured one.
-class ThrottleChargeTest < Minitest::Test
+class ThrottleChargeTest < DispatchPolicy::IntegrationTest
   class ChargeJob < ActiveJob::Base
     include DispatchPolicy::JobExtension
     def perform(*); end
   end
 
-  def self.connect!
-    return @connected if defined?(@connected) && @connected
-
-    ActiveRecord::Base.establish_connection(
-      adapter:  "postgresql",
-      encoding: "unicode",
-      host:     ENV.fetch("DB_HOST", "localhost"),
-      username: ENV.fetch("DB_USER", ENV["USER"]),
-      password: ENV.fetch("DB_PASS", ""),
-      database: ENV.fetch("DB_NAME", "dispatch_policy_test")
-    )
-    ActiveRecord::Base.connection.execute("SELECT 1")
-    @connected = true
-  rescue StandardError => e
-    warn "[skip] Postgres not reachable: #{e.message}"
-    @connected = false
-  end
-
   def setup
     super
-    skip "no Postgres available" unless self.class.connect!
-    truncate_tables!
     DispatchPolicy.reset_registry!
   end
 
   def teardown
     DispatchPolicy.reset_registry!
-  end
-
-  def truncate_tables!
-    ActiveRecord::Base.connection.execute(
-      "TRUNCATE dispatch_policy_staged_jobs, dispatch_policy_partitions, " \
-      "dispatch_policy_inflight_jobs, dispatch_policy_tick_samples RESTART IDENTITY"
-    )
   end
 
   def stage!(scheduled_at: nil, id:)

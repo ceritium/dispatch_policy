@@ -12,53 +12,8 @@ require_relative "../../app/models/dispatch_policy/adaptive_concurrency_stats"
 # Repository so they stay DB-less; here we run the SQL itself and
 # pin its arithmetic across all four code branches (seed, +1 grow,
 # slow-shrink, fail-shrink).
-class AdaptiveConcurrencyIntegrationTest < Minitest::Test
+class AdaptiveConcurrencyIntegrationTest < DispatchPolicy::IntegrationTest
   POLICY = "adaptive_test"
-
-  def self.connect!
-    return @connected if defined?(@connected) && @connected
-
-    ActiveRecord::Base.establish_connection(
-      adapter:  "postgresql",
-      encoding: "unicode",
-      host:     ENV.fetch("DB_HOST", "localhost"),
-      username: ENV.fetch("DB_USER", ENV["USER"]),
-      password: ENV.fetch("DB_PASS", ""),
-      database: ENV.fetch("DB_NAME", "dispatch_policy_test")
-    )
-    ActiveRecord::Base.connection.execute("SELECT 1")
-    @connected = true
-  rescue StandardError => e
-    warn "[skip] Postgres not reachable: #{e.message}"
-    @connected = false
-  end
-
-  def setup
-    super
-    skip "no Postgres available" unless self.class.connect!
-    ensure_schema!
-    truncate_tables!
-  end
-
-  def ensure_schema!
-    cols_present = ActiveRecord::Base.connection.table_exists?("dispatch_policy_adaptive_concurrency_stats")
-    return if cols_present
-    ActiveRecord::Base.connection.execute(
-      "DROP TABLE IF EXISTS dispatch_policy_staged_jobs, dispatch_policy_partitions, " \
-      "dispatch_policy_inflight_jobs, dispatch_policy_tick_samples, " \
-      "dispatch_policy_adaptive_concurrency_stats CASCADE"
-    )
-    require_relative "../../db/migrate/20260501000001_create_dispatch_policy_tables"
-    ActiveRecord::Migration.suppress_messages { CreateDispatchPolicyTables.new.change }
-  end
-
-  def truncate_tables!
-    ActiveRecord::Base.connection.execute(
-      "TRUNCATE dispatch_policy_staged_jobs, dispatch_policy_partitions, " \
-      "dispatch_policy_inflight_jobs, dispatch_policy_tick_samples, " \
-      "dispatch_policy_adaptive_concurrency_stats RESTART IDENTITY"
-    )
-  end
 
   def seed!(initial_max: 4)
     DispatchPolicy::Repository.adaptive_seed!(

@@ -10,7 +10,7 @@ require_relative "../../app/models/dispatch_policy/tick_sample"
 # Verifies the atomic admission contract: when Forwarder.dispatch raises
 # from inside Tick's transaction, the entire admission is rolled back —
 # staged_jobs return, inflight rows disappear, partition counters revert.
-class TickAtomicAdmissionTest < Minitest::Test
+class TickAtomicAdmissionTest < DispatchPolicy::IntegrationTest
   class TestTickJob < ActiveJob::Base
     include DispatchPolicy::JobExtension
     around_enqueue do |job, blk|
@@ -19,28 +19,8 @@ class TickAtomicAdmissionTest < Minitest::Test
     def perform(*); end
   end
 
-  def self.connect!
-    return @connected if defined?(@connected) && @connected
-
-    ActiveRecord::Base.establish_connection(
-      adapter:  "postgresql",
-      encoding: "unicode",
-      host:     ENV.fetch("DB_HOST", "localhost"),
-      username: ENV.fetch("DB_USER", ENV["USER"]),
-      password: ENV.fetch("DB_PASS", ""),
-      database: ENV.fetch("DB_NAME", "dispatch_policy_test")
-    )
-    ActiveRecord::Base.connection.execute("SELECT 1")
-    @connected = true
-  rescue StandardError => e
-    warn "[skip] Postgres not reachable: #{e.message}"
-    @connected = false
-  end
-
   def setup
     super
-    skip "no Postgres available" unless self.class.connect!
-    truncate_tables!
 
     # Install BulkEnqueue patch (railtie installs it in real apps; in this
     # integration test we mirror that so Forwarder's bulk handoff path
@@ -69,13 +49,6 @@ class TickAtomicAdmissionTest < Minitest::Test
   def teardown
     DispatchPolicy.reset_registry!
     Object.send(:remove_const, :AtomicTestJob) if Object.const_defined?(:AtomicTestJob)
-  end
-
-  def truncate_tables!
-    ActiveRecord::Base.connection.execute(
-      "TRUNCATE dispatch_policy_staged_jobs, dispatch_policy_partitions, " \
-      "dispatch_policy_inflight_jobs, dispatch_policy_tick_samples RESTART IDENTITY"
-    )
   end
 
   def stage_one_job!
