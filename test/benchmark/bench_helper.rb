@@ -51,10 +51,16 @@ module Bench
 
   def recreate_schema!
     require_relative "../../db/migrate/20260501000001_create_dispatch_policy_tables"
+    # Every table the migration creates — each bench_*.rb calls this, so a
+    # table left behind makes the NEXT call fail with DuplicateTable.
+    # Keep in sync with the migration (see the "Adding a table?" workflow
+    # in CLAUDE.md).
     ActiveRecord::Base.connection.execute(
       "DROP TABLE IF EXISTS dispatch_policy_staged_jobs, " \
       "dispatch_policy_partitions, dispatch_policy_inflight_jobs, " \
-      "dispatch_policy_tick_samples CASCADE"
+      "dispatch_policy_tick_samples, " \
+      "dispatch_policy_adaptive_concurrency_stats, " \
+      "dispatch_policy_policy_settings CASCADE"
     )
     ActiveRecord::Migration.suppress_messages do
       CreateDispatchPolicyTables.new.change
@@ -125,7 +131,12 @@ module Bench
     DispatchPolicy.reset_registry!
     policy = DispatchPolicy::PolicyDSL.build(policy_name) do
       context ->(_args) { {} }
-      gate :throttle, rate: 1_000_000, per: 60, partition_by: ->(_c) { "k" }
+      # partition_by is policy-level and required; the per-gate
+      # `partition_by:` these benchmarks used to pass was removed from the
+      # DSL. The value is irrelevant here — the seeded rows carry their own
+      # partition_key and the throttle's bucket lives on the partition row.
+      partition_by ->(_c) { "k" }
+      gate :throttle, rate: 1_000_000, per: 60
       admission_batch_size batch_size
       fairness half_life: half_life if half_life
       tick_admission_budget tick_cap if tick_cap
@@ -141,8 +152,18 @@ module Bench
     ((Process.clock_gettime(Process::CLOCK_MONOTONIC) - t0) * 1_000).round(2)
   end
 
+  # RUNS overrides the per-call-site default. The Rakefile advertises it
+  # ("RUNS=10 to increase samples") and print_report prints it, but until
+  # this existed nothing read it — the footer claimed a sample count the
+  # run never used. Raise it when a scenario's numbers move more between
+  # runs than the difference you're trying to measure.
+  def runs_for(default)
+    ENV["RUNS"] ? Integer(ENV["RUNS"]) : default
+  end
+
   # Median over N runs, with the first run discarded as warmup.
   def measure_median_ms(runs: 5, &block)
+    runs    = runs_for(runs)
     samples = runs.times.map { measure_ms(&block) }
     samples.shift # warmup
     return samples.first if samples.size == 1
@@ -156,6 +177,7 @@ module Bench
   # the next iteration would otherwise measure "tick with nothing to
   # do".
   def measure_median_ms_with_setup(runs: 5, setup:, work:)
+    runs    = runs_for(runs)
     samples = runs.times.map do
       setup.call
       measure_ms { work.call }
