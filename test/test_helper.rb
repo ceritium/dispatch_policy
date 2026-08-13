@@ -37,14 +37,9 @@ module DispatchPolicy
   # from green to 17 errors and back to green on a re-run, purely on
   # ordering.
   module PostgresTest
-    TABLES = %w[
-      dispatch_policy_staged_jobs
-      dispatch_policy_partitions
-      dispatch_policy_inflight_jobs
-      dispatch_policy_tick_samples
-      dispatch_policy_adaptive_concurrency_stats
-      dispatch_policy_policy_settings
-    ].freeze
+    # Read from the gem so a new table can't be missed here — see
+    # Repository::ALL_TABLES.
+    TABLES = DispatchPolicy::Repository::ALL_TABLES
 
     # Columns that must exist for the schema to count as current. Add to
     # this when a migration adds a column, per the "Adding a table?"
@@ -56,8 +51,15 @@ module DispatchPolicy
 
     # Memoized across the whole run rather than per class: ten classes
     # used to open (and warn about) the same connection independently.
+    #
+    # Only SUCCESS is memoized. Caching a failure would let one transient
+    # hiccup — Postgres restarting, a momentary connection limit — skip
+    # every remaining integration test in the run, and (outside CI, where
+    # DISPATCH_POLICY_REQUIRE_DB makes it fatal) report green having
+    # exercised nothing but the unit tests. Retrying per class costs one
+    # failed connect attempt each when the database really is absent.
     def connect!
-      return @connected unless @connected.nil?
+      return true if @connected
 
       ActiveRecord::Base.establish_connection(
         adapter:  "postgresql",
@@ -76,8 +78,13 @@ module DispatchPolicy
       # DISPATCH_POLICY_REQUIRE_DB turns "no database" into a failure.
       raise if ENV["DISPATCH_POLICY_REQUIRE_DB"] == "1"
 
-      warn "[skip] Postgres not reachable: #{e.message}"
-      @connected = false
+      # Warn once per run, not once per test class, while still leaving
+      # @connected unset so a later class retries.
+      unless @warned
+        warn "[skip] Postgres not reachable: #{e.message}"
+        @warned = true
+      end
+      false
     end
 
     def ensure_schema!
