@@ -134,7 +134,13 @@ module DispatchPolicy
           )
         end
 
-        rows.group_by { |r| [r[:policy_name], r[:partition_key]] }.each do |(policy_name, partition_key), group|
+        # Sorted so concurrent bulk enqueues touching the same partitions
+        # take their row locks in the same order. Two perform_all_later
+        # calls that happened to list partitions A,B and B,A could
+        # otherwise each hold one and wait for the other — a deadlock
+        # Postgres resolves by killing one of the transactions, losing
+        # that whole batch's staging.
+        rows.group_by { |r| [r[:policy_name], r[:partition_key]] }.sort_by(&:first).each do |(policy_name, partition_key), group|
           upsert_partition!(
             policy_name:   policy_name,
             partition_key: partition_key,
@@ -223,7 +229,8 @@ module DispatchPolicy
     # many partitions into a single UPDATE…FROM(VALUES…) at the end of
     # the tick.
     def claim_staged_jobs!(policy_name:, partition_key:, limit:, retry_after:,
-                           gate_state_patch: nil, half_life_seconds: nil)
+                           gate_state_patch: nil, half_life_seconds: nil,
+                           preserve_next_eligible: false)
       raise ArgumentError, "claim_staged_jobs! requires limit > 0" unless limit.positive?
 
       sql_select = <<~SQL.squish
@@ -255,7 +262,8 @@ module DispatchPolicy
         admitted:          rows.size,
         gate_state_patch:  patch,
         retry_after:       retry_after,
-        half_life_seconds: half_life_seconds
+        half_life_seconds: half_life_seconds,
+        preserve_next_eligible: preserve_next_eligible
       )
 
       rows.map { |r| normalize_staged(r) }
@@ -272,9 +280,22 @@ module DispatchPolicy
     # last update, then `admitted` is added on top. This keeps fairness
     # state atomic with the admit (no separate write, no race) and
     # leaves the partitions row's lock undisturbed.
+    # `preserve_next_eligible` leaves any existing backoff alone instead of
+    # replacing it. The Tick wants the default: it has just evaluated the
+    # gates, so what they said supersedes whatever was there. A forced
+    # admission (the UI's admit/drain) bypassed the gates entirely and has
+    # therefore learned nothing about capacity — clearing the backoff there
+    # just makes the next tick re-claim the partition, re-evaluate it and
+    # back it off again.
     def record_partition_admit!(policy_name:, partition_key:, admitted:, gate_state_patch:,
-                                retry_after:, half_life_seconds: nil)
-      next_eligible_sql, next_eligible_params = next_eligible_clause(retry_after)
+                                retry_after:, half_life_seconds: nil,
+                                preserve_next_eligible: false)
+      next_eligible_sql, next_eligible_params =
+        if preserve_next_eligible
+          ["next_eligible_at", []]
+        else
+          next_eligible_clause(retry_after)
+        end
       gate_state_json = JSON.dump(gate_state_patch || {})
 
       params = [policy_name, partition_key, admitted, gate_state_json, *next_eligible_params]
@@ -324,6 +345,38 @@ module DispatchPolicy
         SQL
         "record_partition_admit",
         params
+      )
+    end
+
+    # Park a partition until its soonest future-scheduled job is due.
+    #
+    # `claim_partitions` selects on `pending_count > 0`, which counts rows
+    # scheduled for later, while `claim_staged_jobs!` only takes rows whose
+    # `scheduled_at` has arrived. A partition holding nothing but future
+    # work therefore claims, finds nothing, and — with `next_eligible_at`
+    # left NULL — is immediately eligible again: a full transaction and a
+    # `partition_batch_size` slot burned every tick until the job is due,
+    # with `no_rows_claimed` filling the denial breakdown meanwhile.
+    #
+    # Only sets the value when there is no backoff already: a gate that
+    # just asked for one is asking about capacity, which outranks this.
+    # A NULL result (another tick took the rows in between) leaves the
+    # partition immediately eligible, which is correct.
+    def defer_partition_to_next_scheduled!(policy_name:, partition_key:)
+      connection.exec_query(
+        <<~SQL.squish,
+          UPDATE #{PARTITIONS_TABLE} p
+          SET next_eligible_at = (
+                SELECT MIN(s.scheduled_at) FROM #{STAGED_TABLE} s
+                WHERE s.policy_name = $1 AND s.partition_key = $2
+                  AND s.scheduled_at > now()
+              ),
+              updated_at = now()
+          WHERE p.policy_name = $1 AND p.partition_key = $2
+            AND p.next_eligible_at IS NULL
+        SQL
+        "defer_partition_to_next_scheduled",
+        [policy_name, partition_key]
       )
     end
 
@@ -874,12 +927,38 @@ module DispatchPolicy
 
     # ----------------------------------------------------------------------------
 
-    def sweep_inactive_partitions!(cutoff_seconds:)
+    # `policy_name` sweeps one policy (with its own cutoff — see
+    # TickLoop.sweep!, which gives a throttled policy a cutoff at least as
+    # long as its refill window). `except_policies` is the complement: one
+    # pass at the default cutoff for every partition whose policy isn't
+    # registered in this process, so rows left behind by a deleted policy
+    # are still collected.
+    #
+    # `status` is deliberately not filtered. It used to require 'active',
+    # which meant a paused policy's empty partitions were never collected
+    # at all — pausing is when partitions are MOST likely to go empty and
+    # stay that way. Nothing is lost by collecting one: the pause flag
+    # lives in dispatch_policy_policy_settings, so it still applies when
+    # the partition reappears.
+    def sweep_inactive_partitions!(cutoff_seconds:, policy_name: nil, except_policies: [])
+      params = [cutoff_seconds.to_i]
+      filter = ""
+      if policy_name
+        params << policy_name
+        filter = "AND policy_name = $#{params.size}"
+      elsif except_policies.any?
+        placeholders = except_policies.map do |name|
+          params << name
+          "$#{params.size}"
+        end
+        filter = "AND policy_name NOT IN (#{placeholders.join(', ')})"
+      end
+
       connection.exec_query(
         <<~SQL.squish,
           DELETE FROM #{PARTITIONS_TABLE}
           WHERE pending_count = 0
-            AND status = 'active'
+            #{filter}
             AND (
               (last_admit_at IS NOT NULL AND last_admit_at < now() - ($1 || ' seconds')::interval)
               OR
@@ -887,7 +966,7 @@ module DispatchPolicy
             )
         SQL
         "sweep_inactive_partitions",
-        [cutoff_seconds.to_i]
+        params
       )
     end
 

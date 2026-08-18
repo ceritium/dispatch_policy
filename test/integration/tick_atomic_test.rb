@@ -206,4 +206,27 @@ class TickAtomicAdmissionTest < DispatchPolicy::IntegrationTest
     refute_includes inflight_ids, staged_aj_id,
                     "no inflight row should be left under the original staged job_id"
   end
+  # L12: whatever made the admission raise — the adapter refusing
+  # enqueues, a gate with a bug — will not be fixed by the next tick a
+  # fraction of a second later. Without a backoff the tick re-claims and
+  # re-fails the same partition every iteration, burning a claim slot and
+  # a transaction each time and burying the log in one repeated error.
+  def test_a_failed_admission_backs_the_partition_off
+    stage_one_job!
+    forwarder = DispatchPolicy::Forwarder.singleton_class
+    original  = forwarder.instance_method(:dispatch)
+    forwarder.define_method(:dispatch) { |_rows| raise "adapter exploded" }
+
+    begin
+      DispatchPolicy::Tick.run(policy_name: "atomic_test")
+    ensure
+      forwarder.define_method(:dispatch, original)
+    end
+
+    partition = DispatchPolicy::Partition.first
+    refute_nil partition.next_eligible_at,
+               "a failed admission must park the partition, not retry it every tick"
+    assert_operator partition.next_eligible_at, :>, Time.current,
+                    "and the backoff must be in the future"
+  end
 end

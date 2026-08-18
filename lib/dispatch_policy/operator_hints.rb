@@ -89,13 +89,18 @@ module DispatchPolicy
       end
 
       # ---- forward failure rate --------------------------------------
-      if m[:jobs_admitted].to_i.positive?
-        rate = m[:forward_failures].to_f / m[:jobs_admitted]
+      # Both sides are partition counts. forward_failures counts
+      # PARTITIONS whose admission raised, so dividing it by jobs_admitted
+      # compared partitions against jobs: with a healthy 100 jobs per
+      # partition it read as 1% when every single partition had failed.
+      if m[:partitions_seen].to_i.positive?
+        rate = m[:forward_failures].to_f / m[:partitions_seen]
         if rate >= 0.01
           hints << Hint.new(
             level: rate >= 0.05 ? :critical : :warn,
-            message: "Forward failures at #{format('%.1f%%', rate * 100)} (#{m[:forward_failures]} / " \
-                     "#{m[:jobs_admitted]} admits). Inspect logs — adapter is rejecting enqueues."
+            message: "Forward failures on #{format('%.1f%%', rate * 100)} of partitions " \
+                     "(#{m[:forward_failures]} / #{m[:partitions_seen]} seen). " \
+                     "Inspect logs — the adapter is rejecting enqueues, or a gate is raising."
           )
         end
       end

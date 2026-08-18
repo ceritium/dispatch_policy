@@ -50,7 +50,17 @@ module DispatchPolicy
             partition_key:    partition_key,
             limit:            limit,
             gate_state_patch: {},
-            retry_after:      nil
+            retry_after:      nil,
+            # A forced admission bypasses the gates, so it has learned
+            # nothing about capacity and must not clear a backoff one of
+            # them asked for — that only makes the next tick re-claim the
+            # partition, re-evaluate it and back it off again.
+            preserve_next_eligible: true,
+            # …but it IS an admission, so fairness has to see it. Without
+            # the half-life the decay clause is skipped entirely and a
+            # partition drained from the UI still looks under-admitted to
+            # the next tick's reorder, which then favours it again.
+            half_life_seconds: fairness_half_life(policy)
           )
           next if rows.empty?
 
@@ -74,6 +84,13 @@ module DispatchPolicy
         end
       end
       forwarded
+    end
+
+    # Same precedence the Tick uses: the policy's override, else the
+    # global default. nil (fairness disabled) skips the decay clause,
+    # which is then correct rather than an oversight.
+    def fairness_half_life(policy)
+      policy&.fairness_half_life_seconds || DispatchPolicy.config.fairness_half_life_seconds
     end
   end
 end

@@ -16,10 +16,15 @@ bloat listings, UI queries, and the partitions table.
 
 **Possible improvements.**
 
-- Lower the default TTL to something more aggressive (1h? 15m?). The
-  only thing lost when an empty partition is deleted is its
-  `gate_state` (token bucket), which rebuilds itself when the
-  partition reappears.
+- Lower the default TTL to something more aggressive (1h? 15m?). Note
+  the constraint M11 established: what is lost when an empty partition
+  is deleted is its `gate_state` (token bucket), and "it rebuilds
+  itself" means it rebuilds itself FULL. Deleting a partition inside a
+  throttle's refill window therefore hands that tenant a fresh quota,
+  so the sweeper's cutoff can never go below the policy's window —
+  TickLoop.sweep! now takes `max(partition_inactive_after, per)` per
+  policy. A more aggressive default is still fine for short windows;
+  it just can't be global.
 - Add a "GC partitions" button in the UI that calls
   `Repository.sweep_inactive_partitions!(cutoff_seconds: 0)` for
   on-demand cleanup.

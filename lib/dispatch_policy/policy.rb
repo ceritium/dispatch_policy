@@ -65,6 +65,17 @@ module DispatchPolicy
       @gates.find { |g| InflightTracker::TRACKED_GATES.include?(g.name) }
     end
 
+    # How long this policy's token bucket takes to refill, when that is a
+    # fixed number of seconds. The bucket lives in the partition row's
+    # gate_state, so the partition sweeper must not delete a row inside a
+    # window still being spent — that would hand the tenant a fresh quota.
+    # nil when there is no throttle (nothing to lose) or when `per` is a
+    # proc (unknowable without a context; the sweeper falls back to
+    # config.partition_inactive_after and says so).
+    def static_throttle_window
+      @gates.find { |g| g.name == :throttle }&.static_per
+    end
+
     # The shard a partition belongs to. Stable per (policy, partition_key)
     # via first-writer-wins in Repository.upsert_partition!. If no shard_by
     # is declared the partition lives on the "default" shard.

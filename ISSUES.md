@@ -24,10 +24,9 @@ the `database_role` wrapper and cursor pagination.
 
 ## High
 
-> **Status:** H3, H4 and H5 fixed, each with regression tests
-> (`inflight_lifecycle_test.rb`, `master_switch_test.rb`,
-> `adaptive_concurrency_test.rb`). M10–M12 and L11–L17 are still open;
-> the plan below numbers them as phases 4–7.
+> **Status:** every finding in this audit (H3–H5, M10–M12, L11–L17) is
+> fixed, each with a regression test verified to fail against the code it
+> replaces. H3–H5 landed in #35; M10–M12 and the L cleanup followed.
 >
 > A review of the Phase 1 branch itself found that the first version of
 > the fix only closed the wedge for classes declaring their policy with
@@ -317,7 +316,7 @@ The refinement "only grow while `in_flight >= current_max * 0.8`" needs
 the live in-flight count at observation time; record it in `IDEAS.md`
 rather than widening this PR.
 
-## Phase 4 — M10: back off to the next `scheduled_at`
+## Phase 4 — M10: back off to the next `scheduled_at` *(done)*
 
 New `Repository.defer_partition_to_next_scheduled!` issuing a single
 `UPDATE … SET next_eligible_at = (SELECT MIN(scheduled_at) … WHERE
@@ -328,7 +327,7 @@ NULL subquery result (another tick took the rows) correctly leaves the
 partition immediately eligible. Uses `idx_dp_staged_admission` and only
 runs when the claim came back empty.
 
-## Phase 5 — M11: the GC must not drop a bucket that is still spending
+## Phase 5 — M11: the GC must not drop a bucket that is still spending *(done)*
 
 A partition may only be deleted once its bucket would have refilled,
 i.e. `last_admit_at + per` — which is exactly what a per-policy cutoff
@@ -344,7 +343,7 @@ expresses, since the sweep already keys on `last_admit_at`.
 4. A dynamic `per` cannot be bounded: keep the default cutoff and warn
    once at boot. Correct the claim in `IDEAS.md:19-22`.
 
-## Phase 6 — M12: manual admission
+## Phase 6 — M12: manual admission *(done)*
 
 Add `preserve_next_eligible:` to `record_partition_admit!` /
 `claim_staged_jobs!` (when true the SET becomes
@@ -353,7 +352,7 @@ which is right after a successful admit), and have
 `ManualAdmission.force!` pass it along with the policy's
 `half_life_seconds`.
 
-## Phase 7 — L11–L15 cleanup, one PR
+## Phase 7 — L11–L15 cleanup, one PR *(done, plus L16/L17 as docs)*
 
 Sort the groups in `stage_many!`; give the `admit_partition` rescue a
 short `config.forward_failure_backoff` (default 5s) pushed through

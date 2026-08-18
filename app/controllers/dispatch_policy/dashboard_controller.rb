@@ -43,6 +43,7 @@ module DispatchPolicy
         admitted_per_minute:  @capacity[:admitted_per_minute],
         forward_failures:     @windows["1m"][:forward_failures],
         jobs_admitted:        @windows["1m"][:jobs_admitted],
+        partitions_seen:      @windows["1m"][:partitions_seen],
         active_partitions:    @round_trip[:active_partitions],
         never_checked:        @round_trip[:never_checked],
         in_backoff:           @round_trip[:in_backoff],

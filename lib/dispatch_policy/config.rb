@@ -20,7 +20,8 @@ module DispatchPolicy
                   :database_role,
                   :fairness_half_life_seconds,
                   :tick_admission_budget,
-                  :adapter_throughput_target
+                  :adapter_throughput_target,
+                  :forward_failure_backoff
 
     def initialize
       # Master switch for the ENQUEUE side. When false, the around_enqueue
@@ -85,6 +86,13 @@ module DispatchPolicy
       # nil = no ceiling reference (just shows the absolute rate).
       # Measured locally against good_job: ~3500 jobs/sec per worker.
       @adapter_throughput_target = nil
+      # How long a partition backs off after its admission raised — an
+      # adapter refusing enqueues, or a gate with a bug. Without it the
+      # tick re-claims and re-fails that partition every iteration, which
+      # burns a claim slot and a transaction per tick and buries the logs
+      # in the same error. Keep it short: it also delays recovery once
+      # whatever broke is fixed. 0 disables the backoff.
+      @forward_failure_backoff   = 5
     end
 
     def now
