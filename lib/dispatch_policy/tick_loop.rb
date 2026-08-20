@@ -110,9 +110,18 @@ module DispatchPolicy
         window = policy.static_throttle_window
         warn_unbounded_sweep(policy) if window.nil? && throttled?(policy)
 
+        # Two ways out for a throttled partition: outlive the window (the
+        # bucket has certainly refilled), or be idle the normal cutoff
+        # with a bucket already at capacity. Without the second, a
+        # `per: 7.days` policy holds every partition for a week — a lot
+        # of rows for state that only matters below capacity.
+        capacity = policy.static_throttle_capacity
         Repository.sweep_inactive_partitions!(
           cutoff_seconds: window ? [default_cutoff, window.ceil].max : default_cutoff,
-          policy_name:    policy.name
+          policy_name:    policy.name,
+          full_bucket:    (if window && capacity
+                             { capacity: capacity, cutoff_seconds: default_cutoff }
+                           end)
         )
       end
 

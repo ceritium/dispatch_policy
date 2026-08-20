@@ -76,6 +76,13 @@ module DispatchPolicy
       @gates.find { |g| g.name == :throttle }&.static_per
     end
 
+    # Bucket size, when the throttle's rate is a fixed number. Lets the
+    # sweeper collect a partition whose bucket has already refilled
+    # without waiting out the whole window — see TickLoop.sweep!.
+    def static_throttle_capacity
+      @gates.find { |g| g.name == :throttle }&.static_capacity
+    end
+
     # The shard a partition belongs to. Stable per (policy, partition_key)
     # via first-writer-wins in Repository.upsert_partition!. If no shard_by
     # is declared the partition lives on the "default" shard.

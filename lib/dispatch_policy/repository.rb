@@ -987,7 +987,17 @@ module DispatchPolicy
     # stay that way. Nothing is lost by collecting one: the pause flag
     # lives in dispatch_policy_policy_settings, so it still applies when
     # the partition reappears.
-    def sweep_inactive_partitions!(cutoff_seconds:, policy_name: nil, except_policies: [])
+    # `full_bucket` — {capacity:, cutoff_seconds:} — collects a partition
+    # early when its token bucket is already at capacity. Giving a
+    # throttled policy a cutoff as long as its window (so the bucket is
+    # never reset mid-window) otherwise means holding every partition of
+    # a `per: 7.days` policy for a week, which is a lot of rows to keep
+    # for state that is only interesting while it is BELOW capacity. A
+    # full bucket is worth nothing: a partition that reappears starts
+    # full anyway. Only available when the rate is a fixed number —
+    # capacity is unknowable here otherwise.
+    def sweep_inactive_partitions!(cutoff_seconds:, policy_name: nil, except_policies: [],
+                                   full_bucket: nil)
       params = [cutoff_seconds.to_i]
       filter = ""
       if policy_name
@@ -1001,15 +1011,32 @@ module DispatchPolicy
         filter = "AND policy_name NOT IN (#{placeholders.join(', ')})"
       end
 
+      if full_bucket
+        cap_idx    = params.size + 1
+        cutoff_idx = params.size + 2
+        params << full_bucket.fetch(:capacity).to_f
+        params << full_bucket.fetch(:cutoff_seconds).to_i
+        # A row with no bucket recorded at all has nothing to lose, hence
+        # the COALESCE to capacity.
+        full_bucket_sql = <<~SQL.squish
+          OR (
+            COALESCE(last_admit_at, created_at) < now() - ($#{cutoff_idx} || ' seconds')::interval
+            AND COALESCE((gate_state -> 'throttle' ->> 'tokens')::double precision,
+                         $#{cap_idx}::double precision) >= $#{cap_idx}::double precision
+          )
+        SQL
+      else
+        full_bucket_sql = ""
+      end
+
       connection.exec_query(
         <<~SQL.squish,
           DELETE FROM #{PARTITIONS_TABLE}
           WHERE pending_count = 0
             #{filter}
             AND (
-              (last_admit_at IS NOT NULL AND last_admit_at < now() - ($1 || ' seconds')::interval)
-              OR
-              (last_admit_at IS NULL AND created_at < now() - ($1 || ' seconds')::interval)
+              COALESCE(last_admit_at, created_at) < now() - ($1 || ' seconds')::interval
+              #{full_bucket_sql}
             )
         SQL
         "sweep_inactive_partitions",

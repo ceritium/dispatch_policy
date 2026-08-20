@@ -106,4 +106,43 @@ class PartitionSweepTest < DispatchPolicy::IntegrationTest
     assert_equal 0, DispatchPolicy::Partition.count,
                  "the catch-all pass covers policies this process doesn't know"
   end
+  # Keeping a partition for the whole window is only necessary while its
+  # bucket is BELOW capacity — that is the state worth preserving. Once it
+  # has refilled the row holds nothing (a partition that reappears starts
+  # full), so it can be collected on the normal cutoff instead of being
+  # held for a week.
+  def test_a_refilled_bucket_is_collected_on_the_normal_cutoff
+    2.times { WeeklyJob.perform_later }
+    DispatchPolicy::Tick.run(policy_name: "sweep_weekly")
+    age_partitions!(25)
+
+    # Simulate the window having elapsed: the bucket is back at capacity.
+    ActiveRecord::Base.connection.execute(<<~SQL)
+      UPDATE dispatch_policy_partitions
+      SET gate_state = jsonb_build_object('throttle', jsonb_build_object(
+            'tokens', 2.0, 'refilled_at', EXTRACT(EPOCH FROM now())))
+    SQL
+
+    DispatchPolicy::TickLoop.sweep!
+
+    assert_equal 0, DispatchPolicy::Partition.count,
+                 "a full bucket is worth nothing; holding the row for 7 days is pure bloat"
+  end
+
+  def test_a_partly_spent_bucket_is_still_held_for_the_window
+    2.times { WeeklyJob.perform_later }
+    DispatchPolicy::Tick.run(policy_name: "sweep_weekly")
+    age_partitions!(25)
+
+    ActiveRecord::Base.connection.execute(<<~SQL)
+      UPDATE dispatch_policy_partitions
+      SET gate_state = jsonb_build_object('throttle', jsonb_build_object(
+            'tokens', 0.5, 'refilled_at', EXTRACT(EPOCH FROM now())))
+    SQL
+
+    DispatchPolicy::TickLoop.sweep!
+
+    assert_equal 1, DispatchPolicy::Partition.count,
+                 "half a token short of capacity still means quota this tenant has spent"
+  end
 end

@@ -23,9 +23,17 @@ module DispatchPolicy
       # that is still being spent hands the tenant a fresh quota.
       attr_reader :static_per
 
+      # Capacity when BOTH knobs are fixed, nil otherwise. The sweeper
+      # uses it to tell a bucket that is already full — such a row holds
+      # nothing worth keeping, since a partition that reappears starts
+      # full anyway — from one that is still spending its window.
+      attr_reader :static_capacity
+
       def initialize(rate:, per:)
         super()
         @rate_proc = rate.respond_to?(:call) ? rate : ->(_ctx) { rate }
+        static_rate = rate.respond_to?(:call) ? nil : Float(rate || 0)
+        @static_capacity = static_rate&.positive? ? [static_rate, 1.0].max : nil
         if per.respond_to?(:call)
           # Dynamic window (per-ctx), symmetric with a dynamic rate. Validated
           # per-evaluate since the value isn't known until admission time.
