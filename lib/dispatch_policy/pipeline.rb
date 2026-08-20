@@ -29,6 +29,15 @@ module DispatchPolicy
       patch
     end
 
+    # The state a gate wants settled atomically in the admission UPDATE,
+    # rather than written back as a literal patch. At most one gate has
+    # one today (the throttle); a second would need Repository to learn
+    # how to compose them, so take the first and be explicit about it.
+    def self.charge_for(decisions)
+      decisions.each { |_, decision| return decision.charge if decision.charge }
+      nil
+    end
+
     def call(ctx, partition, max_budget)
       budget          = max_budget
       retry_after     = nil

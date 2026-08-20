@@ -232,7 +232,11 @@ module DispatchPolicy
             partition_key:     partition["partition_key"],
             limit:             result.admit_count,
             retry_after:       result.retry_after,
-            half_life_seconds: half_life
+            half_life_seconds: half_life,
+            # Settled inside the UPDATE, from the row's own bucket, so two
+            # ticks racing on one partition can't overwrite each other's
+            # charge. See Repository.record_partition_admit!.
+            throttle_charge:   Pipeline.charge_for(result.decisions)
           ) { |admitted_count| settled_patch = Pipeline.settle(result.decisions, admitted_count) }
 
           # `claim_staged_jobs!` always runs `record_partition_admit!` so

@@ -66,27 +66,33 @@ module DispatchPolicy
         elapsed     = [now - refilled_at, 0.0].max
         tokens      = [tokens + (elapsed * refill_rate), capacity].min
 
-        # The patch records the post-refill bucket WITHOUT deducting yet.
-        # The actual deduction is deferred to #consume, which runs once
-        # the admission TX knows how many staged rows were really claimed.
-        # Deducting `allowed` here over-charges the bucket whenever fewer
-        # jobs are admitted than allowed — a later gate capping admit_count,
-        # future-scheduled rows skipped by the `scheduled_at <= now()`
-        # filter, or rows another tick grabbed under SKIP LOCKED.
-        patch = { "tokens" => tokens, "refilled_at" => now }
+        # Nothing is written from here. The refill above is a pure
+        # function of the stored `refilled_at` and the clock, so
+        # persisting it buys nothing — and persisting it on the DENY path
+        # actively hurt: a deny landing after a concurrent admission
+        # overwrote the charged bucket with an uncharged refill, undoing
+        # the admission's cost. What the bucket owes is settled in the
+        # admission UPDATE instead, from the row's own value; `charge`
+        # carries the numbers that needs. `tokens` rides along so #consume
+        # can mirror the result in memory for the tick's second pass.
+        charge = { capacity:    capacity,
+                   refill_rate: refill_rate,
+                   tokens:      tokens,
+                   refilled_at: now }
 
-        whole = tokens.floor
-        if whole.zero?
-          missing      = 1.0 - tokens
-          retry_after  = missing / refill_rate
+        # Under one whole token, not `floor == 0`: the bucket can be
+        # NEGATIVE now that a concurrent over-admission is repaid rather
+        # than forgiven, and a debt is even less admissible than an empty
+        # bucket. `missing` is then > 1 and the backoff covers the debt.
+        if tokens < 1.0
+          missing = 1.0 - tokens
           return Decision.new(allowed: 0,
-                              retry_after: retry_after,
-                              gate_state_patch: { "throttle" => patch },
+                              retry_after: missing / refill_rate,
                               reason: "throttle_empty")
         end
 
-        allowed = [whole, admit_budget].min
-        Decision.new(allowed: allowed, gate_state_patch: { "throttle" => patch })
+        allowed = [tokens.floor, admit_budget].min
+        Decision.new(allowed: allowed, charge: charge)
       end
 
       # Settles the bucket against the number of jobs actually admitted.
@@ -94,12 +100,18 @@ module DispatchPolicy
       # patch; here we subtract exactly `admitted_count` (≤ allowed), so
       # the bucket is charged for jobs that really left, never for unspent
       # budget. Called by Pipeline.settle after the claim.
+      # The persisted value is computed in SQL (see the `charge` above);
+      # what this returns is the in-memory mirror the Tick applies to the
+      # partition it is holding, so the second admission pass in the same
+      # tick evaluates against a bucket that already reflects the first.
+      # Without it pass-2 would re-read the pre-admission count and hand
+      # out the same tokens twice inside one tick.
       def consume(decision, admitted_count)
-        st = decision.gate_state_patch && decision.gate_state_patch["throttle"]
-        return nil unless st
+        c = decision.charge
+        return nil unless c
 
-        { "throttle" => { "tokens"      => st["tokens"].to_f - admitted_count,
-                          "refilled_at" => st["refilled_at"] } }
+        { "throttle" => { "tokens"      => c[:tokens] - admitted_count,
+                          "refilled_at" => c[:refilled_at] } }
       end
 
       private
