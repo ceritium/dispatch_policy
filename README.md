@@ -241,6 +241,16 @@ reads before the transaction opens — so two tick loops on the same
 correction kicks in. Run one loop per shard (the generated
 `DispatchTickLoopJob` does) and shard the policy to parallelise.
 
+One sizing note: the tick cadence is the granularity of the rate limit.
+A partition becomes eligible again `retry_after` seconds after it empties
+its bucket, but nothing admits until the next tick comes round, so the
+achievable rate is capped by how often the loop runs. It only bites when
+the refill period is close to the tick interval — `rate: 1, per: 2` with
+a tick every ~1.1s delivers one job per 2.2s, about 7% under the
+configured rate — and is invisible when a whole window's worth of tokens
+is released at once (`rate: 100, per: 60`). Lower `idle_pause` if you
+need a low rate to be precise.
+
 ```ruby
 gate :throttle,
      rate: ->(ctx) { ctx[:rate_limit] },
