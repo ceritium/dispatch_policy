@@ -13,6 +13,18 @@ module DispatchPolicy
     # `partition_by` (declared in the policy DSL block, not on the gate).
     # The bucket lives on the staged partition row — one row per
     # `policy.partition_for(ctx)` value, one bucket per row, no dilution.
+    #
+    # Concurrency: `evaluate` reads the bucket OUTSIDE the admission
+    # transaction, so two tick loops covering the same (policy, shard)
+    # can both see a full bucket and both admit it — the same caveat
+    # Gates::Concurrency documents for its COUNT(*). What they cannot do
+    # is escape the cost: the bucket is settled inside the admission
+    # UPDATE from the row's own value (Repository#record_partition_admit!),
+    # so the two charges compose, the bucket goes negative, and the debt
+    # comes out of the next window. The long-run rate holds; the burst is
+    # transient. Run one tick loop per (policy, shard) — shard the policy
+    # rather than duplicating loops on one shard — if you need the burst
+    # gone too.
     class Throttle < Gate
       attr_reader :rate_proc, :per_proc
 

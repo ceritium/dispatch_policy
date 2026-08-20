@@ -227,6 +227,20 @@ separate burst). Admits jobs while tokens are available; leaves the
 rest pending for the next tick. State is persisted in
 `partitions.gate_state.throttle`.
 
+A brand-new partition starts on a full bucket, so a tenant's first
+`rate` jobs go out at once — standard token-bucket behaviour, and the
+reason the partition sweeper will not collect a partition whose bucket
+is still below capacity (that would hand the tenant a fresh quota).
+
+The bucket is charged inside the admission transaction, computed from
+the row's own value, so concurrent ticks cannot lose each other's
+charge: the bucket goes negative and the overdraft comes out of the next
+window. The admission *decision* is not serialised, though — `evaluate`
+reads before the transaction opens — so two tick loops on the same
+`(policy, shard)` can still produce a simultaneous burst before that
+correction kicks in. Run one loop per shard (the generated
+`DispatchTickLoopJob` does) and shard the policy to parallelise.
+
 ```ruby
 gate :throttle,
      rate: ->(ctx) { ctx[:rate_limit] },

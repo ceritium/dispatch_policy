@@ -124,6 +124,30 @@
 - **No more Rails 8 deprecation on every tick** (audit 2026-08-13, L14):
   `decayed_admits_epoch` no longer calls `to_time` on a String.
 
+- **The throttle's token bucket is charged atomically** (throttle
+  review). It was written back as a literal jsonb patch computed in Ruby
+  from an earlier read — a read-modify-write across two statements. Two
+  tick loops covering the same `(policy, shard)` each evaluated a full
+  bucket, each admitted it, and the second write overwrote the first, so
+  one admission went uncharged and the effective rate became
+  `rate × loops` **indefinitely**. Reproduced against Postgres: 20 jobs
+  admitted against `rate: 10, per: 60`, bucket left at `0.0` instead of
+  `-10`. The bucket is now recomputed inside the admission UPDATE from
+  the row's own value, so concurrent charges compose and the overdraft is
+  repaid out of the next window — the long-run rate holds. Note this
+  makes the *charge* atomic, not the admission *decision*: a transient
+  burst is still possible, so one tick loop per `(policy, shard)` remains
+  the recommendation. `evaluate` also stops persisting its refill, which
+  is recomputable and, on the deny path, could overwrite a concurrent
+  admission's charge.
+
+- **The partition sweeper collects a refilled bucket on the normal
+  cutoff.** Holding a throttled policy's partitions for its whole window
+  (needed so a mid-window collection can't reset the quota) meant a week
+  of rows for `per: 7.days`. A bucket at capacity is worth nothing — a
+  partition that reappears starts full — so it is now collected on the
+  usual cutoff, and only a partly-spent bucket waits out the window.
+
 ### Changed
 
 - **`config.enabled = false` no longer stops the tick loop** (audit

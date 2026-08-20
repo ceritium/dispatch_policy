@@ -79,9 +79,23 @@ dispatch_policy_policy_settings               one row per policy — pause flag
   UPSERT. Gates read that ctx, NOT `staged_jobs.context` (which is
   historical). This lets a change in the host DB (e.g. new
   `max_per_account`) take effect on the next enqueue.
-- **`shard_by` must be ≥ as coarse as the most restrictive throttle's
-  scope.** If not, the bucket duplicates across shards and the
-  effective rate becomes `rate × N_shards`.
+- **One tick loop per (policy, shard) — the throttle's burst depends on
+  it, not its long-run rate.** `evaluate` reads the token bucket before
+  the admission TX opens, so two loops on the same shard can both see a
+  full bucket and both admit it. The CHARGE is atomic (the bucket is
+  recomputed inside the admission UPDATE from the row's own value), so
+  the two costs compose, the bucket goes negative, and the debt is
+  repaid out of the next window — the rate holds over time, the burst
+  does not. The generated `DispatchTickLoopJob` enforces this with
+  good_job / solid_queue concurrency keys; a hand-rolled driver must.
+  Do NOT go back to writing the bucket as a literal jsonb patch computed
+  in Ruby: that is a read-modify-write, the second writer wins, and the
+  rate silently becomes `rate × N_loops` forever.
+  (The older warning here — that a too-fine `shard_by` duplicates the
+  bucket across shards for `rate × N_shards` — no longer applies: since
+  `partition_by` became policy-level, `(policy_name, partition_key)` is
+  unique and the shard is pinned on first write, so one partition_key is
+  exactly one row on exactly one shard.)
 - **`BulkEnqueue.perform_all_later` checks `Bypass.active?`** and
   delegates to `super` when active. Without it, the call from
   `Forwarder.dispatch` (deserialize + `perform_all_later` under
