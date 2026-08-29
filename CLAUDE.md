@@ -170,6 +170,24 @@ dispatch_policy_policy_settings               one row per policy — pause flag
   `preinserted_inflight_ids`**: TX rollback covers that. If you ever
   support a non-PG adapter, think first about how to keep
   at-least-once without this invariant.
+- **The forward must not be deferrable.** ActiveJob 7.2+ lets a job class
+  set `enqueue_after_transaction_commit = true`, which reroutes its
+  enqueue through `ActiveRecord.after_all_transactions_commit` — i.e.
+  onto the gem's OWN admission transaction, landing after COMMIT and
+  outside `Bypass`. That re-stages the job the tick just admitted (or
+  rolls the admission back) forever. `Forwarder.dispatch` therefore wraps
+  the enqueue in a NON-JOINABLE savepoint when any job in the batch
+  defers: `ActiveRecord.all_open_transactions` skips non-joinable
+  transactions, so the deferral finds nothing to wait for and runs
+  inline. Only when needed — a non-joinable savepoint runs its commit
+  callbacks on RELEASE rather than at the real COMMIT.
+- **The sweep cadence counter lives on the module, not in `run`.** The
+  generated tick job calls `TickLoop.run` for one `tick_max_duration`
+  window and re-enqueues itself, and the shipped defaults put exactly
+  `sweep_every_ticks` iterations in a window — so a per-invocation
+  counter never reaches the modulo and NOTHING is ever swept. Don't move
+  it back into a local, and don't assume a fresh `run` starts a fresh
+  cadence.
 - **Non-PG adapter = warn at boot, no hard-fail.** The railtie calls
   `DispatchPolicy.warn_unsupported_adapter` in `after_initialize`.
   If the host runs Sidekiq/Resque, a warning explains atomicity is

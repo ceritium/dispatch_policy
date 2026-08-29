@@ -14,7 +14,6 @@ module DispatchPolicy
     def run(policy_name: nil, shard: nil, stop_when: -> { false })
       config       = DispatchPolicy.config
       logger       = config.logger
-      iteration    = 0
 
       loop do
         break if stop_when.call
@@ -49,11 +48,32 @@ module DispatchPolicy
           end
         end
 
-        iteration += 1
-        # sweep_every_ticks <= 0 means "never sweep" (rather than crashing
-        # the loop with ZeroDivisionError on `iteration % 0`).
+        # sweep_every_ticks <= 0 means "never sweep".
+        #
+        # The counter lives on the module, NOT in a local. The generated
+        # DispatchTickLoopJob calls `run` for a bounded window
+        # (tick_max_duration) and then re-enqueues itself, so a local
+        # restarts from zero every window — and with the shipped defaults
+        # a window holds at most tick_max_duration / idle_pause = 25 / 0.5
+        # = 50 iterations, exactly `sweep_every_ticks`. Any per-iteration
+        # cost at all leaves the count at 49 and the sweep never fires, in
+        # any window, ever: stale inflight rows then wedge a concurrency
+        # partition permanently (the gate counts rows nothing reaps, the
+        # partition admits 0, admitting 0 means idle_pause, which caps the
+        # window below 50 — self-reinforcing), and tick_samples grow
+        # without bound. Counting across invocations makes the cadence
+        # mean what it says.
+        #
+        # Several loops in one process share the counter, so a deployment
+        # with N of them sweeps N times as often. That is harmless — the
+        # sweeps are idempotent DELETEs on indexed columns — and much
+        # cheaper than the alternative of not sweeping at all.
         sweep_every = config.sweep_every_ticks.to_i
-        sweep! if sweep_every.positive? && (iteration % sweep_every).zero?
+        @ticks_since_sweep = @ticks_since_sweep.to_i + 1
+        if sweep_every.positive? && @ticks_since_sweep >= sweep_every
+          @ticks_since_sweep = 0
+          sweep!
+        end
 
         if admitted.zero?
           pause(config.idle_pause)
@@ -61,6 +81,12 @@ module DispatchPolicy
           pause(config.busy_pause)
         end
       end
+    end
+
+    # Testing seam: the sweep cadence is process state by design (see
+    # `run`), so a test that wants a known starting point has to say so.
+    def reset_sweep_cadence!
+      @ticks_since_sweep = 0
     end
 
     # sleep, but never with a negative argument (which would raise

@@ -20,6 +20,41 @@
   after which the tick re-parks it in the new column.
 ### Fixed
 
+- **A job class that defers its own enqueue no longer breaks admission.**
+  ActiveJob 7.2+ lets a class set `self.enqueue_after_transaction_commit
+  = true` — the setting Rails recommends for apps that enqueue inside
+  ActiveRecord transactions. `Forwarder.dispatch` runs INSIDE the
+  admission transaction, so that deferral registered the real enqueue on
+  the gem's own transaction and it landed after COMMIT, outside the
+  `Bypass` window: the scheduled path re-staged the job it had just
+  admitted, on every tick forever, leaking one inflight row each time
+  (so a `:concurrency` gate wedged at `max` within `max` ticks), and the
+  immediate path saw `successfully_enqueued? == false`, raised, and
+  rolled the whole admission back on every tick forever. The job never
+  reached the adapter either way and nothing said so. The enqueue now
+  runs inside a non-joinable savepoint when a job in the batch defers,
+  which is what makes `ActiveRecord.after_all_transactions_commit` run
+  its block inline — the work happens inside the admission TX and inside
+  Bypass, as the contract requires. Deployments with no such job class
+  are unaffected.
+
+- **The periodic sweeper actually runs.** `TickLoop.run` counted
+  iterations in a local, but the generated `DispatchTickLoopJob` calls
+  `run` for one bounded window (`tick_max_duration`) and re-enqueues
+  itself — so the counter restarted every window. With the shipped
+  defaults a window holds at most `tick_max_duration / idle_pause` =
+  25 / 0.5 = 50 iterations, exactly `sweep_every_ticks`, so any
+  per-iteration cost at all left it at 49 and `iteration %
+  sweep_every_ticks` never hit zero. Nothing was ever swept: stale
+  inflight rows wedged a `:concurrency` partition permanently (the gate
+  counts rows nothing reaps, admitting 0 means `idle_pause`, and
+  `idle_pause` is what keeps the window under 50 — the wedge feeds
+  itself), and `dispatch_policy_tick_samples` grew without bound. The
+  repo's own dummy log shows the symptom: 53,835 `claim_partitions`
+  against 215 `sweep_stale_inflight`, a 1:250 ratio where the nominal
+  cadence is 1:50. The counter now lives on the module and survives
+  re-entry.
+
 - **The heartbeat thread no longer leaks a database connection per
   running job.** `InflightTracker`'s heartbeat wrapped its UPDATE in
   `connection_pool.with_connection`, believing that borrowed and returned
