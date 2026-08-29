@@ -210,4 +210,32 @@ class ManualAdmissionTest < DispatchPolicy::IntegrationTest
     assert_in_delta 3.0, DispatchPolicy::Partition.first.decayed_admits, 0.01,
                     "manual admits must count towards recent activity like any other"
   end
+  # Bypassing the gate's DECISION is what the button is for; escaping its
+  # COST is not. A drain that leaves the bucket untouched hands the tenant
+  # everything it forwarded plus a whole fresh window, and the rate the
+  # policy declares stops being true — so the bucket goes into debt by
+  # exactly what went out, and the next window repays it.
+  def test_a_forced_admission_charges_the_throttle
+    5.times { stage_one_job! }
+
+    assert_equal 5, DispatchPolicy::ManualAdmission.force!(
+      policy_name: "manual_test", partition_key: "k", limit: 10
+    )
+
+    tokens = DispatchPolicy::Partition.first.gate_state.dig("throttle", "tokens").to_f
+    assert_in_delta 95.0, tokens, 0.1,
+                    "a bucket of 100 minus the five jobs the operator pushed out"
+  end
+
+  def test_a_forced_admission_past_the_bucket_leaves_a_debt
+    150.times { stage_one_job! }
+
+    DispatchPolicy::ManualAdmission.force!(
+      policy_name: "manual_test", partition_key: "k", limit: 150
+    )
+
+    tokens = DispatchPolicy::Partition.first.gate_state.dig("throttle", "tokens").to_f
+    assert_in_delta(-50.0, tokens, 0.2,
+                    "150 jobs against a bucket of 100 is a debt of 50, not a free ride")
+  end
 end

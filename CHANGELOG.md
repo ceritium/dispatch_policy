@@ -87,6 +87,19 @@
   knobs are fixed numbers; a proc `rate` or `per` still falls back to
   the window cutoff.
 
+- **A forced admission charges the throttle.** `ManualAdmission.force!`
+  — the dashboard's admit/drain buttons — bypasses every gate by design,
+  but it was also escaping the token bucket's cost: a drain of N jobs
+  went out with the bucket untouched, so the tenant received N plus a
+  whole fresh window and the rate the policy declares stopped being true.
+  The bucket now goes into debt by exactly what was forwarded, and the
+  next window repays it — the same overdraft two racing tick loops
+  produce. Operators should expect a large drain to leave the partition
+  quiet for a while; that is the rate contract catching up, not a stall.
+  Only a fixed `rate`/`per` can be charged from that path (a proc needs
+  the partition's context, which the web process never loads there); a
+  dynamic throttle is left alone and logs a warning.
+
 - **The catch-all sweep no longer resets the token bucket of a policy
   this process merely hasn't loaded.** `TickLoop.sweep!` collects
   partitions whose policy is absent from `DispatchPolicy.registry`,

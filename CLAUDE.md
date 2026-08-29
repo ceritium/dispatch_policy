@@ -200,6 +200,12 @@ dispatch_policy_policy_settings               one row per policy — pause flag
   classes loading, so an unknown policy there means "we can't see it",
   NOT "it has no gate" — the helper inserts unless it knows there is no
   tracked gate, and `force!` warns. Erring the other way over-admits.
+  It also charges the throttle, for the same reason: the button exists to
+  bypass the gate's DECISION, not its COST, and a drain that leaves the
+  bucket alone hands the tenant everything it forwarded plus an untouched
+  window. Only a fixed `rate` and `per` can be charged here — a proc
+  needs the partition's ctx, which this path never loads — so a dynamic
+  throttle is left alone and warns.
 - **Inflight rows are reaped on `discard.active_job`.** The railtie
   subscribes and calls `InflightTracker.handle_discard`, deleting the
   row by `active_job_id`. This covers jobs killed BEFORE around_perform
@@ -349,9 +355,20 @@ FROM dispatch_policy_partitions
 GROUP BY policy_name, shard, status
 ORDER BY pending DESC;
 
--- Partitions currently in backoff
+-- Partitions currently in backoff.
+-- `tokens` is the balance AS OF `refilled_at`, and nothing rewrites it
+-- between admissions (evaluate persists nothing), so read the raw column
+-- and you will see a bucket frozen at the last admit. `live_tokens`
+-- applies the refill the gate would apply — substitute the policy's own
+-- rate/per for the 10/60 below, and its capacity for the LEAST bound.
 SELECT policy_name, partition_key,
-       gate_state -> 'throttle' ->> 'tokens' AS tokens,
+       (gate_state -> 'throttle' ->> 'tokens')::float AS tokens_at_last_admit,
+       LEAST(
+         (gate_state -> 'throttle' ->> 'tokens')::float
+         + GREATEST(EXTRACT(EPOCH FROM now())
+                    - (gate_state -> 'throttle' ->> 'refilled_at')::float, 0) * (10 / 60.0),
+         10
+       ) AS live_tokens,
        (next_eligible_at - now()) AS time_left
 FROM dispatch_policy_partitions
 WHERE next_eligible_at > now();
