@@ -20,6 +20,22 @@
   after which the tick re-parks it in the new column.
 ### Fixed
 
+- **One poisoned staged row no longer kills the whole drain.** The UI's
+  drain buttons called `ManualAdmission.force!` with no error isolation,
+  so a staged row the Forwarder cannot deserialize — a job class renamed
+  or deleted in a deploy while its rows are still staged — raised
+  `NameError` out of the controller as a bare 500: no flash, no partition
+  name, no count, and nothing drained. In the policy-wide drain the
+  poison partition sorts first, so every healthy partition behind it was
+  never reached, identically on every click, leaving the operator's
+  escape hatch permanently dead for that policy. Each partition is now
+  isolated the way `Tick#admit_partition` already isolates the automatic
+  path: the batch is rescued and logged, that partition is abandoned
+  (retrying would spin on the same head-of-queue row), and the flash says
+  how many partitions could not be forwarded. The raise inside
+  `Forwarder`/`ManualAdmission` is untouched — it is what rolls the claim
+  transaction back and saves the staged rows.
+
 - **A job that dies before `around_perform` releases its slot even
   without `discard_on`.** The railtie reaped the Tick's pre-inserted
   inflight row on `discard.active_job`, and CLAUDE.md claimed that
