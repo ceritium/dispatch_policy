@@ -20,6 +20,31 @@
   after which the tick re-parks it in the new column.
 ### Fixed
 
+- **The heartbeat thread no longer leaks a database connection per
+  running job.** `InflightTracker`'s heartbeat wrapped its UPDATE in
+  `connection_pool.with_connection`, believing that borrowed and returned
+  a connection per beat. It does not: the thread is a bare `Thread.new`
+  running outside the Rails executor, so nothing has established a lease
+  for it and the pool treats the lease as PERMANENT — `with_connection`
+  marks it sticky and its ensure then skips `release_connection`, on the
+  assumption that whoever established the lease will release it. Nothing
+  did. The first beat pinned a connection to the heartbeat thread for the
+  rest of the job, and when the thread died the connection was not
+  returned either: it sat checked out with a dead owner until the pool
+  reaper got to it.
+
+  With the Rails default sizing — pool size and worker threads both from
+  `RAILS_MAX_THREADS` — every tracked job that outlives one
+  `inflight_heartbeat_interval` doubles its connection demand, so a full
+  worker raises `ActiveRecord::ConnectionTimeoutError` on the jobs
+  themselves. The beats that lose the race fail too, which stalls
+  `heartbeat_at` on rows whose jobs are still running, and the stale
+  sweep then reclaims them after `inflight_stale_after` — leaving the
+  concurrency gate under-counting and over-admitting. Verified against
+  Rails 8.1: after `with_connection` returned inside a thread the pool
+  still reported the connection busy, and it went to `dead` rather than
+  `idle` when the thread exited. The beat now releases explicitly.
+
 - **The throttle's token bucket is charged atomically** (throttle
   review). It was written back as a literal jsonb patch computed in Ruby
   from an earlier read — a read-modify-write across two statements. Two

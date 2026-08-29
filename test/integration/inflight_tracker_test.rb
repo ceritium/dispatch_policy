@@ -50,4 +50,35 @@ class InflightTrackerHeartbeatTest < DispatchPolicy::IntegrationTest
   ensure
     DispatchPolicy.reset_config!
   end
+  # The heartbeat thread runs outside the Rails executor, so the pool
+  # treats its lease as permanent: `with_connection` marks it sticky and
+  # then deliberately does NOT release it, on the assumption that whoever
+  # established the lease will. Nothing did. One connection per running
+  # tracked job is then pinned for the life of that job — and with the
+  # Rails default sizing (pool and worker threads both from
+  # RAILS_MAX_THREADS) that is the whole pool twice over, so the workers
+  # start raising ConnectionTimeoutError and long jobs get swept as stale
+  # while they are still running.
+  def test_a_beat_returns_its_connection_to_the_pool
+    DispatchPolicy::Repository.insert_inflight!([{
+      policy_name: "p", partition_key: "k", active_job_id: "ajid-pool"
+    }])
+
+    pool     = ActiveRecord::Base.connection_pool
+    baseline = pool.stat[:busy]
+    observed = nil
+
+    thread = Thread.new do
+      3.times { DispatchPolicy::InflightTracker.beat!("ajid-pool") }
+      observed = ActiveRecord::Base.connection_pool.stat[:busy]
+      sleep 0.4 # still alive, so a leaked connection would still be held
+    end
+    sleep 0.2
+    during = pool.stat[:busy]
+    thread.join
+
+    assert_equal baseline, during,
+                 "the beat's connection must be back in the pool while the thread lives on"
+    assert_equal baseline, observed
+  end
 end

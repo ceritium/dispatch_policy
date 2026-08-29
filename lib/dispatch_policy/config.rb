@@ -69,11 +69,15 @@ module DispatchPolicy
       # assuming the admission was lost. Raise it if your adapter backlog
       # can exceed an hour.
       @inflight_queued_stale_after = 60 * 60
-      # Seconds between heartbeat_at refreshes. Each beat briefly checks out
-      # an EXTRA connection (one per running job) from the role's pool, so
-      # the DB pool needs headroom above the worker concurrency — otherwise
-      # beats hit ConnectionTimeoutError and long jobs get swept as stale.
-      # Set to 0 to disable the heartbeat thread entirely.
+      # Seconds between heartbeat_at refreshes. Each beat checks out a
+      # connection from the role's pool for the duration of one UPDATE and
+      # returns it explicitly — the heartbeat thread runs outside the
+      # Rails executor, where the pool treats a lease as permanent and
+      # `with_connection` alone would NOT give it back (see
+      # InflightTracker.beat!). A little pool headroom above the worker
+      # concurrency is still worth having, since a beat and its job can
+      # want a connection at the same instant. Set to 0 to disable the
+      # heartbeat thread entirely.
       @inflight_heartbeat_interval = 30
       @real_adapter              = nil
       @logger                    = nil
