@@ -32,6 +32,7 @@ class CreateDispatchPolicyTables < ActiveRecord::Migration[<%= Rails::VERSION::S
       t.datetime :last_checked_at
       t.datetime :last_admit_at
       t.datetime :next_eligible_at
+      t.datetime :scheduled_eligible_at
       t.jsonb    :gate_state,         null: false, default: {}
       t.float    :decayed_admits,     null: false, default: 0.0
       t.datetime :decayed_admits_at

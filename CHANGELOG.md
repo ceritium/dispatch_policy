@@ -2,7 +2,60 @@
 
 ## Unreleased
 
+### Upgrade notes
+
+- **New column**: `dispatch_policy_partitions.scheduled_eligible_at`
+  (nullable timestamp). The gem ships a single migration, so an existing
+  install does not get it from `db:migrate` — run it yourself:
+
+  ```sql
+  ALTER TABLE dispatch_policy_partitions
+    ADD COLUMN scheduled_eligible_at timestamptz;
+  ```
+
+  No backfill is needed. NULL means "nothing is holding this partition
+  back", which is the correct reading for every existing row; a
+  partition that was parked under the old scheme carries its horizon in
+  `next_eligible_at` and simply becomes claimable one tick earlier,
+  after which the tick re-parks it in the new column.
+
 ### Fixed
+
+- **A job due now no longer waits behind a future-scheduled one.** M10
+  parked a partition holding only future work by writing
+  `next_eligible_at`, the same column gates use for their backoff.
+  Nothing on the enqueue path could then clear it — clearing it there
+  would clobber a gate's backoff and bring back the busy-loop that
+  backoff exists to prevent — so a `perform_later` landing behind a
+  `set(wait: 1.hour)` sat in `dispatch_policy_staged_jobs` for the full
+  hour, unclaimed, with no gate having denied it and nothing in the
+  logs. With `wait: 1.week` it waited a week. Reproduced:
+  `partitions_seen = 0` on five consecutive ticks with two staged rows,
+  one of them due. The horizon now lives in its own column,
+  `scheduled_eligible_at`, and `claim_partitions` requires both. A job
+  due now clears it; a future job cannot install one over a partition
+  that already has due work.
+
+  Side effect worth knowing: the horizon is set by the enqueue itself,
+  so a partition holding only future work is no longer claimed even
+  once. Ticks that used to spend a claim slot discovering there was
+  nothing to do now skip it entirely.
+
+- **The catch-all sweep no longer resets the token bucket of a policy
+  this process merely hasn't loaded.** `TickLoop.sweep!` collects
+  partitions whose policy is absent from `DispatchPolicy.registry`,
+  reading that as "deleted from the code". The registry is populated as
+  a side effect of job classes loading, so it is also every policy a
+  dashboard-only process, a lazily-loaded worker or a half-rolled deploy
+  has not touched — the same trap ISSUES.md R3 records for
+  `ManualAdmission`. Reproduced with `rate: 2, per: 7.days`: the row a
+  worker that knows the policy correctly keeps is deleted by one that
+  does not, and the tenant gets two more admits inside the same week. A
+  row that still carries a token bucket now waits out the new
+  `config.unknown_policy_retention` (30 days by default, long enough to
+  cover any plausible window) instead of `partition_inactive_after`;
+  a row with nothing to lose is still collected on the usual cutoff, so
+  a genuinely deleted policy is still garbage-collected.
 
 - **Inflight rows are no longer created without a way to release them**
   (audit 2026-08-13, H3). Admission pre-inserted a row in

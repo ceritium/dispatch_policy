@@ -582,6 +582,9 @@ DispatchPolicy.configure do |c|
   c.admission_batch_size      = 100      # max jobs admitted per partition per iteration
   c.idle_pause                = 0.5      # seconds slept when a tick admits nothing
   c.partition_inactive_after  = 86_400   # GC partitions idle this long
+  c.unknown_policy_retention  = 2_592_000 # ...unless this process doesn't
+                                          # know the policy and the row
+                                          # still holds a token bucket
   c.inflight_stale_after      = 300      # GC inflight rows whose worker stopped heartbeating
   c.inflight_queued_stale_after = 3_600  # GC inflight rows admitted but never started (queued)
   c.inflight_heartbeat_interval = 30     # how often the worker bumps heartbeat_at; 0 disables the thread

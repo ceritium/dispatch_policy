@@ -75,6 +75,26 @@ dispatch_policy_policy_settings               one row per policy — pause flag
   its job class opts in with `dispatch_policy_inflight_tracking`
   (which buys a dashboard count, nothing else — no admission decision
   reads those rows).
+- **Two columns park a partition, and they are not interchangeable.**
+  `next_eligible_at` is a GATE backoff ("we asked, capacity said wait");
+  `scheduled_eligible_at` is the scheduled-work horizon ("there is
+  nothing due yet"). `claim_partitions` requires both to be clear.
+  Sharing one column was M10's bug: an enqueue cannot lower a gate
+  backoff without resurrecting the busy-loop the backoff prevents, so a
+  job due NOW stayed invisible behind a `set(wait: 1.week)` sibling for
+  a week. `upsert_partition!` maintains the horizon on every enqueue
+  and NULL is absorbing in both directions — due work clears it, and a
+  future job cannot install one over a partition that already has due
+  work.
+- **"Not in `DispatchPolicy.registry`" means "we can't see it", NOT "it
+  was deleted".** The registry fills as a side effect of job classes
+  loading, so a dashboard process, a lazily-loaded worker or a rolling
+  deploy all reach code with a policy the rest of the fleet knows.
+  `ManualAdmission` learned this once (ISSUES.md R3) and `TickLoop`'s
+  catch-all sweep learned it again: collecting such a partition deletes
+  its token bucket and hands the tenant a fresh quota. A row carrying a
+  bucket now waits out `config.unknown_policy_retention` there. Any new
+  code that branches on registry membership has to err the same way.
 - **`partitions.context` is refreshed on every `perform_later`** via
   UPSERT. Gates read that ctx, NOT `staged_jobs.context` (which is
   historical). This lets a change in the host DB (e.g. new

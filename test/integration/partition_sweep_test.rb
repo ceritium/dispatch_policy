@@ -38,10 +38,22 @@ class PartitionSweepTest < DispatchPolicy::IntegrationTest
     def perform(*); end
   end
 
+  class UngatedJob < ActiveJob::Base
+    include DispatchPolicy::JobExtension
+
+    POLICY = dispatch_policy("sweep_ungated") do
+      context ->(_args) { {} }
+      partition_by ->(_c) { "k" }
+    end
+
+    def perform(*); end
+  end
+
   def setup
     super
     DispatchPolicy.registry.register(WeeklyJob::POLICY, owner: WeeklyJob.name)
     DispatchPolicy.registry.register(MinuteJob::POLICY, owner: MinuteJob.name)
+    DispatchPolicy.registry.register(UngatedJob::POLICY, owner: UngatedJob.name)
   end
 
   def age_partitions!(hours)
@@ -94,10 +106,11 @@ class PartitionSweepTest < DispatchPolicy::IntegrationTest
   end
 
   # A partition whose policy no longer exists in the code still has to be
-  # collected, or it accumulates forever.
-  def test_partitions_of_an_unregistered_policy_are_collected
-    MinuteJob.perform_later
-    DispatchPolicy::Tick.run(policy_name: "sweep_minute")
+  # collected, or it accumulates forever. With nothing in its gate_state
+  # there is nothing to lose by collecting it on the usual cutoff.
+  def test_partitions_of_an_unregistered_policy_with_no_bucket_are_collected
+    UngatedJob.perform_later
+    DispatchPolicy::Tick.run(policy_name: "sweep_ungated")
     age_partitions!(25)
 
     DispatchPolicy.registry.clear
@@ -105,5 +118,30 @@ class PartitionSweepTest < DispatchPolicy::IntegrationTest
 
     assert_equal 0, DispatchPolicy::Partition.count,
                  "the catch-all pass covers policies this process doesn't know"
+  end
+
+  # ...but "absent from this process's registry" is not "deleted from the
+  # code". The registry fills as a side effect of job classes loading, so
+  # a dashboard process, a lazily-loaded worker or a half-rolled deploy
+  # all get here with a policy the rest of the fleet knows perfectly well
+  # — and collecting the row resets its token bucket, which is the M11
+  # quota reset with extra steps. Same trap as ISSUES.md R3.
+  def test_an_unregistered_policys_token_bucket_is_not_reset_on_the_normal_cutoff
+    2.times { WeeklyJob.perform_later }
+    DispatchPolicy::Tick.run(policy_name: "sweep_weekly")
+    assert_equal 0, DispatchPolicy::StagedJob.count, "the weekly quota is spent"
+
+    age_partitions!(25)
+    DispatchPolicy.registry.clear
+    DispatchPolicy::TickLoop.sweep!
+
+    assert_equal 1, DispatchPolicy::Partition.count,
+                 "this process cannot know the window, so it must not guess 24h"
+
+    age_partitions!(31 * 24) # past unknown_policy_retention
+    DispatchPolicy::TickLoop.sweep!
+
+    assert_equal 0, DispatchPolicy::Partition.count,
+                 "a genuinely deleted policy still gets collected, just later"
   end
 end

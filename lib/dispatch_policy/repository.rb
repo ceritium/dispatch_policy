@@ -87,7 +87,8 @@ module DispatchPolicy
           queue_name:    queue_name,
           shard:         shard,
           context:       context,
-          delta_pending: 1
+          delta_pending: 1,
+          scheduled_at:  scheduled_at
         )
       end
       true
@@ -154,14 +155,23 @@ module DispatchPolicy
       rows.size
     end
 
+    # `scheduled_at` is the new job's own due time (nil = due now). It
+    # maintains `scheduled_eligible_at`, the soonest moment this partition
+    # can have work to do — see `defer_partition_to_next_scheduled!` for
+    # why that lives in its own column rather than in `next_eligible_at`.
+    # NULL is absorbing in both directions: a job due NOW clears the
+    # horizon, and a future job cannot install one over a partition that
+    # already has due work waiting.
     def upsert_partition!(policy_name:, partition_key:, queue_name:, context:, delta_pending:,
-                          shard: Policy::DEFAULT_SHARD)
+                          shard: Policy::DEFAULT_SHARD, scheduled_at: nil)
       connection.exec_query(
         <<~SQL.squish,
           INSERT INTO #{PARTITIONS_TABLE}
             (policy_name, partition_key, queue_name, shard, context, context_updated_at,
-             pending_count, last_enqueued_at, status, gate_state, created_at, updated_at)
-          VALUES ($1, $2, $3, $4, $5::jsonb, now(), $6, now(), 'active', '{}'::jsonb, now(), now())
+             pending_count, last_enqueued_at, status, gate_state, scheduled_eligible_at,
+             created_at, updated_at)
+          VALUES ($1, $2, $3, $4, $5::jsonb, now(), $6, now(), 'active', '{}'::jsonb, $7,
+                  now(), now())
           ON CONFLICT (policy_name, partition_key) DO UPDATE SET
             context             = EXCLUDED.context,
             context_updated_at  = EXCLUDED.context_updated_at,
@@ -169,10 +179,17 @@ module DispatchPolicy
             shard               = #{PARTITIONS_TABLE}.shard,
             pending_count       = #{PARTITIONS_TABLE}.pending_count + EXCLUDED.pending_count,
             last_enqueued_at    = EXCLUDED.last_enqueued_at,
+            scheduled_eligible_at = CASE
+              WHEN EXCLUDED.scheduled_eligible_at IS NULL THEN NULL
+              WHEN #{PARTITIONS_TABLE}.scheduled_eligible_at IS NULL THEN NULL
+              ELSE LEAST(#{PARTITIONS_TABLE}.scheduled_eligible_at,
+                         EXCLUDED.scheduled_eligible_at)
+            END,
             updated_at          = now()
         SQL
         "upsert_partition",
-        [policy_name, partition_key, queue_name, shard, JSON.dump(context), delta_pending]
+        [policy_name, partition_key, queue_name, shard, JSON.dump(context), delta_pending,
+         scheduled_at]
       )
     end
 
@@ -201,6 +218,7 @@ module DispatchPolicy
             AND status = 'active'
             AND pending_count > 0
             AND (next_eligible_at IS NULL OR next_eligible_at <= now())
+            AND (scheduled_eligible_at IS NULL OR scheduled_eligible_at <= now())
             AND NOT EXISTS (
               SELECT 1 FROM #{POLICY_SETTINGS_TABLE} ps
               WHERE ps.policy_name = $1 AND ps.paused
@@ -366,14 +384,13 @@ module DispatchPolicy
       connection.exec_query(
         <<~SQL.squish,
           UPDATE #{PARTITIONS_TABLE} p
-          SET next_eligible_at = (
+          SET scheduled_eligible_at = (
                 SELECT MIN(s.scheduled_at) FROM #{STAGED_TABLE} s
                 WHERE s.policy_name = $1 AND s.partition_key = $2
                   AND s.scheduled_at > now()
               ),
               updated_at = now()
           WHERE p.policy_name = $1 AND p.partition_key = $2
-            AND p.next_eligible_at IS NULL
         SQL
         "defer_partition_to_next_scheduled",
         [policy_name, partition_key]
@@ -940,7 +957,16 @@ module DispatchPolicy
     # stay that way. Nothing is lost by collecting one: the pause flag
     # lives in dispatch_policy_policy_settings, so it still applies when
     # the partition reappears.
-    def sweep_inactive_partitions!(cutoff_seconds:, policy_name: nil, except_policies: [])
+    # `throttled_cutoff_seconds` gives rows that still carry a token
+    # bucket a longer grace than the rest. The catch-all pass uses it:
+    # it sweeps policies this process does not know, and "unknown" there
+    # means "no job class referencing it has loaded here", which a
+    # dashboard-only process, lazy loading or a half-finished deploy all
+    # produce. Deleting such a row resets its bucket, which is the M11
+    # quota reset — and unlike the per-policy passes, nothing here can
+    # say how long that policy's window is.
+    def sweep_inactive_partitions!(cutoff_seconds:, policy_name: nil, except_policies: [],
+                                   throttled_cutoff_seconds: nil)
       params = [cutoff_seconds.to_i]
       filter = ""
       if policy_name
@@ -954,16 +980,23 @@ module DispatchPolicy
         filter = "AND policy_name NOT IN (#{placeholders.join(', ')})"
       end
 
+      if throttled_cutoff_seconds
+        params << throttled_cutoff_seconds.to_i
+        age_sql = <<~SQL.squish
+          COALESCE(last_admit_at, created_at) < now() - (
+            CASE WHEN gate_state ? 'throttle' THEN $#{params.size} ELSE $1 END || ' seconds'
+          )::interval
+        SQL
+      else
+        age_sql = "COALESCE(last_admit_at, created_at) < now() - ($1 || ' seconds')::interval"
+      end
+
       connection.exec_query(
         <<~SQL.squish,
           DELETE FROM #{PARTITIONS_TABLE}
           WHERE pending_count = 0
             #{filter}
-            AND (
-              (last_admit_at IS NOT NULL AND last_admit_at < now() - ($1 || ' seconds')::interval)
-              OR
-              (last_admit_at IS NULL AND created_at < now() - ($1 || ' seconds')::interval)
-            )
+            AND #{age_sql}
         SQL
         "sweep_inactive_partitions",
         params

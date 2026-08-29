@@ -116,13 +116,22 @@ module DispatchPolicy
         )
       end
 
-      # Partitions whose policy this process doesn't know — most often one
-      # that was deleted from the code. Nothing can tell us its window, so
-      # the default cutoff applies; without this pass those rows would
-      # never be collected at all.
+      # Partitions whose policy this process doesn't know. Usually one
+      # that was deleted from the code — but the registry is filled as a
+      # side effect of job classes loading, so it is also every policy a
+      # lazily-loaded process, a dashboard-only process or a half-rolled
+      # deploy has not touched yet (ISSUES.md R3 records the same trap in
+      # ManualAdmission). Without this pass a genuinely deleted policy's
+      # rows would never be collected; with it on the normal cutoff, a
+      # policy that is merely unloaded here has its token bucket deleted
+      # and its tenants handed a fresh quota. So a row that still carries
+      # a bucket waits out `unknown_policy_retention` instead — long
+      # enough to cover any plausible window — while one with nothing to
+      # lose goes on the usual cutoff.
       Repository.sweep_inactive_partitions!(
-        cutoff_seconds:  default_cutoff,
-        except_policies: registered
+        cutoff_seconds:           default_cutoff,
+        except_policies:          registered,
+        throttled_cutoff_seconds: cfg.unknown_policy_retention
       )
     end
 
