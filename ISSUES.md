@@ -6,6 +6,138 @@ are as of the commit named in the audit heading.
 
 ---
 
+# Audit 2026-08-29 — throttle review + subsystem hunt (`749274a`)
+
+Third full review. Two halves: a line-by-line review of the throttle
+atomicity branch (PR #38, since closed and folded in here), and a hunt
+across the subsystems the first two audits did not cover — the enqueue
+path, the dispatch/inflight handoff, the non-throttle gates with
+fairness and metrics, and the dashboard/config/generator surface.
+
+Everything below was reproduced against real Postgres before being
+fixed, and every fix carries a regression test verified by mutation:
+breaking the production line turns the suite red. Baseline going in:
+218 runs / 517 assertions. Coming out: 252 runs / 600 assertions.
+
+> **Status:** every finding is fixed on
+> `fix/throttle-atomicity-and-partition-lifecycle`. The narrative for
+> each — scenario, measurement, and what the fix does not promise —
+> is in CHANGELOG.md under Unreleased.
+
+## Blocker
+
+### B1 — The generated tick-loop job dies on its first iteration under solid_queue
+
+`adapter_shutting_down?` called `SolidQueue::Process.current_process`, a
+method solid_queue has never had. It is the `stop_when` lambda, called
+outside the rescue that guards `Tick.run`, so the NoMethodError escaped
+`perform` and the self-re-enqueue chain died after one run — while
+`perform_later` interception kept staging jobs nothing would admit.
+Fixed by using the ActiveJob `stopping?` hook both adapters implement,
+plus making a raising `stop_when` non-fatal.
+
+## High
+
+### H6 — The token bucket was a read-modify-write
+
+Two tick loops on one `(policy, shard)` each evaluated a full bucket,
+each admitted it, and the second write overwrote the first, so one
+admission went uncharged and the effective rate became `rate x loops`
+indefinitely. Settled inside the admission UPDATE now.
+
+### H7 — The bucket was read on one clock and charged on another
+
+The charge took its timestamps from Postgres `now()` while `evaluate`
+refills from `config.now`. Any offset became free tokens on every
+evaluate (measured: 100 jobs in ten ticks against `rate: 10, per: 60`),
+and `now()` being the transaction timestamp froze it inside an
+enclosing transaction. The gate's clock is bound as a parameter now, and
+the stamp is monotonic.
+
+### H8 — A job class deferring its own enqueue destroyed admission
+
+`enqueue_after_transaction_commit = true` (Rails-recommended for apps
+enqueuing inside transactions) reroutes the forward onto the gem's own
+admission transaction: it lands after COMMIT, outside `Bypass`. The
+scheduled path re-staged forever leaking an inflight row per tick; the
+immediate path rolled the admission back forever. Neither reached the
+adapter. Fixed with a non-joinable savepoint around the enqueue.
+
+### H9 — The periodic sweeper never ran
+
+`TickLoop.run` counted iterations in a local while the generated job
+re-enters `run` every `tick_max_duration`, and the shipped defaults put
+exactly `sweep_every_ticks` iterations in a window. Nothing was ever
+swept; a stale inflight row wedged a concurrency partition permanently,
+in a loop that feeds itself. The counter is module state now.
+
+### H10 — The heartbeat thread leaked a connection per running job
+
+`connection_pool.with_connection` does not release a lease the pool
+treats as permanent, which is what a bare `Thread.new` gets. One
+connection per tracked job was pinned for the job's life, so a worker
+sized by the Rails default raised ConnectionTimeoutError. Released
+explicitly now.
+
+### H11 — An inflight row orphaned for an hour without `discard_on`
+
+`discard.active_job` is emitted only by the handler `discard_on`
+installs, so a job dying before `around_perform` without one (the
+routine `ActiveJob::DeserializationError`) left its row until the 1h
+sweeper — an hour of a frozen tenant under `gate :concurrency, max: 1`.
+The railtie also subscribes to `perform.active_job` now. M3's fix
+covered only the `discard_on` subset.
+
+## Medium
+
+### M13 — A job due now waited behind a future-scheduled sibling
+
+M10 parked partitions in `next_eligible_at`, the gate backoff column, so
+no enqueue could clear it without resurrecting the M4 busy-loop. Moved
+to `scheduled_eligible_at`.
+
+### M14 — The sweeper's retention answered the wrong question
+
+"One window has passed" is neither necessary nor sufficient for "the
+bucket has refilled": too long for a partly-spent bucket, too short for
+one in debt or on a sub-unit rate. The early-collection clause added
+alongside it compared the stored snapshot, which nothing refreshes while
+a partition is idle, so it was inert. Both replaced by refilling the
+stored bucket to now.
+
+### M15 — The catch-all sweep reset the bucket of an unloaded policy
+
+"Absent from this process's registry" is not "deleted from the code" —
+R3 recorded the same trap in `ManualAdmission`. A row still carrying a
+bucket waits out `config.unknown_policy_retention` now.
+
+### M16 — Priority was applied backwards
+
+The claim ordered `priority DESC` while both adapters mean a smaller
+number is more urgent, so a host's urgent job was admitted last and
+could starve. The dashboard mirrored the inversion.
+
+### M17 — The adaptive stats table had no GC
+
+`adaptive_seed!` runs on every evaluate and nothing ever deleted from
+`dispatch_policy_adaptive_concurrency_stats`, so it grew with the
+lifetime cardinality of `partition_by`. Swept now, anti-joined against
+the partitions table.
+
+### M18 — A forced admission escaped the throttle's cost
+
+The UI admit/drain bypassed the gate's decision, which is the point, and
+also its charge, which is not: a drain handed the tenant everything it
+forwarded plus an untouched window.
+
+### M19 — One poisoned staged row killed the whole drain
+
+No per-partition isolation in the UI drain, so an undeserialisable row
+raised out of the controller as a bare 500 and every healthy partition
+behind it was never reached.
+
+---
+
 # Audit 2026-08-13 — v0.5.0 (`d1eb259`)
 
 Second full-repo review, focused on admission correctness. Baseline
