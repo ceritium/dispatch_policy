@@ -110,19 +110,50 @@ module DispatchPolicy
         window = policy.static_throttle_window
         warn_unbounded_sweep(policy) if window.nil? && throttled?(policy)
 
-        Repository.sweep_inactive_partitions!(
-          cutoff_seconds: window ? [default_cutoff, window.ceil].max : default_cutoff,
-          policy_name:    policy.name
-        )
+        # When both knobs are fixed we can ask the exact question — has
+        # this bucket refilled to capacity? — instead of approximating it
+        # with "one window has passed". The approximation is wrong in
+        # both directions: it holds a `per: 7.days` partition for a week
+        # after its bucket refilled hours ago, and it collects one whose
+        # bucket has NOT refilled (a debt left by concurrent loops needs
+        # more than a window; a sub-unit rate needs capacity/rate of
+        # them), which hands that tenant a fresh quota — the M11 reset.
+        capacity    = policy.static_throttle_capacity
+        refill_rate = policy.static_throttle_refill_rate
+        if capacity && refill_rate
+          Repository.sweep_inactive_partitions!(
+            cutoff_seconds:  default_cutoff,
+            policy_name:     policy.name,
+            refilled_bucket: { capacity:    capacity,
+                               refill_rate: refill_rate,
+                               now:         DispatchPolicy.config.now.to_f }
+          )
+        else
+          # A proc rate or a proc window: nothing here can say what the
+          # bucket holds, so fall back to outliving the window.
+          Repository.sweep_inactive_partitions!(
+            cutoff_seconds: window ? [default_cutoff, window.ceil].max : default_cutoff,
+            policy_name:    policy.name
+          )
+        end
       end
 
-      # Partitions whose policy this process doesn't know — most often one
-      # that was deleted from the code. Nothing can tell us its window, so
-      # the default cutoff applies; without this pass those rows would
-      # never be collected at all.
+      # Partitions whose policy this process doesn't know. Usually one
+      # that was deleted from the code — but the registry is filled as a
+      # side effect of job classes loading, so it is also every policy a
+      # lazily-loaded process, a dashboard-only process or a half-rolled
+      # deploy has not touched yet (ISSUES.md R3 records the same trap in
+      # ManualAdmission). Without this pass a genuinely deleted policy's
+      # rows would never be collected; with it on the normal cutoff, a
+      # policy that is merely unloaded here has its token bucket deleted
+      # and its tenants handed a fresh quota. So a row that still carries
+      # a bucket waits out `unknown_policy_retention` instead — long
+      # enough to cover any plausible window — while one with nothing to
+      # lose goes on the usual cutoff.
       Repository.sweep_inactive_partitions!(
-        cutoff_seconds:  default_cutoff,
-        except_policies: registered
+        cutoff_seconds:           default_cutoff,
+        except_policies:          registered,
+        throttled_cutoff_seconds: cfg.unknown_policy_retention
       )
     end
 

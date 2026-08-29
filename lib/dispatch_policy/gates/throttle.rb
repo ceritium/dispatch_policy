@@ -35,9 +35,24 @@ module DispatchPolicy
       # that is still being spent hands the tenant a fresh quota.
       attr_reader :static_per
 
+      # Bucket size when `rate` is a fixed number, nil when it is a proc.
+      # Paired with `static_refill_rate` it lets the sweeper work out what
+      # the bucket holds RIGHT NOW — the stored value plus the refill
+      # accrued since `refilled_at` — rather than trusting the stored
+      # snapshot, which nothing refreshes while a partition sits idle.
+      attr_reader :static_capacity
+
+      # Tokens per second, when BOTH knobs are fixed. Not derivable from
+      # `static_capacity`: a sub-unit rate floors the capacity at 1.0
+      # while still refilling at the true `rate`, so `capacity / per`
+      # would refill such a bucket twice as fast as the policy allows.
+      attr_reader :static_refill_rate
+
       def initialize(rate:, per:)
         super()
         @rate_proc = rate.respond_to?(:call) ? rate : ->(_ctx) { rate }
+        static_rate = rate.respond_to?(:call) ? nil : Float(rate || 0)
+        @static_capacity = static_rate&.positive? ? [static_rate, 1.0].max : nil
         if per.respond_to?(:call)
           # Dynamic window (per-ctx), symmetric with a dynamic rate. Validated
           # per-evaluate since the value isn't known until admission time.
@@ -49,6 +64,7 @@ module DispatchPolicy
           @per_proc   = ->(_ctx) { fixed }
           @static_per = fixed
         end
+        @static_refill_rate = @static_capacity && @static_per ? static_rate / @static_per : nil
       end
 
       def name

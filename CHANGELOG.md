@@ -18,7 +18,6 @@
   partition that was parked under the old scheme carries its horizon in
   `next_eligible_at` and simply becomes claimable one tick earlier,
   after which the tick re-parks it in the new column.
-
 ### Fixed
 
 - **The throttle's token bucket is charged atomically** (throttle
@@ -72,6 +71,37 @@
   once. Ticks that used to spend a claim slot discovering there was
   nothing to do now skip it entirely.
 
+- **The partition sweeper holds a throttled partition until its bucket
+  has refilled, instead of for a whole window.** Retaining the row for
+  `per` was an approximation of "the bucket is back at capacity", and it
+  was wrong in both directions. Too long: a `per: 7.days` policy kept
+  every partition for a week, when a bucket that spent one of two tokens
+  is full again in 3.5 days. Too short: a bucket left in debt by
+  concurrent loops needs more than one window to climb back, and a
+  sub-unit rate (`rate: 0.5, per: 7.days` — capacity is floored at one
+  token while the refill runs at the true rate) needs two — collecting
+  either hands the tenant a fresh quota, which is the reset the window
+  rule existed to prevent. The sweeper now refills the stored bucket to
+  now with the same expression the admission UPDATE uses and collects
+  only what has genuinely reached capacity. Applies when both throttle
+  knobs are fixed numbers; a proc `rate` or `per` still falls back to
+  the window cutoff.
+
+- **The catch-all sweep no longer resets the token bucket of a policy
+  this process merely hasn't loaded.** `TickLoop.sweep!` collects
+  partitions whose policy is absent from `DispatchPolicy.registry`,
+  reading that as "deleted from the code". The registry is populated as
+  a side effect of job classes loading, so it is also every policy a
+  dashboard-only process, a lazily-loaded worker or a half-rolled deploy
+  has not touched — the same trap ISSUES.md R3 records for
+  `ManualAdmission`. Reproduced with `rate: 2, per: 7.days`: the row a
+  worker that knows the policy correctly keeps is deleted by one that
+  does not, and the tenant gets two more admits inside the same week. A
+  row that still carries a token bucket now waits out the new
+  `config.unknown_policy_retention` (30 days by default, long enough to
+  cover any plausible window) instead of `partition_inactive_after`;
+  a row with nothing to lose is still collected on the usual cutoff, so
+  a genuinely deleted policy is still garbage-collected.
 
 - **Inflight rows are no longer created without a way to release them**
   (audit 2026-08-13, H3). Admission pre-inserted a row in

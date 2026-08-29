@@ -86,6 +86,15 @@ dispatch_policy_policy_settings               one row per policy — pause flag
   and NULL is absorbing in both directions — due work clears it, and a
   future job cannot install one over a partition that already has due
   work.
+- **"Not in `DispatchPolicy.registry`" means "we can't see it", NOT "it
+  was deleted".** The registry fills as a side effect of job classes
+  loading, so a dashboard process, a lazily-loaded worker or a rolling
+  deploy all reach code with a policy the rest of the fleet knows.
+  `ManualAdmission` learned this once (ISSUES.md R3) and `TickLoop`'s
+  catch-all sweep learned it again: collecting such a partition deletes
+  its token bucket and hands the tenant a fresh quota. A row carrying a
+  bucket now waits out `config.unknown_policy_retention` there. Any new
+  code that branches on registry membership has to err the same way.
 - **`partitions.context` is refreshed on every `perform_later`** via
   UPSERT. Gates read that ctx, NOT `staged_jobs.context` (which is
   historical). This lets a change in the host DB (e.g. new
@@ -120,6 +129,22 @@ dispatch_policy_policy_settings               one row per policy — pause flag
   as `GREATEST(now, stored)`: two admission transactions can execute in
   the opposite order to the one they started in, and a stamp that moves
   backwards makes that interval refill twice.
+- **The partition sweeper holds a throttled partition until its bucket
+  has REFILLED, not until its window is out.** `sweep_inactive_partitions!`
+  refills the stored value to now with the same expression the admission
+  UPDATE uses (hence `Policy#static_throttle_refill_rate`, which is not
+  `capacity / window` — a sub-unit rate floors capacity at one token).
+  Comparing the stored snapshot instead would be inert: the admission
+  UPDATE is its only writer and always subtracts, so a partition that
+  ever admitted anything is frozen below capacity forever. "One window
+  has passed" is not the same test in either direction — a bucket in
+  debt needs more than a window, a `rate: 0.5` bucket needs two — and
+  collecting early is the M11 quota reset.
+  (The older warning here — that a too-fine `shard_by` duplicates the
+  bucket across shards for `rate × N_shards` — no longer applies: since
+  `partition_by` became policy-level, `(policy_name, partition_key)` is
+  unique and the shard is pinned on first write, so one partition_key is
+  exactly one row on exactly one shard.)
 - **`BulkEnqueue.perform_all_later` checks `Bypass.active?`** and
   delegates to `super` when active. Without it, the call from
   `Forwarder.dispatch` (deserialize + `perform_all_later` under

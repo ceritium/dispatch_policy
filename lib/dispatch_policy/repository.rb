@@ -1031,7 +1031,39 @@ module DispatchPolicy
     # stay that way. Nothing is lost by collecting one: the pause flag
     # lives in dispatch_policy_policy_settings, so it still applies when
     # the partition reappears.
-    def sweep_inactive_partitions!(cutoff_seconds:, policy_name: nil, except_policies: [])
+    # `refilled_bucket` — {capacity:, refill_rate:, now:} — replaces the
+    # blunt "hold a throttled partition for one window" rule with the
+    # thing that rule was approximating: hold it until its bucket has
+    # actually refilled to capacity. The bucket lives in the row, so
+    # collecting the row early hands the tenant a fresh quota; but a
+    # bucket AT capacity is worth nothing, since a partition that
+    # reappears starts full anyway.
+    #
+    # The test refills the stored value to `now` instead of comparing the
+    # raw snapshot. Nothing rewrites gate_state while a partition is idle
+    # (the admission UPDATE is its only writer and it runs only while
+    # pending_count > 0, whereas this sweeps pending_count = 0), so the
+    # snapshot is frozen at the last admission and is ALWAYS below
+    # capacity for a partition that ever admitted anything — comparing it
+    # directly would make this clause fire only for rows that never spent
+    # a token.
+    #
+    # One window is not the same thing, in either direction: a bucket in
+    # debt (concurrent loops over-admitted; see record_partition_admit!)
+    # needs more than a window to climb back to capacity, and a sub-unit
+    # rate needs `capacity / rate` windows. Both were quota resets.
+    # Only available when both throttle knobs are fixed numbers —
+    # capacity and refill rate are unknowable here otherwise.
+    # `throttled_cutoff_seconds` gives rows that still carry a token bucket
+    # a longer grace than the rest. The catch-all pass uses it: it sweeps
+    # policies this process does not know, and "unknown" there means "no
+    # job class referencing it has loaded here", which a dashboard-only
+    # process, lazy loading or a half-finished deploy all produce.
+    # Deleting such a row resets its bucket — the M11 quota reset — and
+    # unlike the per-policy passes, nothing here can say how long that
+    # policy's window is.
+    def sweep_inactive_partitions!(cutoff_seconds:, policy_name: nil, except_policies: [],
+                                   refilled_bucket: nil, throttled_cutoff_seconds: nil)
       params = [cutoff_seconds.to_i]
       filter = ""
       if policy_name
@@ -1045,16 +1077,51 @@ module DispatchPolicy
         filter = "AND policy_name NOT IN (#{placeholders.join(', ')})"
       end
 
+      if refilled_bucket
+        cap_idx  = params.size + 1
+        rate_idx = params.size + 2
+        now_idx  = params.size + 3
+        params << refilled_bucket.fetch(:capacity).to_f
+        params << refilled_bucket.fetch(:refill_rate).to_f
+        params << refilled_bucket.fetch(:now).to_f
+        stored_refilled_at = "(gate_state -> 'throttle' ->> 'refilled_at')::double precision"
+        # Same expression the admission UPDATE settles with, on the same
+        # clock (config.now, not the database's). A row with no bucket
+        # recorded at all has nothing to lose, hence the COALESCE to
+        # capacity.
+        refilled_bucket_sql = <<~SQL.squish
+          AND LEAST(
+                COALESCE((gate_state -> 'throttle' ->> 'tokens')::double precision, $#{cap_idx}::double precision)
+                + GREATEST(
+                    $#{now_idx}::double precision
+                    - COALESCE(#{stored_refilled_at}, $#{now_idx}::double precision),
+                    0
+                  ) * $#{rate_idx}::double precision,
+                $#{cap_idx}::double precision
+              ) >= $#{cap_idx}::double precision
+        SQL
+      else
+        refilled_bucket_sql = ""
+      end
+
+      if throttled_cutoff_seconds
+        params << throttled_cutoff_seconds.to_i
+        age_sql = <<~SQL.squish
+          COALESCE(last_admit_at, created_at) < now() - (
+            CASE WHEN gate_state ? 'throttle' THEN $#{params.size} ELSE $1 END || ' seconds'
+          )::interval
+        SQL
+      else
+        age_sql = "COALESCE(last_admit_at, created_at) < now() - ($1 || ' seconds')::interval"
+      end
+
       connection.exec_query(
         <<~SQL.squish,
           DELETE FROM #{PARTITIONS_TABLE}
           WHERE pending_count = 0
             #{filter}
-            AND (
-              (last_admit_at IS NOT NULL AND last_admit_at < now() - ($1 || ' seconds')::interval)
-              OR
-              (last_admit_at IS NULL AND created_at < now() - ($1 || ' seconds')::interval)
-            )
+            AND #{age_sql}
+            #{refilled_bucket_sql}
         SQL
         "sweep_inactive_partitions",
         params

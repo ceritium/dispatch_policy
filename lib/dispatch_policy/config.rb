@@ -9,6 +9,7 @@ module DispatchPolicy
                   :idle_pause,
                   :busy_pause,
                   :partition_inactive_after,
+                  :unknown_policy_retention,
                   :inflight_stale_after,
                   :inflight_queued_stale_after,
                   :inflight_heartbeat_interval,
@@ -45,6 +46,18 @@ module DispatchPolicy
       # throughput ceiling becomes admission_batch_size / busy_pause.
       @busy_pause                = 0.0
       @partition_inactive_after  = 24 * 60 * 60
+      # How long a partition whose policy is absent from THIS process's
+      # registry is kept when it still carries a token bucket. "Absent
+      # from the registry" is not the same as "deleted from the code" —
+      # the registry is populated as a side effect of job classes
+      # loading, so lazy loading, a dashboard-only process or a rolling
+      # deploy all produce it (see ISSUES.md R3, the same mistake in
+      # ManualAdmission). Collecting such a row resets its throttle
+      # bucket and hands that tenant a fresh quota, so it waits out a
+      # grace long enough to cover any plausible window instead of
+      # partition_inactive_after. Rows with no bucket are collected on
+      # the normal cutoff — there is nothing to lose.
+      @unknown_policy_retention  = 30 * 24 * 60 * 60
       @inflight_stale_after      = 5 * 60
       # Cutoff for inflight rows that were admitted (pre-inserted by the
       # Tick) but never started performing — so the heartbeat thread, which
