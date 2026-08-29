@@ -51,7 +51,7 @@ class ThrottleGateTest < Minitest::Test
     # the bucket is charged 4, not 10.
     patch = gate.consume(decision, 4)
     assert_in_delta 6.0, patch.dig("throttle", "tokens"), 0.001
-    assert_equal decision.charge[:refilled_at],
+    assert_equal decision.charge[:now],
                  patch.dig("throttle", "refilled_at")
   end
 

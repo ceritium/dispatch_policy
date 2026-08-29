@@ -95,10 +95,20 @@ module DispatchPolicy
         # admission UPDATE instead, from the row's own value; `charge`
         # carries the numbers that needs. `tokens` rides along so #consume
         # can mirror the result in memory for the tick's second pass.
+        #
+        # `now` travels with it because the bucket must be read and
+        # written on ONE clock. The charge recomputes the refill in SQL,
+        # but from THIS timestamp — not from Postgres `now()`. Mixing the
+        # two means the app clock refills a bucket the database clock
+        # stamped: an offset O between them silently adds O * refill_rate
+        # phantom tokens to every evaluate, and `now()` is the
+        # TRANSACTION timestamp, so an enclosing transaction (Rails
+        # transactional tests, a host wrapping the tick) freezes it while
+        # `config.now` keeps moving.
         charge = { capacity:    capacity,
                    refill_rate: refill_rate,
                    tokens:      tokens,
-                   refilled_at: now }
+                   now:         now }
 
         # Under one whole token, not `floor == 0`: the bucket can be
         # NEGATIVE now that a concurrent over-admission is repaid rather
@@ -131,7 +141,7 @@ module DispatchPolicy
         return nil unless c
 
         { "throttle" => { "tokens"      => c[:tokens] - admitted_count,
-                          "refilled_at" => c[:refilled_at] } }
+                          "refilled_at" => c[:now] } }
       end
 
       private
