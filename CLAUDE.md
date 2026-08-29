@@ -86,11 +86,40 @@ dispatch_policy_policy_settings               one row per policy — pause flag
   recomputed inside the admission UPDATE from the row's own value), so
   the two costs compose, the bucket goes negative, and the debt is
   repaid out of the next window — the rate holds over time, the burst
-  does not. The generated `DispatchTickLoopJob` enforces this with
-  good_job / solid_queue concurrency keys; a hand-rolled driver must.
+  does not. The generated `DispatchTickLoopJob` helps but does not
+  guarantee it: its good_job / solid_queue concurrency key is
+  `"dispatch_tick_loop:#{policy}:#{shard}"`, so it dedupes an identical
+  argument tuple — it does NOT stop a catch-all
+  `perform_later` (key `all:all`) from overlapping a
+  `perform_later("events")` (key `events:all`), and the no-adapter
+  branch of the template has no concurrency control at all.
   Do NOT go back to writing the bucket as a literal jsonb patch computed
   in Ruby: that is a read-modify-write, the second writer wins, and the
   rate silently becomes `rate × N_loops` forever.
+- **The token bucket lives on ONE clock: `DispatchPolicy.config.now`.**
+  The charge is settled in SQL from the row's own value, but the
+  timestamps it reads and writes are bound as parameters from the gate's
+  clock — never `EXTRACT(EPOCH FROM now())`. Only the token COUNT has to
+  come from the row. `evaluate` refills from `config.now`, so sourcing
+  the other end from the database puts one subtraction on two clocks:
+  an offset O silently adds `O × refill_rate` phantom tokens to every
+  evaluate, permanently. `now()` is also the TRANSACTION timestamp, so
+  inside an enclosing transaction (Rails transactional tests, a host
+  wrapping the tick) it stops advancing entirely. The stamp is written
+  as `GREATEST(now, stored)`: two admission transactions can execute in
+  the opposite order to the one they started in, and a stamp that moves
+  backwards makes that interval refill twice.
+- **The partition sweeper holds a throttled partition until its bucket
+  has REFILLED, not until its window is out.** `sweep_inactive_partitions!`
+  refills the stored value to now with the same expression the admission
+  UPDATE uses (hence `Policy#static_throttle_refill_rate`, which is not
+  `capacity / window` — a sub-unit rate floors capacity at one token).
+  Comparing the stored snapshot instead would be inert: the admission
+  UPDATE is its only writer and always subtracts, so a partition that
+  ever admitted anything is frozen below capacity forever. "One window
+  has passed" is not the same test in either direction — a bucket in
+  debt needs more than a window, a `rate: 0.5` bucket needs two — and
+  collecting early is the M11 quota reset.
   (The older warning here — that a too-fine `shard_by` duplicates the
   bucket across shards for `rate × N_shards` — no longer applies: since
   `partition_by` became policy-level, `(policy_name, partition_key)` is

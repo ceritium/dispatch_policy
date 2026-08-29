@@ -110,19 +110,32 @@ module DispatchPolicy
         window = policy.static_throttle_window
         warn_unbounded_sweep(policy) if window.nil? && throttled?(policy)
 
-        # Two ways out for a throttled partition: outlive the window (the
-        # bucket has certainly refilled), or be idle the normal cutoff
-        # with a bucket already at capacity. Without the second, a
-        # `per: 7.days` policy holds every partition for a week — a lot
-        # of rows for state that only matters below capacity.
-        capacity = policy.static_throttle_capacity
-        Repository.sweep_inactive_partitions!(
-          cutoff_seconds: window ? [default_cutoff, window.ceil].max : default_cutoff,
-          policy_name:    policy.name,
-          full_bucket:    (if window && capacity
-                             { capacity: capacity, cutoff_seconds: default_cutoff }
-                           end)
-        )
+        # When both knobs are fixed we can ask the exact question — has
+        # this bucket refilled to capacity? — instead of approximating it
+        # with "one window has passed". The approximation is wrong in
+        # both directions: it holds a `per: 7.days` partition for a week
+        # after its bucket refilled hours ago, and it collects one whose
+        # bucket has NOT refilled (a debt left by concurrent loops needs
+        # more than a window; a sub-unit rate needs capacity/rate of
+        # them), which hands that tenant a fresh quota — the M11 reset.
+        capacity    = policy.static_throttle_capacity
+        refill_rate = policy.static_throttle_refill_rate
+        if capacity && refill_rate
+          Repository.sweep_inactive_partitions!(
+            cutoff_seconds:  default_cutoff,
+            policy_name:     policy.name,
+            refilled_bucket: { capacity:    capacity,
+                               refill_rate: refill_rate,
+                               now:         DispatchPolicy.config.now.to_f }
+          )
+        else
+          # A proc rate or a proc window: nothing here can say what the
+          # bucket holds, so fall back to outliving the window.
+          Repository.sweep_inactive_partitions!(
+            cutoff_seconds: window ? [default_cutoff, window.ceil].max : default_cutoff,
+            policy_name:    policy.name
+          )
+        end
       end
 
       # Partitions whose policy this process doesn't know — most often one

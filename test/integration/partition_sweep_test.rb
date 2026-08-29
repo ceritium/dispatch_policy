@@ -38,18 +38,47 @@ class PartitionSweepTest < DispatchPolicy::IntegrationTest
     def perform(*); end
   end
 
+  class HalfWeeklyJob < ActiveJob::Base
+    include DispatchPolicy::JobExtension
+
+    POLICY = dispatch_policy("sweep_half_weekly") do
+      context ->(_args) { {} }
+      partition_by ->(_c) { "k" }
+      gate :throttle, rate: 0.5, per: 7 * 24 * 3600
+    end
+
+    def perform(*); end
+  end
+
   def setup
     super
     DispatchPolicy.registry.register(WeeklyJob::POLICY, owner: WeeklyJob.name)
     DispatchPolicy.registry.register(MinuteJob::POLICY, owner: MinuteJob.name)
+    DispatchPolicy.registry.register(HalfWeeklyJob::POLICY, owner: HalfWeeklyJob.name)
   end
 
+  # Ages the WHOLE row, token bucket included. Moving last_admit_at back
+  # without moving the bucket's refilled_at describes a state the clock
+  # cannot produce — an hour of idleness during which no refill happened
+  # — and the sweeper's question is precisely "has this bucket refilled
+  # yet?", so a helper that lies about it can only test the wrong thing.
   def age_partitions!(hours)
     ActiveRecord::Base.connection.execute(<<~SQL)
       UPDATE dispatch_policy_partitions
       SET last_admit_at = now() - interval '#{hours} hours',
-          created_at    = now() - interval '#{hours} hours'
+          created_at    = now() - interval '#{hours} hours',
+          gate_state    = CASE
+            WHEN gate_state ? 'throttle'
+            THEN jsonb_set(gate_state, '{throttle,refilled_at}',
+                   to_jsonb((gate_state -> 'throttle' ->> 'refilled_at')::double precision
+                            - #{hours} * 3600))
+            ELSE gate_state
+          END
     SQL
+  end
+
+  def bucket
+    DispatchPolicy::Partition.first.gate_state.dig("throttle", "tokens").to_f
   end
 
   def test_a_partition_is_not_collected_inside_its_refill_window
@@ -111,38 +140,81 @@ class PartitionSweepTest < DispatchPolicy::IntegrationTest
   # has refilled the row holds nothing (a partition that reappears starts
   # full), so it can be collected on the normal cutoff instead of being
   # held for a week.
-  def test_a_refilled_bucket_is_collected_on_the_normal_cutoff
-    2.times { WeeklyJob.perform_later }
+  #
+  # Spending ONE of the two weekly tokens is what makes this test bite:
+  # the bucket climbs back to capacity in 3.5 days, well inside the 7-day
+  # window the old rule would have waited out. The state is produced by a
+  # real admission plus real idleness — writing `tokens` by hand would
+  # test a row the running system never creates, since the admission
+  # UPDATE is the only writer of that key and it always subtracts.
+  def test_a_refilled_bucket_is_collected_before_its_window_is_out
+    WeeklyJob.perform_later
     DispatchPolicy::Tick.run(policy_name: "sweep_weekly")
-    age_partitions!(25)
+    assert_in_delta 1.0, bucket, 0.01, "one of two weekly tokens spent"
 
-    # Simulate the window having elapsed: the bucket is back at capacity.
-    ActiveRecord::Base.connection.execute(<<~SQL)
-      UPDATE dispatch_policy_partitions
-      SET gate_state = jsonb_build_object('throttle', jsonb_build_object(
-            'tokens', 2.0, 'refilled_at', EXTRACT(EPOCH FROM now())))
-    SQL
-
+    age_partitions!(4 * 24) # refills in 3.5 days; still inside the 7-day window
     DispatchPolicy::TickLoop.sweep!
 
     assert_equal 0, DispatchPolicy::Partition.count,
                  "a full bucket is worth nothing; holding the row for 7 days is pure bloat"
   end
 
-  def test_a_partly_spent_bucket_is_still_held_for_the_window
-    2.times { WeeklyJob.perform_later }
+  def test_a_partly_spent_bucket_is_still_held
+    WeeklyJob.perform_later
     DispatchPolicy::Tick.run(policy_name: "sweep_weekly")
-    age_partitions!(25)
 
-    ActiveRecord::Base.connection.execute(<<~SQL)
-      UPDATE dispatch_policy_partitions
-      SET gate_state = jsonb_build_object('throttle', jsonb_build_object(
-            'tokens', 0.5, 'refilled_at', EXTRACT(EPOCH FROM now())))
-    SQL
-
+    age_partitions!(3 * 24) # half a token short of the 3.5 days it needs
     DispatchPolicy::TickLoop.sweep!
 
     assert_equal 1, DispatchPolicy::Partition.count,
-                 "half a token short of capacity still means quota this tenant has spent"
+                 "still short of capacity means quota this tenant has spent"
+  end
+
+  # The bucket goes NEGATIVE when two tick loops cover one (policy, shard)
+  # and both admit against the same snapshot — that overdraft is how the
+  # long-run rate survives the burst. Collecting the row before it is
+  # repaid forgives the debt, which is the M11 reset wearing a new hat:
+  # one window of refill only takes -2 back to 0, not to capacity.
+  def test_a_bucket_in_debt_is_not_collected_when_the_window_is_out
+    2.times { WeeklyJob.perform_later }
+    DispatchPolicy::Tick.run(policy_name: "sweep_weekly")
+
+    # A second loop admitting against the same pre-admission snapshot.
+    gate     = WeeklyJob::POLICY.gates.find { |g| g.name == :throttle }
+    snapshot = { "gate_state" => {} }
+    decision = gate.evaluate(DispatchPolicy::Context.wrap({}), snapshot, 100)
+    DispatchPolicy::Repository.record_partition_admit!(
+      policy_name: "sweep_weekly", partition_key: "k", admitted: 2,
+      gate_state_patch: {}, retry_after: nil, throttle_charge: decision.charge
+    )
+    assert_in_delta(-2.0, bucket, 0.01, "four admits against a bucket of two")
+
+    age_partitions!(8 * 24) # a whole window past — but the debt needs two
+    DispatchPolicy::TickLoop.sweep!
+
+    assert_equal 1, DispatchPolicy::Partition.count,
+                 "deleting it here hands the tenant a full bucket and erases the overdraft"
+  end
+
+  # A sub-unit rate refills one token in `per / rate` seconds, not in
+  # `per`: capacity is floored at 1.0 so the bucket can ever admit, while
+  # the refill still runs at the true rate. Collecting on the window would
+  # hand out a token the tenant has not earned.
+  def test_a_sub_unit_rate_is_held_past_its_window
+    HalfWeeklyJob.perform_later
+    DispatchPolicy::Tick.run(policy_name: "sweep_half_weekly")
+    assert_in_delta 0.0, bucket, 0.01
+
+    age_partitions!(8 * 24) # past the 7-day window, half of the 14 days owed
+    DispatchPolicy::TickLoop.sweep!
+
+    assert_equal 1, DispatchPolicy::Partition.count,
+                 "one job per 14 days: a window of refill is only half a token"
+
+    age_partitions!(15 * 24)
+    DispatchPolicy::TickLoop.sweep!
+
+    assert_equal 0, DispatchPolicy::Partition.count,
+                 "once the token is genuinely back, the row is garbage"
   end
 end

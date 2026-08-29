@@ -141,12 +141,32 @@
   is recomputable and, on the deny path, could overwrite a concurrent
   admission's charge.
 
-- **The partition sweeper collects a refilled bucket on the normal
-  cutoff.** Holding a throttled policy's partitions for its whole window
-  (needed so a mid-window collection can't reset the quota) meant a week
-  of rows for `per: 7.days`. A bucket at capacity is worth nothing — a
-  partition that reappears starts full — so it is now collected on the
-  usual cutoff, and only a partly-spent bucket waits out the window.
+  The bucket stays on ONE clock while doing so: the charge reads the
+  token count from the row but takes its timestamps from
+  `DispatchPolicy.config.now`, bound as parameters. Settling against
+  Postgres `now()` would put the two ends of one subtraction on two
+  clocks — `evaluate` refills from `config.now`, so any offset between
+  app and database is credited as free tokens on every evaluate — and
+  `now()` is the transaction timestamp, which stops advancing inside an
+  enclosing transaction. The stamp is written as `GREATEST(now, stored)`
+  so that two transactions committing out of order cannot rewind it and
+  refill the same interval twice.
+
+- **The partition sweeper holds a throttled partition until its bucket
+  has refilled, instead of for a whole window.** Retaining the row for
+  `per` was an approximation of "the bucket is back at capacity", and it
+  was wrong in both directions. Too long: a `per: 7.days` policy kept
+  every partition for a week, when a bucket that spent one of two tokens
+  is full again in 3.5 days. Too short: a bucket left in debt by
+  concurrent loops needs more than one window to climb back, and a
+  sub-unit rate (`rate: 0.5, per: 7.days` — capacity is floored at one
+  token while the refill runs at the true rate) needs two — collecting
+  either hands the tenant a fresh quota, which is the reset the window
+  rule existed to prevent. The sweeper now refills the stored bucket to
+  now with the same expression the admission UPDATE uses and collects
+  only what has genuinely reached capacity. Applies when both throttle
+  knobs are fixed numbers; a proc `rate` or `per` still falls back to
+  the window cutoff.
 
 ### Changed
 

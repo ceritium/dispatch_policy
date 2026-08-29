@@ -238,8 +238,12 @@ charge: the bucket goes negative and the overdraft comes out of the next
 window. The admission *decision* is not serialised, though — `evaluate`
 reads before the transaction opens — so two tick loops on the same
 `(policy, shard)` can still produce a simultaneous burst before that
-correction kicks in. Run one loop per shard (the generated
-`DispatchTickLoopJob` does) and shard the policy to parallelise.
+correction kicks in. Run one loop per shard and shard the policy to
+parallelise. The generated `DispatchTickLoopJob` sets a good_job /
+solid_queue concurrency key per `(policy, shard)` argument tuple, which
+stops a duplicate of the *same* invocation — it does not stop a
+catch-all `perform_later` from overlapping a `perform_later("events")`,
+since those are different keys.
 
 One sizing note: the tick cadence is the granularity of the rate limit.
 A partition becomes eligible again `retry_after` seconds after it empties
@@ -475,9 +479,12 @@ The gem's automatic context enrichment puts `:queue_name` into the
 ctx hash so `shard_by` can use it directly without your `context`
 proc having to know about it.
 
-**`shard_by` must be ≥ as coarse as the most restrictive throttle's
-scope.** If not, the bucket duplicates across shards and the
-effective rate becomes `rate × N_shards`.
+**One tick loop per `(policy, shard)`.** The bucket cannot duplicate
+across shards — `(policy_name, partition_key)` is unique and the shard
+is pinned on first write, so a partition is exactly one row — but two
+loops covering the same shard both read the bucket before either
+charges it, which costs a burst of up to `rate × N_loops` before the
+overdraft corrects it. See the throttle section above.
 
 ## Atomic admission
 

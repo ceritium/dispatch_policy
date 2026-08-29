@@ -35,11 +35,18 @@ module DispatchPolicy
       # that is still being spent hands the tenant a fresh quota.
       attr_reader :static_per
 
-      # Capacity when BOTH knobs are fixed, nil otherwise. The sweeper
-      # uses it to tell a bucket that is already full — such a row holds
-      # nothing worth keeping, since a partition that reappears starts
-      # full anyway — from one that is still spending its window.
+      # Bucket size when `rate` is a fixed number, nil when it is a proc.
+      # Paired with `static_refill_rate` it lets the sweeper work out what
+      # the bucket holds RIGHT NOW — the stored value plus the refill
+      # accrued since `refilled_at` — rather than trusting the stored
+      # snapshot, which nothing refreshes while a partition sits idle.
       attr_reader :static_capacity
+
+      # Tokens per second, when BOTH knobs are fixed. Not derivable from
+      # `static_capacity`: a sub-unit rate floors the capacity at 1.0
+      # while still refilling at the true `rate`, so `capacity / per`
+      # would refill such a bucket twice as fast as the policy allows.
+      attr_reader :static_refill_rate
 
       def initialize(rate:, per:)
         super()
@@ -57,6 +64,7 @@ module DispatchPolicy
           @per_proc   = ->(_ctx) { fixed }
           @static_per = fixed
         end
+        @static_refill_rate = @static_capacity && @static_per ? static_rate / @static_per : nil
       end
 
       def name
