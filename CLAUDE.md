@@ -224,11 +224,16 @@ dispatch_policy_policy_settings               one row per policy — pause flag
   window. Only a fixed `rate` and `per` can be charged here — a proc
   needs the partition's ctx, which this path never loads — so a dynamic
   throttle is left alone and warns.
-- **Inflight rows are reaped on `discard.active_job`.** The railtie
-  subscribes and calls `InflightTracker.handle_discard`, deleting the
-  row by `active_job_id`. This covers jobs killed BEFORE around_perform
-  (e.g. `discard_on ActiveJob::DeserializationError`), whose `ensure`
-  never runs — otherwise the Tick's pre-inserted row sits until the
+- **Inflight rows are reaped on `perform.active_job` AND
+  `discard.active_job`.** The railtie subscribes to both and calls
+  `InflightTracker.handle_discard`, deleting the row by `active_job_id`.
+  `discard` alone is NOT enough: ActiveJob instruments it in exactly one
+  place, the rescue_from handler `discard_on` installs, so a job class
+  with no handler dies in perform_now's bare `rescue Exception` and emits
+  nothing. `perform.active_job` wraps the whole of perform_now — argument
+  deserialization included — and carries an `:exception` payload when the
+  job dies, which is what actually covers a job killed BEFORE
+  around_perform, whose `ensure` never runs — otherwise the Tick's pre-inserted row sits until the
   `inflight_queued_stale_after` sweeper (1h), holding a slot.
 - **Adding a table?** Add it to `Repository::ALL_TABLES` — the test
   bootstrap (`PostgresTest`) and the benchmark harness (`Bench`) both

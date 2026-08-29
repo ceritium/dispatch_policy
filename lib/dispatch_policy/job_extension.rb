@@ -72,7 +72,20 @@ module DispatchPolicy
       # and re-enqueues it without going through perform_now (e.g. a
       # custom retry path), `job.arguments` would be []. Guard against
       # that here so the context proc always sees the real args.
-      ensure_arguments_materialized!(job)
+      #
+      # A job whose arguments cannot be rebuilt (the GlobalID record was
+      # deleted) must not raise out of the enqueue callback: ActiveJob's
+      # own enqueue copes fine — `serialize` reuses @serialized_arguments
+      # — so raising here would destroy the retry that `retry_on
+      # ActiveJob::DeserializationError` had just scheduled, turning a
+      # recoverable job into a hard failure the gem caused. Hand it to the
+      # adapter instead; it fails again at perform, which is exactly what
+      # would have happened without the gem.
+      begin
+        ensure_arguments_materialized!(job)
+      rescue ActiveJob::DeserializationError
+        return block.call
+      end
 
       queue_name    = job.queue_name&.to_s || policy.queue_name
       ctx           = policy.build_context(job.arguments, queue_name: queue_name)

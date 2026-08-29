@@ -24,11 +24,34 @@ module DispatchPolicy
       end
     end
 
-    # Reap the inflight row when a job is discarded before its perform
-    # callbacks run (e.g. discard_on ActiveJob::DeserializationError):
-    # InflightTracker.track's `ensure` never fires in that path, so the
-    # Tick's pre-inserted row would orphan until the stale sweeper.
+    # Reap the inflight row when a job dies before its perform callbacks
+    # run: InflightTracker.track's `ensure` never fires in that path, so
+    # the Tick's pre-inserted row would orphan until the stale sweeper —
+    # an hour of a `:concurrency` partition wedged one slot short, per
+    # such job.
+    #
+    # `discard.active_job` alone does NOT cover that. It is instrumented
+    # by exactly one thing in ActiveJob: the rescue_from handler that
+    # `discard_on` installs. A job class with no handler dies in
+    # perform_now's bare `rescue Exception` and emits no discard at all —
+    # so the routine case (a GlobalID argument whose record was deleted
+    # between enqueue and perform, raising ActiveJob::DeserializationError
+    # during argument deserialization) was uncovered unless the host
+    # happened to have declared `discard_on`.
+    #
+    # `perform.active_job` wraps the whole of perform_now, argument
+    # deserialization included, and carries an :exception payload when the
+    # job dies. Deleting on it is idempotent and safe: on the normal path
+    # `track`'s ensure has already removed the row, and the Tick
+    # regenerates active_job_id on every admission, so a late delete can
+    # never reach the row of a re-staged job's NEXT admission.
     initializer "dispatch_policy.discard_cleanup" do
+      ActiveSupport::Notifications.subscribe("perform.active_job") do |event|
+        next unless event.payload[:exception]
+
+        DispatchPolicy::InflightTracker.handle_discard(event.payload[:job])
+      end
+
       ActiveSupport::Notifications.subscribe("discard.active_job") do |event|
         DispatchPolicy::InflightTracker.handle_discard(event.payload[:job])
       end

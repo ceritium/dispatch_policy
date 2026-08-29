@@ -20,6 +20,32 @@
   after which the tick re-parks it in the new column.
 ### Fixed
 
+- **A job that dies before `around_perform` releases its slot even
+  without `discard_on`.** The railtie reaped the Tick's pre-inserted
+  inflight row on `discard.active_job`, and CLAUDE.md claimed that
+  covered every job killed before the perform callbacks. It does not:
+  ActiveJob instruments `discard` in exactly one place — the
+  `rescue_from` handler `discard_on` installs — so a job class with no
+  handler dies in `perform_now`'s bare `rescue Exception` and emits
+  nothing at all. The routine case is a GlobalID argument whose record
+  was deleted between enqueue and perform, raising
+  `ActiveJob::DeserializationError` during argument deserialization: the
+  row then orphaned until the `inflight_queued_stale_after` sweeper an
+  hour later, and with `gate :concurrency, max: 1` that is an hour of a
+  frozen tenant per such job. The railtie now also subscribes to
+  `perform.active_job` and reaps when the payload carries an exception —
+  idempotent, since the normal path has already deleted the row, and safe
+  against a late delete because the Tick regenerates `active_job_id` on
+  every admission.
+
+  Relatedly, a job whose arguments cannot be rebuilt no longer raises out
+  of the *enqueue* callback. ActiveJob's own enqueue copes (`serialize`
+  reuses the serialized arguments), so raising there destroyed the retry
+  that `retry_on ActiveJob::DeserializationError` had just scheduled —
+  turning a recoverable job into a hard failure the gem itself caused.
+  Such a job is handed to the adapter instead and fails at perform, which
+  is what would have happened without the gem.
+
 - **The generated tick-loop job no longer dies on its first iteration
   under solid_queue.** The template's shutdown check called
   `SolidQueue::Process.current_process`, a method solid_queue has never
