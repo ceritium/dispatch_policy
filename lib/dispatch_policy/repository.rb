@@ -87,7 +87,8 @@ module DispatchPolicy
           queue_name:    queue_name,
           shard:         shard,
           context:       context,
-          delta_pending: 1
+          delta_pending: 1,
+          scheduled_at:  scheduled_at
         )
       end
       true
@@ -141,27 +142,43 @@ module DispatchPolicy
         # Postgres resolves by killing one of the transactions, losing
         # that whole batch's staging.
         rows.group_by { |r| [r[:policy_name], r[:partition_key]] }.sort_by(&:first).each do |(policy_name, partition_key), group|
+          # nil wins over any timestamp: one job in this batch that is due
+          # now means the partition has work to do now, whatever the rest
+          # of the batch is scheduled for.
+          scheduled = group.map { |r| r[:scheduled_at] }
+          soonest   = scheduled.include?(nil) ? nil : scheduled.min
+
           upsert_partition!(
             policy_name:   policy_name,
             partition_key: partition_key,
             queue_name:    group.first[:queue_name],
             shard:         group.first[:shard] || Policy::DEFAULT_SHARD,
             context:       group.last[:context] || {},
-            delta_pending: group.size
+            delta_pending: group.size,
+            scheduled_at:  soonest
           )
         end
       end
       rows.size
     end
 
+    # `scheduled_at` is the new job's own due time (nil = due now). It
+    # maintains `scheduled_eligible_at`, the soonest moment this partition
+    # can have work to do — see `defer_partition_to_next_scheduled!` for
+    # why that lives in its own column rather than in `next_eligible_at`.
+    # NULL is absorbing in both directions: a job due NOW clears the
+    # horizon, and a future job cannot install one over a partition that
+    # already has due work waiting.
     def upsert_partition!(policy_name:, partition_key:, queue_name:, context:, delta_pending:,
-                          shard: Policy::DEFAULT_SHARD)
+                          shard: Policy::DEFAULT_SHARD, scheduled_at: nil)
       connection.exec_query(
         <<~SQL.squish,
           INSERT INTO #{PARTITIONS_TABLE}
             (policy_name, partition_key, queue_name, shard, context, context_updated_at,
-             pending_count, last_enqueued_at, status, gate_state, created_at, updated_at)
-          VALUES ($1, $2, $3, $4, $5::jsonb, now(), $6, now(), 'active', '{}'::jsonb, now(), now())
+             pending_count, last_enqueued_at, status, gate_state, scheduled_eligible_at,
+             created_at, updated_at)
+          VALUES ($1, $2, $3, $4, $5::jsonb, now(), $6, now(), 'active', '{}'::jsonb, $7,
+                  now(), now())
           ON CONFLICT (policy_name, partition_key) DO UPDATE SET
             context             = EXCLUDED.context,
             context_updated_at  = EXCLUDED.context_updated_at,
@@ -169,10 +186,17 @@ module DispatchPolicy
             shard               = #{PARTITIONS_TABLE}.shard,
             pending_count       = #{PARTITIONS_TABLE}.pending_count + EXCLUDED.pending_count,
             last_enqueued_at    = EXCLUDED.last_enqueued_at,
+            scheduled_eligible_at = CASE
+              WHEN EXCLUDED.scheduled_eligible_at IS NULL THEN NULL
+              WHEN #{PARTITIONS_TABLE}.scheduled_eligible_at IS NULL THEN NULL
+              ELSE LEAST(#{PARTITIONS_TABLE}.scheduled_eligible_at,
+                         EXCLUDED.scheduled_eligible_at)
+            END,
             updated_at          = now()
         SQL
         "upsert_partition",
-        [policy_name, partition_key, queue_name, shard, JSON.dump(context), delta_pending]
+        [policy_name, partition_key, queue_name, shard, JSON.dump(context), delta_pending,
+         scheduled_at]
       )
     end
 
@@ -201,6 +225,7 @@ module DispatchPolicy
             AND status = 'active'
             AND pending_count > 0
             AND (next_eligible_at IS NULL OR next_eligible_at <= now())
+            AND (scheduled_eligible_at IS NULL OR scheduled_eligible_at <= now())
             AND NOT EXISTS (
               SELECT 1 FROM #{POLICY_SETTINGS_TABLE} ps
               WHERE ps.policy_name = $1 AND ps.paused
@@ -366,14 +391,13 @@ module DispatchPolicy
       connection.exec_query(
         <<~SQL.squish,
           UPDATE #{PARTITIONS_TABLE} p
-          SET next_eligible_at = (
+          SET scheduled_eligible_at = (
                 SELECT MIN(s.scheduled_at) FROM #{STAGED_TABLE} s
                 WHERE s.policy_name = $1 AND s.partition_key = $2
                   AND s.scheduled_at > now()
               ),
               updated_at = now()
           WHERE p.policy_name = $1 AND p.partition_key = $2
-            AND p.next_eligible_at IS NULL
         SQL
         "defer_partition_to_next_scheduled",
         [policy_name, partition_key]

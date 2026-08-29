@@ -45,7 +45,8 @@ module DispatchPolicy
     # this when a migration adds a column, per the "Adding a table?"
     # workflow in CLAUDE.md — that's what makes the suite rebuild a
     # stale local database instead of failing on a missing column.
-    SCHEMA_COLUMNS = %w[total_admitted shard decayed_admits decayed_admits_at].freeze
+    SCHEMA_COLUMNS = %w[total_admitted shard decayed_admits decayed_admits_at
+                        scheduled_eligible_at].freeze
 
     module_function
 
