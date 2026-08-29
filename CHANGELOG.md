@@ -21,6 +21,34 @@
 
 ### Fixed
 
+- **The throttle's token bucket is charged atomically** (throttle
+  review). It was written back as a literal jsonb patch computed in Ruby
+  from an earlier read — a read-modify-write across two statements. Two
+  tick loops covering the same `(policy, shard)` each evaluated a full
+  bucket, each admitted it, and the second write overwrote the first, so
+  one admission went uncharged and the effective rate became
+  `rate × loops` **indefinitely**. Reproduced against Postgres: 20 jobs
+  admitted against `rate: 10, per: 60`, bucket left at `0.0` instead of
+  `-10`. The bucket is now recomputed inside the admission UPDATE from
+  the row's own value, so concurrent charges compose and the overdraft is
+  repaid out of the next window — the long-run rate holds. Note this
+  makes the *charge* atomic, not the admission *decision*: a transient
+  burst is still possible, so one tick loop per `(policy, shard)` remains
+  the recommendation. `evaluate` also stops persisting its refill, which
+  is recomputable and, on the deny path, could overwrite a concurrent
+  admission's charge.
+
+  The bucket stays on ONE clock while doing so: the charge reads the
+  token count from the row but takes its timestamps from
+  `DispatchPolicy.config.now`, bound as parameters. Settling against
+  Postgres `now()` would put the two ends of one subtraction on two
+  clocks — `evaluate` refills from `config.now`, so any offset between
+  app and database is credited as free tokens on every evaluate — and
+  `now()` is the transaction timestamp, which stops advancing inside an
+  enclosing transaction. The stamp is written as `GREATEST(now, stored)`
+  so that two transactions committing out of order cannot rewind it and
+  refill the same interval twice.
+
 - **A job due now no longer waits behind a future-scheduled one.** M10
   parked a partition holding only future work by writing
   `next_eligible_at`, the same column gates use for their backoff.

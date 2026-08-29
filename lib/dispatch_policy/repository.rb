@@ -255,7 +255,7 @@ module DispatchPolicy
     # the tick.
     def claim_staged_jobs!(policy_name:, partition_key:, limit:, retry_after:,
                            gate_state_patch: nil, half_life_seconds: nil,
-                           preserve_next_eligible: false)
+                           preserve_next_eligible: false, throttle_charge: nil)
       raise ArgumentError, "claim_staged_jobs! requires limit > 0" unless limit.positive?
 
       sql_select = <<~SQL.squish
@@ -288,7 +288,8 @@ module DispatchPolicy
         gate_state_patch:  patch,
         retry_after:       retry_after,
         half_life_seconds: half_life_seconds,
-        preserve_next_eligible: preserve_next_eligible
+        preserve_next_eligible: preserve_next_eligible,
+        throttle_charge:   throttle_charge
       )
 
       rows.map { |r| normalize_staged(r) }
@@ -312,9 +313,32 @@ module DispatchPolicy
     # therefore learned nothing about capacity — clearing the backoff there
     # just makes the next tick re-claim the partition, re-evaluate it and
     # back it off again.
+    # `throttle_charge` — {capacity:, refill_rate:, now:} — makes the token
+    # bucket settle IN this UPDATE, from the row's own current value,
+    # instead of writing back a number Ruby computed from a read that
+    # happened earlier. That read-modify-write was a real hole: two tick
+    # loops covering the same (policy, shard) each evaluated a full
+    # bucket, each admitted it, and the second write simply overwrote the
+    # first — the second admission was never charged, so the effective
+    # rate became rate x loops, indefinitely. Computed here, the two
+    # charges compose: the bucket goes negative and the debt is repaid
+    # out of the next window, so the long-run rate holds. (The transient
+    # burst is still possible — the ADMISSION decision is not
+    # serialised, only the charge — which is why one tick loop per
+    # (policy, shard) remains the recommended setup.)
+    #
+    # `now` is the gate's own clock (DispatchPolicy.config.now), NOT
+    # Postgres `now()`. Only the TOKEN COUNT has to come from the row;
+    # the clock does not, and taking it from the database would put the
+    # two ends of the same subtraction on different clocks — `evaluate`
+    # refills from config.now, so an offset O between the two adds
+    # O * refill_rate phantom tokens to every evaluate, permanently.
+    # `now()` is also the TRANSACTION timestamp: inside an enclosing
+    # transaction it stops advancing altogether.
     def record_partition_admit!(policy_name:, partition_key:, admitted:, gate_state_patch:,
                                 retry_after:, half_life_seconds: nil,
-                                preserve_next_eligible: false)
+                                preserve_next_eligible: false,
+                                throttle_charge: nil)
       next_eligible_sql, next_eligible_params =
         if preserve_next_eligible
           ["next_eligible_at", []]
@@ -356,13 +380,56 @@ module DispatchPolicy
         decay_sql = ""
       end
 
+      # Recompute the bucket from the row: refill by the time elapsed
+      # since ITS refilled_at, clamp to capacity, then subtract what we
+      # actually admitted. Deliberately NOT floored at zero — a negative
+      # balance is how a concurrent over-admission gets repaid instead of
+      # forgiven, and `evaluate` treats anything under one whole token as
+      # empty. Built with `||` on top of the literal patch, so it wins for
+      # the "throttle" key while other gates' keys survive; every
+      # gate_state reference below reads the pre-UPDATE row.
+      #
+      # The stamp is GREATEST(now, stored) rather than a plain `now`: two
+      # admission transactions can execute in the opposite order to the
+      # one they started in, and a stamp that moves BACKWARDS makes the
+      # interval between them refill twice. Paired with the GREATEST(…, 0)
+      # on the elapsed term, a stale clock then credits nothing instead.
+      if throttle_charge
+        cap_idx  = params.size + 1
+        rate_idx = params.size + 2
+        now_idx  = params.size + 3
+        params << throttle_charge.fetch(:capacity).to_f
+        params << throttle_charge.fetch(:refill_rate).to_f
+        params << throttle_charge.fetch(:now).to_f
+        stored_refilled_at = "(gate_state -> 'throttle' ->> 'refilled_at')::double precision"
+        gate_state_sql = <<~SQL.squish
+          (gate_state || $4::jsonb) || jsonb_build_object('throttle', jsonb_build_object(
+            'tokens', LEAST(
+                COALESCE((gate_state -> 'throttle' ->> 'tokens')::double precision, $#{cap_idx}::double precision)
+                + GREATEST(
+                    $#{now_idx}::double precision
+                    - COALESCE(#{stored_refilled_at}, $#{now_idx}::double precision),
+                    0
+                  ) * $#{rate_idx}::double precision,
+                $#{cap_idx}::double precision
+              ) - $3,
+            'refilled_at', GREATEST(
+                $#{now_idx}::double precision,
+                COALESCE(#{stored_refilled_at}, $#{now_idx}::double precision)
+              )
+          ))
+        SQL
+      else
+        gate_state_sql = "gate_state || $4::jsonb"
+      end
+
       connection.exec_query(
         <<~SQL.squish,
           UPDATE #{PARTITIONS_TABLE}
           SET pending_count    = GREATEST(pending_count - $3, 0),
               total_admitted   = total_admitted + $3,
               last_admit_at    = CASE WHEN $3 > 0 THEN now() ELSE last_admit_at END,
-              gate_state       = gate_state || $4::jsonb,
+              gate_state       = #{gate_state_sql},
               next_eligible_at = #{next_eligible_sql},
               #{decay_sql}
               updated_at       = now()

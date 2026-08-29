@@ -17,6 +17,14 @@ class TickPipelineSmokeTest < Minitest::Test
     result = pipeline.call(DispatchPolicy::Context.wrap({ rate: 4 }), partition, 100)
 
     assert_equal 4, result.admit_count
-    assert_includes result.gate_state_patch, "throttle"
+
+    # The throttle settles its bucket in the admission UPDATE rather than
+    # handing back a literal patch computed from an earlier read, so it
+    # contributes a charge and nothing to gate_state_patch.
+    refute_includes result.gate_state_patch, "throttle"
+    charge = DispatchPolicy::Pipeline.charge_for(result.decisions)
+    refute_nil charge, "the throttle must carry the numbers its charge needs"
+    assert_in_delta 4.0,      charge[:capacity],    0.001
+    assert_in_delta 4 / 60.0, charge[:refill_rate], 0.001
   end
 end
