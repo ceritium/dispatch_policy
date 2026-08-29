@@ -15,8 +15,22 @@ module DispatchPolicy
       config       = DispatchPolicy.config
       logger       = config.logger
 
+      # A `stop_when` that raises must not take down the only thing that
+      # drains the staging table. It is host-supplied (the generated tick
+      # job asks the adapter whether it is shutting down), it is called
+      # OUTSIDE the rescue that guards Tick.run, and an exception here
+      # escapes `perform` — so the self-re-enqueue chain dies, admission
+      # stops for good, and `perform_later` keeps staging into a table
+      # nothing empties. Degrade to "not stopping" and say so.
+      stop = lambda do
+        stop_when.call
+      rescue StandardError => e
+        logger&.error("[dispatch_policy] stop_when raised #{e.class}: #{e.message}; treating as not stopping")
+        false
+      end
+
       loop do
-        break if stop_when.call
+        break if stop.call
 
         # NOTE: `config.enabled` is deliberately not consulted here. It
         # governs the ENQUEUE side — whether new perform_later calls are
@@ -38,7 +52,7 @@ module DispatchPolicy
 
         admitted = 0
         names.each do |name|
-          break if stop_when.call
+          break if stop.call
 
           begin
             result = Tick.run(policy_name: name, shard: shard)
@@ -112,6 +126,9 @@ module DispatchPolicy
       )
       sweep_inactive_partitions!(cfg)
       Repository.sweep_old_tick_samples!(cutoff_seconds: cfg.metrics_retention)
+      # Only reachable once the partition itself has been collected, so it
+      # inherits partition_inactive_after rather than needing a knob.
+      Repository.sweep_orphan_adaptive_stats!(cutoff_seconds: cfg.partition_inactive_after)
     rescue StandardError => e
       DispatchPolicy.config.logger&.error("[dispatch_policy] sweep error: #{e.class}: #{e.message}")
     end

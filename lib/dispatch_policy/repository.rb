@@ -258,12 +258,22 @@ module DispatchPolicy
                            preserve_next_eligible: false, throttle_charge: nil)
       raise ArgumentError, "claim_staged_jobs! requires limit > 0" unless limit.positive?
 
+      # priority ASC, not DESC: ActiveJob priority follows the adapters'
+      # convention, where a SMALLER number is more urgent (good_job's
+      # `priority_ordered` is "priority ASC NULLS LAST", solid_queue's
+      # `ordered` is "priority: :asc"). The enqueue path stores
+      # `job.priority` verbatim, so ordering DESC admitted the host's
+      # LEAST urgent work first and could starve an urgent job behind a
+      # steady stream of default-priority ones.
+      #
+      # (Keep comments out of the heredoc: it is `.squish`ed onto one
+      # line, where a `--` would comment out the rest of the statement.)
       sql_select = <<~SQL.squish
         WITH claimed AS (
           SELECT id FROM #{STAGED_TABLE}
           WHERE policy_name = $1 AND partition_key = $2
             AND (scheduled_at IS NULL OR scheduled_at <= now())
-          ORDER BY priority DESC, scheduled_at NULLS FIRST, id
+          ORDER BY priority ASC, scheduled_at NULLS FIRST, id
           LIMIT $3
           FOR UPDATE SKIP LOCKED
         )
@@ -1003,6 +1013,39 @@ module DispatchPolicy
         [policy_name, partition_key, alpha.to_f, queue_lag_ms.to_f,
          min.to_i, succeeded ? true : false,
          fail_factor.to_f, target_lag_ms.to_f, slow_factor.to_f, max.to_i]
+      )
+    end
+
+    # Collect adaptive stats whose partition is gone. Every other table in
+    # the gem is bounded — staged rows are deleted on claim, partitions at
+    # `partition_inactive_after`, inflight in two tiers, samples at
+    # `metrics_retention` — but `adaptive_seed!` runs on EVERY evaluate of
+    # EVERY partition and nothing ever deleted from here, so the row count
+    # was "every partition key this policy has ever seen". With a
+    # high-cardinality `partition_by` (per user, per endpoint, per upload)
+    # that grows without bound and without a knob.
+    #
+    # The anti-join, rather than age alone: the partition row is already
+    # the gem's authority on liveness, and its own sweeper knows about a
+    # throttle's refill window. A stats row can therefore only go once the
+    # partition it describes has gone, and re-seeding costs one
+    # ON CONFLICT DO NOTHING insert at `initial_max` — which is also what
+    # the `in_flight == 0` safety valve grants a cold partition anyway.
+    # Both tables carry a unique index on (policy_name, partition_key), so
+    # the anti-join is index-supported.
+    def sweep_orphan_adaptive_stats!(cutoff_seconds:)
+      connection.exec_query(
+        <<~SQL.squish,
+          DELETE FROM #{ADAPTIVE_TABLE} a
+          WHERE a.updated_at < now() - ($1 || ' seconds')::interval
+            AND NOT EXISTS (
+              SELECT 1 FROM #{PARTITIONS_TABLE} p
+              WHERE p.policy_name = a.policy_name
+                AND p.partition_key = a.partition_key
+            )
+        SQL
+        "sweep_orphan_adaptive_stats",
+        [cutoff_seconds.to_i]
       )
     end
 

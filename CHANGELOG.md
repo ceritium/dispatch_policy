@@ -20,6 +20,46 @@
   after which the tick re-parks it in the new column.
 ### Fixed
 
+- **The generated tick-loop job no longer dies on its first iteration
+  under solid_queue.** The template's shutdown check called
+  `SolidQueue::Process.current_process`, a method solid_queue has never
+  had (the string does not appear anywhere in 1.3, 1.4 or 1.7).
+  `defined?(SolidQueue::Process)` is truthy once solid_queue is loaded,
+  so the call always raised `NoMethodError` — and it is the `stop_when`
+  lambda, evaluated as the first statement inside the loop, outside the
+  rescue that guards `Tick.run`. The exception escaped `perform`, the
+  `set(wait: 1.second).perform_later` successor was never enqueued, and
+  the chain was dead after one run: every install on solid_queue staged
+  jobs that nothing ever admitted. Both supported adapters implement the
+  ActiveJob `stopping?` hook, so the per-adapter branch is gone. As
+  defence in depth, a `stop_when` that raises is now logged and treated
+  as "not stopping" rather than taking the loop down.
+
+- **Staged jobs are admitted in the priority order ActiveJob means.** The
+  claim ordered `priority DESC`, i.e. the largest number first, while
+  both supported adapters define the opposite — good_job's
+  `priority_ordered` is `priority ASC NULLS LAST`, solid_queue's
+  `ordered` is `priority: :asc` — and the enqueue path stores
+  `job.priority` verbatim. A host setting `priority: -10` for interactive
+  work and `priority: 10` for bulk therefore had it exactly backwards,
+  and behind a steady stream of default-priority jobs the urgent one was
+  starved indefinitely. The dashboard's staged list mirrored the same
+  inverted order, so the UI confirmed it rather than exposing it. Both
+  now sort ascending, and the README states the convention.
+
+- **`dispatch_policy_adaptive_concurrency_stats` is garbage-collected.**
+  `adaptive_seed!` runs on every evaluate of every partition and nothing
+  in the gem ever deleted from that table, so its row count was "every
+  partition key this policy has ever seen" — unbounded for the
+  per-tenant/per-user/per-endpoint `partition_by` the README recommends,
+  with no knob, no dashboard surface and no rake task. `TickLoop.sweep!`
+  now collects stats whose partition is already gone, reusing
+  `partition_inactive_after`: the partition row is the gem's authority on
+  liveness and its own sweeper already respects a throttle's refill
+  window, so no new retention setting is needed. Re-seeding a partition
+  that comes back costs one `ON CONFLICT DO NOTHING` insert at
+  `initial_max`.
+
 - **A job class that defers its own enqueue no longer breaks admission.**
   ActiveJob 7.2+ lets a class set `self.enqueue_after_transaction_commit
   = true` — the setting Rails recommends for apps that enqueue inside

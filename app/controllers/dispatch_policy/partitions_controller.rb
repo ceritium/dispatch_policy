@@ -72,7 +72,9 @@ module DispatchPolicy
       # reflects what would actually be admitted first, not the reverse.
       @recent_jobs = StagedJob
         .for_partition(@partition.policy_name, @partition.partition_key)
-        .order(Arel.sql("priority DESC, scheduled_at ASC NULLS FIRST, id ASC"))
+        # Mirrors claim_staged_jobs! exactly (audit L9): the list is
+        # "what comes out next", so the two orders must not drift.
+        .order(Arel.sql("priority ASC, scheduled_at ASC NULLS FIRST, id ASC"))
         .limit(50)
       # The whole policy may be paused even if this partition's own status
       # is 'active' (it was created after the pause). claim_partitions skips

@@ -69,13 +69,15 @@ class DispatchTickLoopJob < ApplicationJob
 
   private
 
+  # Both supported adapters implement the ActiveJob hook — good_job as
+  # GoodJob::Adapter#stopping?, solid_queue as SolidQueueAdapter#stopping?
+  # — so there is nothing adapter-specific to branch on. respond_to?
+  # keeps an adapter without it, or a future API change, degrading to
+  # "never shutting down" instead of raising out of TickLoop's stop_when,
+  # which would kill the self-re-enqueue chain and stop admission
+  # entirely while perform_later kept filling the staging table.
   def adapter_shutting_down?
-<% if good_job? -%>
-    GoodJob.current_thread_shutting_down?
-<% elsif solid_queue? -%>
-    defined?(SolidQueue::Process) && SolidQueue::Process.current_process&.shutdown?
-<% else -%>
-    false
-<% end -%>
+    adapter = self.class.queue_adapter
+    adapter.respond_to?(:stopping?) && adapter.stopping?
   end
 end

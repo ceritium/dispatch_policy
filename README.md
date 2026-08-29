@@ -148,6 +148,12 @@ ActiveJob#perform_later
     → DELETE inflight_jobs
 ```
 
+Within a partition, staged jobs are admitted in ActiveJob priority
+order, then by scheduled time, then by arrival. **A smaller `priority`
+number is more urgent** — the same convention good_job and solid_queue
+use, so `MyJob.set(priority: -10).perform_later` is admitted ahead of a
+default `priority: 0` job and well ahead of `priority: 10` bulk work.
+
 ## Declaring a policy
 
 ```ruby
