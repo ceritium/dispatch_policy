@@ -2,7 +2,316 @@
 
 ## Unreleased
 
+### Upgrade notes
+
+- **New column**: `dispatch_policy_partitions.scheduled_eligible_at`
+  (nullable timestamp). The gem ships a single migration, so an existing
+  install does not get it from `db:migrate` — run it yourself:
+
+  ```sql
+  ALTER TABLE dispatch_policy_partitions
+    ADD COLUMN scheduled_eligible_at timestamp(6) without time zone;
+
+  CREATE INDEX CONCURRENTLY idx_dp_partitions_scheduled_order
+    ON dispatch_policy_partitions
+    (policy_name, shard, status, scheduled_eligible_at NULLS FIRST,
+     last_checked_at NULLS FIRST);
+  ```
+
+  The type is what `t.datetime` emits under the supported Rails versions,
+  so an upgraded install matches a fresh one; using `timestamptz` instead
+  works at runtime but leaves this one column disagreeing with the eight
+  others on the table and with every fresh install's schema dump. The
+  index matters once the table is large and most of the work is
+  `set(wait:)`-scheduled: `claim_partitions` filters on both horizons, and
+  without it the parked rows are eliminated by a heap filter. It is not
+  free — the claim rewrites `last_checked_at` on every pass, so the table
+  now maintains two indexes on that hot path; an install whose work is
+  mostly due-now can skip it.
+
+  No backfill is needed. NULL means "nothing is holding this partition
+  back", which is the correct reading for every existing row; a
+  partition that was parked under the old scheme carries its horizon in
+  `next_eligible_at` and simply becomes claimable one tick earlier,
+  after which the tick re-parks it in the new column.
 ### Fixed
+
+- **One poisoned staged row no longer kills the whole drain.** The UI's
+  drain buttons called `ManualAdmission.force!` with no error isolation,
+  so a staged row the Forwarder cannot deserialize — a job class renamed
+  or deleted in a deploy while its rows are still staged — raised
+  `NameError` out of the controller as a bare 500: no flash, no partition
+  name, no count, and nothing drained. In the policy-wide drain the
+  poison partition sorts first, so every healthy partition behind it was
+  never reached, identically on every click, leaving the operator's
+  escape hatch permanently dead for that policy. Each partition is now
+  isolated the way `Tick#admit_partition` already isolates the automatic
+  path: the batch is rescued and logged, that partition is abandoned
+  (retrying would spin on the same head-of-queue row), and the flash says
+  how many partitions could not be forwarded. The raise inside
+  `Forwarder`/`ManualAdmission` is untouched — it is what rolls the claim
+  transaction back and saves the staged rows.
+
+- **A backoff is no longer parsed out of a string, so a large drain
+  cannot take a whole policy's deny bookkeeping with it.** Both backoff
+  clauses built `now() + (n || ' seconds')::interval`, and Postgres'
+  interval input parser rejects a seconds field above `INT_MAX`. A
+  backoff is derived from a token debt, which has no such bound now that
+  a forced admission charges the bucket: `retry_after = (1 - tokens) /
+  refill_rate` crosses `INT_MAX` after roughly `2.147e9 × rate/per`
+  jobs — about 7,100 for a `rate: 2, per: 7.days` policy, inside a
+  single drain click. `bulk_record_partition_denies!` builds ONE
+  statement for the whole tick and `Tick#flush_denies!` only logs on
+  failure, so one unparseable interval discarded every denied
+  partition's `next_eligible_at` **and** `gate_state` patch in that
+  batch. Those partitions were then re-claimed on every tick with
+  nothing recorded — the M4 busy-loop, for a whole policy, from one UI
+  click, silent but for a single log line. Both clauses multiply an
+  interval instead — and clamp first, at `MAX_BACKOFF_SECONDS` (1e9, about
+  31 years). The multiply raises the ceiling ~4295x but does not remove
+  it: `interval` stores microseconds in an int64, so it still raises past
+  ~9.22e12 seconds, which a `rate: 1, per: 1.year` policy reaches at
+  ~292k drained jobs. A backoff longer than the clamp is not a backoff
+  anyone will outlive anyway.
+
+- **A job that dies before `around_perform` releases its slot even
+  without `discard_on`.** The railtie reaped the Tick's pre-inserted
+  inflight row on `discard.active_job`, and CLAUDE.md claimed that
+  covered every job killed before the perform callbacks. It does not:
+  ActiveJob instruments `discard` in exactly one place — the
+  `rescue_from` handler `discard_on` installs — so a job class with no
+  handler dies in `perform_now`'s bare `rescue Exception` and emits
+  nothing at all. The routine case is a GlobalID argument whose record
+  was deleted between enqueue and perform, raising
+  `ActiveJob::DeserializationError` during argument deserialization: the
+  row then orphaned until the `inflight_queued_stale_after` sweeper an
+  hour later, and with `gate :concurrency, max: 1` that is an hour of a
+  frozen tenant per such job. The railtie now also subscribes to
+  `perform.active_job` and reaps when the payload carries an exception —
+  idempotent, since the normal path has already deleted the row, and safe
+  against a late delete because the Tick regenerates `active_job_id` on
+  every admission. The rule lives in
+  `InflightTracker.handle_failed_perform` rather than in the initializer
+  block, because a subscription body is unreachable from the suite.
+
+  Relatedly, a job whose arguments cannot be rebuilt no longer raises out
+  of the *enqueue* callback, on either path — the bulk one materializes
+  before it splits the batch, so one such job is routed to the adapter
+  rather than aborting the row builder and losing every other stageable
+  job with it (after the non-policy half has already gone to the
+  adapter, where a caller that rescues and re-drives would duplicate
+  them). ActiveJob's own enqueue copes (`serialize`
+  reuses the serialized arguments), so raising there destroyed the retry
+  that `retry_on ActiveJob::DeserializationError` had just scheduled —
+  turning a recoverable job into a hard failure the gem itself caused.
+  Such a job is handed to the adapter instead and fails at perform, which
+  is what would have happened without the gem.
+
+- **The generated tick-loop job no longer dies on its first iteration
+  under solid_queue.** The template's shutdown check called
+  `SolidQueue::Process.current_process`, a method solid_queue has never
+  had (the string does not appear anywhere in 1.3, 1.4 or 1.7).
+  `defined?(SolidQueue::Process)` is truthy once solid_queue is loaded,
+  so the call always raised `NoMethodError` — and it is the `stop_when`
+  lambda, evaluated as the first statement inside the loop, outside the
+  rescue that guards `Tick.run`. The exception escaped `perform`, the
+  `set(wait: 1.second).perform_later` successor was never enqueued, and
+  the chain was dead after one run: every install on solid_queue staged
+  jobs that nothing ever admitted. Both supported adapters implement the
+  ActiveJob `stopping?` hook, so the per-adapter branch is gone. As
+  defence in depth, a `stop_when` that raises is now logged and treated
+  as "not stopping" rather than taking the loop down.
+
+- **Staged jobs are admitted in the priority order ActiveJob means.** The
+  claim ordered `priority DESC`, i.e. the largest number first, while
+  both supported adapters define the opposite — good_job's
+  `priority_ordered` is `priority ASC NULLS LAST`, solid_queue's
+  `ordered` is `priority: :asc` — and the enqueue path stores
+  `job.priority` verbatim. A host setting `priority: -10` for interactive
+  work and `priority: 10` for bulk therefore had it exactly backwards,
+  and behind a steady stream of default-priority jobs the urgent one was
+  starved indefinitely. The dashboard's staged list mirrored the same
+  inverted order, so the UI confirmed it rather than exposing it. Both
+  now sort ascending, and the README states the convention.
+
+- **`dispatch_policy_adaptive_concurrency_stats` is garbage-collected.**
+  `adaptive_seed!` runs on every evaluate of every partition and nothing
+  in the gem ever deleted from that table, so its row count was "every
+  partition key this policy has ever seen" — unbounded for the
+  per-tenant/per-user/per-endpoint `partition_by` the README recommends,
+  with no knob, no dashboard surface and no rake task. `TickLoop.sweep!`
+  now collects stats whose partition is already gone, reusing
+  `partition_inactive_after`: the partition row is the gem's authority on
+  liveness and its own sweeper already respects a throttle's refill
+  window, so no new retention setting is needed. Re-seeding a partition
+  that comes back costs one `ON CONFLICT DO NOTHING` insert at
+  `initial_max`.
+
+- **A job class that defers its own enqueue no longer breaks admission.**
+  ActiveJob 7.2+ lets a class set `self.enqueue_after_transaction_commit
+  = true` — the setting Rails recommends for apps that enqueue inside
+  ActiveRecord transactions. `Forwarder.dispatch` runs INSIDE the
+  admission transaction, so that deferral registered the real enqueue on
+  the gem's own transaction and it landed after COMMIT, outside the
+  `Bypass` window: the scheduled path re-staged the job it had just
+  admitted, on every tick forever, leaking one inflight row each time
+  (so a `:concurrency` gate wedged at `max` within `max` ticks), and the
+  immediate path saw `successfully_enqueued? == false`, raised, and
+  rolled the whole admission back on every tick forever. The job never
+  reached the adapter either way and nothing said so. The enqueue now
+  runs inside a non-joinable savepoint when a job in the batch defers,
+  which is what makes `ActiveRecord.after_all_transactions_commit` run
+  its block inline — the work happens inside the admission TX and inside
+  Bypass, as the contract requires. Deployments with no such job class
+  are unaffected. `transaction` swallows `ActiveRecord::Rollback` by
+  design, so the savepoint re-raises: absorbing one would let the
+  admission commit with the staged rows deleted and nothing in the
+  adapter, where the non-deferring path aborts.
+
+- **The periodic sweeper actually runs.** `TickLoop.run` counted
+  iterations in a local, but the generated `DispatchTickLoopJob` calls
+  `run` for one bounded window (`tick_max_duration`) and re-enqueues
+  itself — so the counter restarted every window. With the shipped
+  defaults a window holds at most `tick_max_duration / idle_pause` =
+  25 / 0.5 = 50 iterations, exactly `sweep_every_ticks`, so any
+  per-iteration cost at all left it at 49 and `iteration %
+  sweep_every_ticks` never hit zero. Nothing was ever swept: stale
+  inflight rows wedged a `:concurrency` partition permanently (the gate
+  counts rows nothing reaps, admitting 0 means `idle_pause`, and
+  `idle_pause` is what keeps the window under 50 — the wedge feeds
+  itself), and `dispatch_policy_tick_samples` grew without bound. The
+  repo's own dummy log shows the symptom: 53,835 `claim_partitions`
+  against 215 `sweep_stale_inflight`, a 1:250 ratio where the nominal
+  cadence is 1:50. The counter now lives on the module and survives
+  re-entry.
+
+- **The heartbeat thread no longer leaks a database connection per
+  running job.** `InflightTracker`'s heartbeat wrapped its UPDATE in
+  `connection_pool.with_connection`, believing that borrowed and returned
+  a connection per beat. It does not: the thread is a bare `Thread.new`
+  running outside the Rails executor, so nothing has established a lease
+  for it and the pool treats the lease as PERMANENT — `with_connection`
+  marks it sticky and its ensure then skips `release_connection`, on the
+  assumption that whoever established the lease will release it. Nothing
+  did. The first beat pinned a connection to the heartbeat thread for the
+  rest of the job, and when the thread died the connection was not
+  returned either: it sat checked out with a dead owner until the pool
+  reaper got to it.
+
+  With the Rails default sizing — pool size and worker threads both from
+  `RAILS_MAX_THREADS` — every tracked job that outlives one
+  `inflight_heartbeat_interval` doubles its connection demand, so a full
+  worker raises `ActiveRecord::ConnectionTimeoutError` on the jobs
+  themselves. The beats that lose the race fail too, which stalls
+  `heartbeat_at` on rows whose jobs are still running, and the stale
+  sweep then reclaims them after `inflight_stale_after` — leaving the
+  concurrency gate under-counting and over-admitting. Verified against
+  Rails 8.1: after `with_connection` returned inside a thread the pool
+  still reported the connection busy, and it went to `dead` rather than
+  `idle` when the thread exited. The beat now releases explicitly — and
+  from inside `Repository.with_connection`, since `connected_to` is
+  block-scoped and releasing after it returns aims at the writing pool
+  while the lease belongs to the role's.
+
+- **The throttle's token bucket is charged atomically** (throttle
+  review). It was written back as a literal jsonb patch computed in Ruby
+  from an earlier read — a read-modify-write across two statements. Two
+  tick loops covering the same `(policy, shard)` each evaluated a full
+  bucket, each admitted it, and the second write overwrote the first, so
+  one admission went uncharged and the effective rate became
+  `rate × loops` **indefinitely**. Reproduced against Postgres: 20 jobs
+  admitted against `rate: 10, per: 60`, bucket left at `0.0` instead of
+  `-10`. The bucket is now recomputed inside the admission UPDATE from
+  the row's own value, so concurrent charges compose and the overdraft is
+  repaid out of the next window — the long-run rate holds. Note this
+  makes the *charge* atomic, not the admission *decision*: a transient
+  burst is still possible, so one tick loop per `(policy, shard)` remains
+  the recommendation. `evaluate` also stops persisting its refill, which
+  is recomputable and, on the deny path, could overwrite a concurrent
+  admission's charge.
+
+  The bucket stays on ONE clock while doing so: the charge reads the
+  token count from the row but takes its timestamps from
+  `DispatchPolicy.config.now`, bound as parameters. Settling against
+  Postgres `now()` would put the two ends of one subtraction on two
+  clocks — `evaluate` refills from `config.now`, so any offset between
+  app and database is credited as free tokens on every evaluate — and
+  `now()` is the transaction timestamp, which stops advancing inside an
+  enclosing transaction. The stamp is written as `GREATEST(now, stored)`
+  so that two transactions committing out of order cannot rewind it and
+  refill the same interval twice.
+
+- **A job due now no longer waits behind a future-scheduled one.** M10
+  parked a partition holding only future work by writing
+  `next_eligible_at`, the same column gates use for their backoff.
+  Nothing on the enqueue path could then clear it — clearing it there
+  would clobber a gate's backoff and bring back the busy-loop that
+  backoff exists to prevent — so a `perform_later` landing behind a
+  `set(wait: 1.hour)` sat in `dispatch_policy_staged_jobs` for the full
+  hour, unclaimed, with no gate having denied it and nothing in the
+  logs. With `wait: 1.week` it waited a week. Reproduced:
+  `partitions_seen = 0` on five consecutive ticks with two staged rows,
+  one of them due. The horizon now lives in its own column,
+  `scheduled_eligible_at`, and `claim_partitions` requires both. A job
+  due now clears it; a future job cannot install one over a partition
+  that already has due work. Both enqueue paths maintain it — the bulk
+  one (`perform_all_later` → `stage_many!`) upserts once per partition
+  for a whole batch, and one job in that batch being due settles it for
+  the group. The park itself asks "is anything due?" in the same
+  statement and snapshot as the write, so a job that becomes due between
+  the claim and the park — an enqueue committing while the tick waits on
+  the partition row lock — cannot be hidden behind a horizon the park
+  never saw it beside.
+
+  Side effect worth knowing: the horizon is set by the enqueue itself,
+  so a partition holding only future work is no longer claimed even
+  once. Ticks that used to spend a claim slot discovering there was
+  nothing to do now skip it entirely.
+
+- **The partition sweeper holds a throttled partition until its bucket
+  has refilled, instead of for a whole window.** Retaining the row for
+  `per` was an approximation of "the bucket is back at capacity", and it
+  was wrong in both directions. Too long: a `per: 7.days` policy kept
+  every partition for a week, when a bucket that spent one of two tokens
+  is full again in 3.5 days. Too short: a bucket left in debt by
+  concurrent loops needs more than one window to climb back, and a
+  sub-unit rate (`rate: 0.5, per: 7.days` — capacity is floored at one
+  token while the refill runs at the true rate) needs two — collecting
+  either hands the tenant a fresh quota, which is the reset the window
+  rule existed to prevent. The sweeper now refills the stored bucket to
+  now with the same expression the admission UPDATE uses and collects
+  only what has genuinely reached capacity. Applies when both throttle
+  knobs are fixed numbers; a proc `rate` or `per` still falls back to
+  the window cutoff.
+
+- **A forced admission charges the throttle.** `ManualAdmission.force!`
+  — the dashboard's admit/drain buttons — bypasses every gate by design,
+  but it was also escaping the token bucket's cost: a drain of N jobs
+  went out with the bucket untouched, so the tenant received N plus a
+  whole fresh window and the rate the policy declares stopped being true.
+  The bucket now goes into debt by exactly what was forwarded, and the
+  next window repays it — the same overdraft two racing tick loops
+  produce. Operators should expect a large drain to leave the partition
+  quiet for a while; that is the rate contract catching up, not a stall.
+  Only a fixed `rate`/`per` can be charged from that path (a proc needs
+  the partition's context, which the web process never loads there); a
+  dynamic throttle is left alone and logs a warning.
+
+- **The catch-all sweep no longer resets the token bucket of a policy
+  this process merely hasn't loaded.** `TickLoop.sweep!` collects
+  partitions whose policy is absent from `DispatchPolicy.registry`,
+  reading that as "deleted from the code". The registry is populated as
+  a side effect of job classes loading, so it is also every policy a
+  dashboard-only process, a lazily-loaded worker or a half-rolled deploy
+  has not touched — the same trap ISSUES.md R3 records for
+  `ManualAdmission`. Reproduced with `rate: 2, per: 7.days`: the row a
+  worker that knows the policy correctly keeps is deleted by one that
+  does not, and the tenant gets two more admits inside the same week. A
+  row that still carries a token bucket now waits out the new
+  `config.unknown_policy_retention` (30 days by default, long enough to
+  cover any plausible window) instead of `partition_inactive_after`;
+  a row with nothing to lose is still collected on the usual cutoff, so
+  a genuinely deleted policy is still garbage-collected.
 
 - **Inflight rows are no longer created without a way to release them**
   (audit 2026-08-13, H3). Admission pre-inserted a row in

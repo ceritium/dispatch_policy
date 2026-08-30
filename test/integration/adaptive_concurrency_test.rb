@@ -173,4 +173,38 @@ class AdaptiveConcurrencyIntegrationTest < DispatchPolicy::IntegrationTest
     assert_equal 9, row.current_max,
                  "the CASE branch must use the post-update ewma to decide; FLOOR(10*0.95)=9"
   end
+  # Every other table in the gem is bounded; this one was not.
+  # `adaptive_seed!` runs on every evaluate of every partition and nothing
+  # ever deleted from it, so with a high-cardinality partition_by the row
+  # count was "every key this policy has ever seen". The row can only go
+  # once the partition it describes has gone — the partition row is the
+  # gem's authority on liveness, and its own sweeper already knows about a
+  # throttle's refill window.
+  def test_orphan_stats_are_collected_once_their_partition_is_gone
+    seed!
+    DispatchPolicy::Repository.adaptive_seed!(
+      policy_name: POLICY, partition_key: "still-live", initial_max: 4
+    )
+    DispatchPolicy::Repository.upsert_partition!(
+      policy_name: POLICY, partition_key: "still-live", queue_name: nil,
+      context: {}, delta_pending: 1
+    )
+    ActiveRecord::Base.connection.execute(
+      "UPDATE dispatch_policy_adaptive_concurrency_stats SET updated_at = now() - interval '48 hours'"
+    )
+
+    DispatchPolicy::Repository.sweep_orphan_adaptive_stats!(cutoff_seconds: 24 * 3600)
+
+    keys = DispatchPolicy::AdaptiveConcurrencyStats.pluck(:partition_key)
+    assert_equal ["still-live"], keys,
+                 "the orphan goes; the one whose partition is still there stays"
+  end
+
+  def test_a_recent_orphan_is_left_alone
+    seed!
+    DispatchPolicy::Repository.sweep_orphan_adaptive_stats!(cutoff_seconds: 24 * 3600)
+
+    assert_equal 1, DispatchPolicy::AdaptiveConcurrencyStats.count,
+                 "a partition can be between ticks; the cutoff is what makes this safe"
+  end
 end

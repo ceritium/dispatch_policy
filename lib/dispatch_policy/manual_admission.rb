@@ -60,7 +60,15 @@ module DispatchPolicy
             # the half-life the decay clause is skipped entirely and a
             # partition drained from the UI still looks under-admitted to
             # the next tick's reorder, which then favours it again.
-            half_life_seconds: fairness_half_life(policy)
+            half_life_seconds: fairness_half_life(policy),
+            # …and so does the throttle. Bypassing the gate's DECISION is
+            # the point of this button; escaping its COST is not. Left
+            # uncharged, a drain of N jobs hands the tenant N free plus a
+            # whole untouched window, and the rate the policy declares
+            # stops being true. Charged, the bucket goes into debt by
+            # exactly what was forwarded and the next window repays it —
+            # the same overdraft two racing tick loops produce.
+            throttle_charge: throttle_charge_for(policy, policy_name, partition_key)
           )
           next if rows.empty?
 
@@ -91,6 +99,34 @@ module DispatchPolicy
     # which is then correct rather than an oversight.
     def fairness_half_life(policy)
       policy&.fairness_half_life_seconds || DispatchPolicy.config.fairness_half_life_seconds
+    end
+
+    # What the admission UPDATE needs to settle the bucket from the row's
+    # own value. Only the capacity and the refill rate are needed — the
+    # token count comes from the row — so a fixed `rate` and `per` are
+    # enough and no context has to be reconstructed here.
+    #
+    # A proc rate or window cannot be resolved without one, and the ctx
+    # gates read lives on the partition row, which this path never loads;
+    # rather than charge against a guess, say so and leave the bucket
+    # alone. Same for a policy this process's registry does not know —
+    # see the warning at the top of force!.
+    def throttle_charge_for(policy, policy_name, partition_key)
+      return nil unless policy
+
+      capacity    = policy.static_throttle_capacity
+      refill_rate = policy.static_throttle_refill_rate
+      if capacity.nil? || refill_rate.nil?
+        if policy.gates.any? { |g| g.name == :throttle }
+          DispatchPolicy.config.logger&.warn(
+            "[dispatch_policy] force-admitting #{policy_name}/#{partition_key} without charging " \
+            "its throttle: rate or per is a proc, and this path has no context to resolve it"
+          )
+        end
+        return nil
+      end
+
+      { capacity: capacity, refill_rate: refill_rate, now: DispatchPolicy.config.now.to_f }
     end
   end
 end

@@ -204,6 +204,16 @@ module DispatchPolicy
     # concurrency slot the whole time. Wired to the `discard.active_job`
     # notification by the railtie. Idempotent: a no-op when no row exists
     # (e.g. discard fired after track already deleted it).
+    # What the railtie's perform.active_job subscription does. A method
+    # rather than a block in the initializer so the rule — reap only when
+    # the perform actually failed — is reachable from a test; inverting it
+    # inside an initializer block is invisible to the suite.
+    def self.handle_failed_perform(event)
+      return unless event.payload[:exception]
+
+      handle_discard(event.payload[:job])
+    end
+
     def self.handle_discard(job)
       return unless job
       return unless job.class.respond_to?(:dispatch_policy_name) && job.class.dispatch_policy_name
@@ -291,25 +301,52 @@ module DispatchPolicy
           end
           break if stop_flag.true?
 
-          begin
-            # Establish config.database_role inside this thread BEFORE the
-            # checkout: under multi-DB, connection_pool must resolve to the
-            # role's pool (where the inflight row lives), not the default
-            # writing pool. with_connection swaps the role thread-locally;
-            # the nested pool checkout then borrows/returns a dedicated
-            # connection from that pool per beat.
-            Repository.with_connection do
-              ActiveRecord::Base.connection_pool.with_connection do
-                Repository.heartbeat_inflight!(active_job_id: active_job_id)
-              end
-            end
-          rescue StandardError => e
-            DispatchPolicy.config.logger&.warn("[dispatch_policy] heartbeat #{active_job_id} failed: #{e.class}: #{e.message}")
-          end
+          beat!(active_job_id)
         end
       end
 
       Heartbeat.new(thread, stop_flag)
+    end
+
+    # One beat, connection returned. Split out of the loop so a test can
+    # drive it directly, and because the release below is the whole point.
+    #
+    # `Repository.with_connection` establishes config.database_role inside
+    # this thread BEFORE the checkout: under multi-DB the pool must
+    # resolve to the role's (where the inflight row lives), not the
+    # default writing pool.
+    #
+    # The explicit release is NOT redundant with a nested
+    # `connection_pool.with_connection`. A bare Thread.new runs outside
+    # the Rails executor, so nothing has established a lease for it and
+    # the pool treats its lease as PERMANENT: `with_connection` marks it
+    # sticky and its ensure then skips `release_connection` precisely
+    # because it assumes something outside owns it. Nothing does. The
+    # first beat therefore pins a connection to the heartbeat thread for
+    # the rest of the job, and when the thread dies the connection is not
+    # returned either — it sits checked out with a dead owner until the
+    # pool reaper gets to it. With a pool sized to the worker's thread
+    # count (the Rails default: both come from RAILS_MAX_THREADS), every
+    # tracked job that outlives one interval doubles its connection
+    # demand, and the workers start raising ConnectionTimeoutError.
+    def self.beat!(active_job_id)
+      Repository.with_connection do
+        Repository.heartbeat_inflight!(active_job_id: active_job_id)
+      end
+    rescue StandardError => e
+      DispatchPolicy.config.logger&.warn("[dispatch_policy] heartbeat #{active_job_id} failed: #{e.class}: #{e.message}")
+    ensure
+      begin
+        # Through with_connection, not bare: `connected_to` is block-scoped,
+        # so by the time this ensure runs `current_role` is back to
+        # :writing and `ActiveRecord::Base.connection_pool` resolves to the
+        # WRITING pool — while the lease to hand back belongs to the role's
+        # pool, where the inflight row lives. Releasing the wrong pool is
+        # the same leak with an extra step.
+        Repository.with_connection { ActiveRecord::Base.connection_pool.release_connection }
+      rescue StandardError
+        # A pool that has gone away takes its connections with it.
+      end
     end
 
     def self.stop_heartbeat(heartbeat)

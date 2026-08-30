@@ -29,7 +29,7 @@ class ThrottleGateTest < Minitest::Test
     assert_equal 10, decision.allowed
     # evaluate records the post-refill bucket WITHOUT deducting; the
     # deduction happens in #consume once the real admitted count is known.
-    assert_in_delta 10.0, decision.gate_state_patch.dig("throttle", "tokens"), 0.001
+    assert_in_delta 10.0, decision.charge[:tokens], 0.001
   end
 
   def test_admit_budget_caps_allowed
@@ -39,7 +39,7 @@ class ThrottleGateTest < Minitest::Test
     assert_equal 3, decision.allowed
     # Still the full refilled bucket — admit_budget caps `allowed`, not the
     # recorded token count.
-    assert_in_delta 10.0, decision.gate_state_patch.dig("throttle", "tokens"), 0.001
+    assert_in_delta 10.0, decision.charge[:tokens], 0.001
   end
 
   def test_consume_deducts_exactly_the_admitted_count
@@ -51,7 +51,7 @@ class ThrottleGateTest < Minitest::Test
     # the bucket is charged 4, not 10.
     patch = gate.consume(decision, 4)
     assert_in_delta 6.0, patch.dig("throttle", "tokens"), 0.001
-    assert_equal decision.gate_state_patch.dig("throttle", "refilled_at"),
+    assert_equal decision.charge[:now],
                  patch.dig("throttle", "refilled_at")
   end
 
@@ -157,7 +157,7 @@ class ThrottleGateTest < Minitest::Test
     gate = DispatchPolicy::Gates::Throttle.new(rate: 2.5, per: 1)
     decision = gate.evaluate(DispatchPolicy::Context.wrap({}), empty_partition, 100)
     assert_equal 2, decision.allowed, "2.5 tokens floor to 2 whole admits"
-    assert_in_delta 2.5, decision.gate_state_patch.dig("throttle", "tokens"), 0.001,
+    assert_in_delta 2.5, decision.charge[:tokens], 0.001,
                     "the 0.5 fractional token must be preserved (Float, not Integer)"
   end
 

@@ -14,10 +14,23 @@ module DispatchPolicy
     def run(policy_name: nil, shard: nil, stop_when: -> { false })
       config       = DispatchPolicy.config
       logger       = config.logger
-      iteration    = 0
+
+      # A `stop_when` that raises must not take down the only thing that
+      # drains the staging table. It is host-supplied (the generated tick
+      # job asks the adapter whether it is shutting down), it is called
+      # OUTSIDE the rescue that guards Tick.run, and an exception here
+      # escapes `perform` — so the self-re-enqueue chain dies, admission
+      # stops for good, and `perform_later` keeps staging into a table
+      # nothing empties. Degrade to "not stopping" and say so.
+      stop = lambda do
+        stop_when.call
+      rescue StandardError => e
+        logger&.error("[dispatch_policy] stop_when raised #{e.class}: #{e.message}; treating as not stopping")
+        false
+      end
 
       loop do
-        break if stop_when.call
+        break if stop.call
 
         # NOTE: `config.enabled` is deliberately not consulted here. It
         # governs the ENQUEUE side — whether new perform_later calls are
@@ -39,7 +52,7 @@ module DispatchPolicy
 
         admitted = 0
         names.each do |name|
-          break if stop_when.call
+          break if stop.call
 
           begin
             result = Tick.run(policy_name: name, shard: shard)
@@ -49,11 +62,32 @@ module DispatchPolicy
           end
         end
 
-        iteration += 1
-        # sweep_every_ticks <= 0 means "never sweep" (rather than crashing
-        # the loop with ZeroDivisionError on `iteration % 0`).
+        # sweep_every_ticks <= 0 means "never sweep".
+        #
+        # The counter lives on the module, NOT in a local. The generated
+        # DispatchTickLoopJob calls `run` for a bounded window
+        # (tick_max_duration) and then re-enqueues itself, so a local
+        # restarts from zero every window — and with the shipped defaults
+        # a window holds at most tick_max_duration / idle_pause = 25 / 0.5
+        # = 50 iterations, exactly `sweep_every_ticks`. Any per-iteration
+        # cost at all leaves the count at 49 and the sweep never fires, in
+        # any window, ever: stale inflight rows then wedge a concurrency
+        # partition permanently (the gate counts rows nothing reaps, the
+        # partition admits 0, admitting 0 means idle_pause, which caps the
+        # window below 50 — self-reinforcing), and tick_samples grow
+        # without bound. Counting across invocations makes the cadence
+        # mean what it says.
+        #
+        # Several loops in one process share the counter, so a deployment
+        # with N of them sweeps N times as often. That is harmless — the
+        # sweeps are idempotent DELETEs on indexed columns — and much
+        # cheaper than the alternative of not sweeping at all.
         sweep_every = config.sweep_every_ticks.to_i
-        sweep! if sweep_every.positive? && (iteration % sweep_every).zero?
+        @ticks_since_sweep = @ticks_since_sweep.to_i + 1
+        if sweep_every.positive? && @ticks_since_sweep >= sweep_every
+          @ticks_since_sweep = 0
+          sweep!
+        end
 
         if admitted.zero?
           pause(config.idle_pause)
@@ -61,6 +95,12 @@ module DispatchPolicy
           pause(config.busy_pause)
         end
       end
+    end
+
+    # Testing seam: the sweep cadence is process state by design (see
+    # `run`), so a test that wants a known starting point has to say so.
+    def reset_sweep_cadence!
+      @ticks_since_sweep = 0
     end
 
     # sleep, but never with a negative argument (which would raise
@@ -86,6 +126,9 @@ module DispatchPolicy
       )
       sweep_inactive_partitions!(cfg)
       Repository.sweep_old_tick_samples!(cutoff_seconds: cfg.metrics_retention)
+      # Only reachable once the partition itself has been collected, so it
+      # inherits partition_inactive_after rather than needing a knob.
+      Repository.sweep_orphan_adaptive_stats!(cutoff_seconds: cfg.partition_inactive_after)
     rescue StandardError => e
       DispatchPolicy.config.logger&.error("[dispatch_policy] sweep error: #{e.class}: #{e.message}")
     end
@@ -110,19 +153,50 @@ module DispatchPolicy
         window = policy.static_throttle_window
         warn_unbounded_sweep(policy) if window.nil? && throttled?(policy)
 
-        Repository.sweep_inactive_partitions!(
-          cutoff_seconds: window ? [default_cutoff, window.ceil].max : default_cutoff,
-          policy_name:    policy.name
-        )
+        # When both knobs are fixed we can ask the exact question — has
+        # this bucket refilled to capacity? — instead of approximating it
+        # with "one window has passed". The approximation is wrong in
+        # both directions: it holds a `per: 7.days` partition for a week
+        # after its bucket refilled hours ago, and it collects one whose
+        # bucket has NOT refilled (a debt left by concurrent loops needs
+        # more than a window; a sub-unit rate needs capacity/rate of
+        # them), which hands that tenant a fresh quota — the M11 reset.
+        capacity    = policy.static_throttle_capacity
+        refill_rate = policy.static_throttle_refill_rate
+        if capacity && refill_rate
+          Repository.sweep_inactive_partitions!(
+            cutoff_seconds:  default_cutoff,
+            policy_name:     policy.name,
+            refilled_bucket: { capacity:    capacity,
+                               refill_rate: refill_rate,
+                               now:         DispatchPolicy.config.now.to_f }
+          )
+        else
+          # A proc rate or a proc window: nothing here can say what the
+          # bucket holds, so fall back to outliving the window.
+          Repository.sweep_inactive_partitions!(
+            cutoff_seconds: window ? [default_cutoff, window.ceil].max : default_cutoff,
+            policy_name:    policy.name
+          )
+        end
       end
 
-      # Partitions whose policy this process doesn't know — most often one
-      # that was deleted from the code. Nothing can tell us its window, so
-      # the default cutoff applies; without this pass those rows would
-      # never be collected at all.
+      # Partitions whose policy this process doesn't know. Usually one
+      # that was deleted from the code — but the registry is filled as a
+      # side effect of job classes loading, so it is also every policy a
+      # lazily-loaded process, a dashboard-only process or a half-rolled
+      # deploy has not touched yet (ISSUES.md R3 records the same trap in
+      # ManualAdmission). Without this pass a genuinely deleted policy's
+      # rows would never be collected; with it on the normal cutoff, a
+      # policy that is merely unloaded here has its token bucket deleted
+      # and its tenants handed a fresh quota. So a row that still carries
+      # a bucket waits out `unknown_policy_retention` instead — long
+      # enough to cover any plausible window — while one with nothing to
+      # lose goes on the usual cutoff.
       Repository.sweep_inactive_partitions!(
-        cutoff_seconds:  default_cutoff,
-        except_policies: registered
+        cutoff_seconds:           default_cutoff,
+        except_policies:          registered,
+        throttled_cutoff_seconds: cfg.unknown_policy_retention
       )
     end
 

@@ -148,6 +148,12 @@ ActiveJob#perform_later
     → DELETE inflight_jobs
 ```
 
+Within a partition, staged jobs are admitted in ActiveJob priority
+order, then by scheduled time, then by arrival. **A smaller `priority`
+number is more urgent** — the same convention good_job and solid_queue
+use, so `MyJob.set(priority: -10).perform_later` is admitted ahead of a
+default `priority: 0` job and well ahead of `priority: 10` bulk work.
+
 ## Declaring a policy
 
 ```ruby
@@ -226,6 +232,34 @@ Refills `rate` tokens every `per` seconds, capped at `rate` (no
 separate burst). Admits jobs while tokens are available; leaves the
 rest pending for the next tick. State is persisted in
 `partitions.gate_state.throttle`.
+
+A brand-new partition starts on a full bucket, so a tenant's first
+`rate` jobs go out at once — standard token-bucket behaviour, and the
+reason the partition sweeper will not collect a partition whose bucket
+is still below capacity (that would hand the tenant a fresh quota).
+
+The bucket is charged inside the admission transaction, computed from
+the row's own value, so concurrent ticks cannot lose each other's
+charge: the bucket goes negative and the overdraft comes out of the next
+window. The admission *decision* is not serialised, though — `evaluate`
+reads before the transaction opens — so two tick loops on the same
+`(policy, shard)` can still produce a simultaneous burst before that
+correction kicks in. Run one loop per shard and shard the policy to
+parallelise. The generated `DispatchTickLoopJob` sets a good_job /
+solid_queue concurrency key per `(policy, shard)` argument tuple, which
+stops a duplicate of the *same* invocation — it does not stop a
+catch-all `perform_later` from overlapping a `perform_later("events")`,
+since those are different keys.
+
+One sizing note: the tick cadence is the granularity of the rate limit.
+A partition becomes eligible again `retry_after` seconds after it empties
+its bucket, but nothing admits until the next tick comes round, so the
+achievable rate is capped by how often the loop runs. It only bites when
+the refill period is close to the tick interval — `rate: 1, per: 2` with
+a tick every ~1.1s delivers one job per 2.2s, about 7% under the
+configured rate — and is invisible when a whole window's worth of tokens
+is released at once (`rate: 100, per: 60`). Lower `idle_pause` if you
+need a low rate to be precise.
 
 ```ruby
 gate :throttle,
@@ -451,9 +485,12 @@ The gem's automatic context enrichment puts `:queue_name` into the
 ctx hash so `shard_by` can use it directly without your `context`
 proc having to know about it.
 
-**`shard_by` must be ≥ as coarse as the most restrictive throttle's
-scope.** If not, the bucket duplicates across shards and the
-effective rate becomes `rate × N_shards`.
+**One tick loop per `(policy, shard)`.** The bucket cannot duplicate
+across shards — `(policy_name, partition_key)` is unique and the shard
+is pinned on first write, so a partition is exactly one row — but two
+loops covering the same shard both read the bucket before either
+charges it, which costs a burst of up to `rate × N_loops` before the
+overdraft corrects it. See the throttle section above.
 
 ## Atomic admission
 
@@ -582,6 +619,9 @@ DispatchPolicy.configure do |c|
   c.admission_batch_size      = 100      # max jobs admitted per partition per iteration
   c.idle_pause                = 0.5      # seconds slept when a tick admits nothing
   c.partition_inactive_after  = 86_400   # GC partitions idle this long
+  c.unknown_policy_retention  = 2_592_000 # ...unless this process doesn't
+                                          # know the policy and the row
+                                          # still holds a token bucket
   c.inflight_stale_after      = 300      # GC inflight rows whose worker stopped heartbeating
   c.inflight_queued_stale_after = 3_600  # GC inflight rows admitted but never started (queued)
   c.inflight_heartbeat_interval = 30     # how often the worker bumps heartbeat_at; 0 disables the thread
@@ -668,7 +708,7 @@ end
 ## Testing
 
 ```bash
-bundle exec rake test         # 124 runs / 284 assertions
+bundle exec rake test         # 262 runs / 621 assertions
 bundle exec rake bench        # manual benchmark suite (creates dispatch_policy_bench DB)
 bundle exec rake bench:real   # end-to-end against good_job on the dummy DB
 bundle exec rake bench:limits # stretches every path to its breaking point

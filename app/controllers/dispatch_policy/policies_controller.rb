@@ -115,7 +115,8 @@ module DispatchPolicy
     # bypassing all gates. Walks partitions in pending-DESC order so the
     # busiest ones drain first. Bounded at DRAIN_MAX_PER_REQUEST per click.
     def drain
-      drained = 0
+      drained  = 0
+      failures = 0
       Partition.for_policy(@policy_name)
                .where("pending_count > 0")
                .order(pending_count: :desc, id: :asc)
@@ -126,12 +127,16 @@ module DispatchPolicy
         # Pass the REMAINING budget so a single partition can't push the
         # total past the cap (a fixed per-partition cap could overshoot by
         # nearly 2× when the first partition nearly fills it).
-        batch, = PartitionsController.drain_partition!(partition, cap: DRAIN_MAX_PER_REQUEST - drained)
-        drained += batch
+        batch, _due, _scheduled, failed =
+          PartitionsController.drain_partition!(partition, cap: DRAIN_MAX_PER_REQUEST - drained)
+        drained  += batch
+        failures += 1 if failed
       end
 
       remaining = Partition.for_policy(@policy_name).sum(:pending_count)
-      notice = if remaining.positive?
+      notice = if failures.positive?
+        "Drained #{drained} job(s); #{failures} partition(s) could not be forwarded — see logs."
+      elsif remaining.positive?
         "Drained #{drained} job(s) across this policy; #{remaining} still pending — click drain again to continue."
       else
         "Drained #{drained} job(s); policy fully drained."

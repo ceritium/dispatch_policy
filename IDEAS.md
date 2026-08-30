@@ -36,6 +36,34 @@ and can surprise people (losing live gate_state for partitions that
 are momentarily empty). Better thought of as: per-policy config +
 explicit UI.
 
+## A forward-skewed refill stamp written by the web process
+
+**Symptom.** `ManualAdmission.force!` binds `DispatchPolicy.config.now`
+from the WEB process into the throttle charge, while the charge writes
+the stamp as `GREATEST($now, stored)` and `evaluate` credits
+`[now - refilled_at, 0].max`. If the dashboard host's clock runs ahead
+of the tick worker's, a forced admission stamps the bucket into the
+future and nothing can move it back, so that partition's refill is
+frozen for the length of the offset. Master self-healed because
+`evaluate` re-stamped on every pass; this branch deliberately stopped
+persisting from `evaluate` (that write is what let a deny undo an
+admission's charge), so the self-healing went with it.
+
+**Why deferred.** Two remedies were proposed during review and neither
+survived measurement. Clamping the stamp with
+`LEAST(..., now + capacity/rate)` is inert on the very path the problem
+is about: the SQL clamp only runs on an admitting charge, which a
+drained partition never reaches. Passing `now: nil` from the manual
+path and adding a deduct-only SQL branch probably works, but it was
+never tested, and it reopens the question the `GREATEST` stamp exists to
+answer — two admission transactions committing out of order must not
+rewind the stamp and refill that interval twice. Settling it means
+re-running the two-connection ordering probe against the deduct-only
+branch.
+
+**Cost of leaving it.** Needs a genuinely mis-set clock between two
+hosts, loses no job, and self-heals once real time passes the stamp.
+
 ## Revisit the sweeper and heartbeat interval
 
 **Symptom.** Three coupled numbers without strong justification in

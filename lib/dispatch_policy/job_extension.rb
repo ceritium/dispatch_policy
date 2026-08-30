@@ -72,7 +72,20 @@ module DispatchPolicy
       # and re-enqueues it without going through perform_now (e.g. a
       # custom retry path), `job.arguments` would be []. Guard against
       # that here so the context proc always sees the real args.
-      ensure_arguments_materialized!(job)
+      #
+      # A job whose arguments cannot be rebuilt (the GlobalID record was
+      # deleted) must not raise out of the enqueue callback: ActiveJob's
+      # own enqueue copes fine — `serialize` reuses @serialized_arguments
+      # — so raising here would destroy the retry that `retry_on
+      # ActiveJob::DeserializationError` had just scheduled, turning a
+      # recoverable job into a hard failure the gem caused. Hand it to the
+      # adapter instead; it fails again at perform, which is exactly what
+      # would have happened without the gem.
+      begin
+        ensure_arguments_materialized!(job)
+      rescue ActiveJob::DeserializationError
+        return block.call
+      end
 
       queue_name    = job.queue_name&.to_s || policy.queue_name
       ctx           = policy.build_context(job.arguments, queue_name: queue_name)
@@ -166,6 +179,24 @@ module DispatchPolicy
         # loses jobs the caller expected to be enqueued.
         to_stage, to_adapter = flat.partition { |job| JobExtension.stageable?(job) }
 
+        # Materialize before the rows are built, and route a job whose
+        # arguments cannot be rebuilt to the adapter instead of letting it
+        # abort the map. Same reasoning as the single path: ActiveJob's own
+        # enqueue copes (serialize reuses @serialized_arguments), so
+        # raising here would turn a job Rails would have retried into a
+        # hard failure — and here it would take every other stageable job
+        # in the batch with it, after `super(to_adapter)` has already put
+        # the non-policy half into the adapter.
+        unrebuildable, to_stage = to_stage.partition do |job|
+          begin
+            JobExtension.ensure_arguments_materialized!(job)
+            false
+          rescue ActiveJob::DeserializationError
+            true
+          end
+        end
+        to_adapter.concat(unrebuildable)
+
         super(to_adapter) if to_adapter.any?
 
         return nil if to_stage.empty?
@@ -173,10 +204,9 @@ module DispatchPolicy
         rows = to_stage.map do |job|
           policy = DispatchPolicy.registry.fetch(job.class.dispatch_policy_name)
 
-          # See JobExtension.ensure_arguments_materialized! — we need this
-          # for the same reason as the single-enqueue path.
-          JobExtension.ensure_arguments_materialized!(job)
-
+          # Arguments were materialized above, before the split, so the
+          # context proc sees the real args and a job that cannot provide
+          # them is already out of this list.
           queue_name    = job.queue_name&.to_s || policy.queue_name
           ctx           = policy.build_context(job.arguments, queue_name: queue_name)
           partition_key = policy.partition_key_for(ctx)

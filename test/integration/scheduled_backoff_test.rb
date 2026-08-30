@@ -14,6 +14,13 @@ require_relative "../../app/models/dispatch_policy/tick_sample"
 # left next_eligible_at NULL, and did it all again a moment later —
 # burning a partition_batch_size slot and a transaction each time, and
 # filling the denial breakdown with no_rows_claimed.
+#
+# The horizon lives in `scheduled_eligible_at`, NOT in `next_eligible_at`.
+# The two answer different questions — "is there anything to do yet?"
+# versus "did a gate tell us to wait?" — and sharing one column meant a
+# job enqueued for right now could not clear the wait without also
+# clobbering a gate's backoff, so it sat unadmitted until the far-future
+# horizon arrived.
 class ScheduledBackoffTest < DispatchPolicy::IntegrationTest
   class ScheduledJob < ActiveJob::Base
     include DispatchPolicy::JobExtension
@@ -43,10 +50,12 @@ class ScheduledBackoffTest < DispatchPolicy::IntegrationTest
     DispatchPolicy::Tick.run(policy_name: "scheduled_backoff")
 
     due_at = DispatchPolicy::StagedJob.first.scheduled_at
-    refute_nil partition.next_eligible_at,
-               "a NULL next_eligible_at makes the partition eligible again immediately"
-    assert_in_delta due_at.to_f, partition.next_eligible_at.to_f, 1.0,
+    refute_nil partition.scheduled_eligible_at,
+               "a NULL horizon makes the partition eligible again immediately"
+    assert_in_delta due_at.to_f, partition.scheduled_eligible_at.to_f, 1.0,
                     "it should wake exactly when the job becomes due"
+    assert_nil partition.next_eligible_at,
+               "no gate has asked for a backoff; that column is not ours to write"
   end
 
   def test_the_parked_partition_is_not_reclaimed_on_the_next_tick
@@ -55,8 +64,9 @@ class ScheduledBackoffTest < DispatchPolicy::IntegrationTest
     3.times { DispatchPolicy::Tick.run(policy_name: "scheduled_backoff") }
 
     seen = DispatchPolicy::TickSample.order(:id).pluck(:partitions_seen)
-    assert_equal [1, 0, 0], seen,
-                 "only the first tick should see it; after that it is parked"
+    assert_equal [0, 0, 0], seen,
+                 "the horizon is set by the enqueue itself, so not even the first " \
+                 "tick spends a claim slot on work that is not due"
   end
 
   # The soonest job is what matters — parking until the last one would
@@ -68,7 +78,7 @@ class ScheduledBackoffTest < DispatchPolicy::IntegrationTest
     DispatchPolicy::Tick.run(policy_name: "scheduled_backoff")
 
     earliest = DispatchPolicy::StagedJob.minimum(:scheduled_at)
-    assert_in_delta earliest.to_f, partition.next_eligible_at.to_f, 1.0
+    assert_in_delta earliest.to_f, partition.scheduled_eligible_at.to_f, 1.0
   end
 
   # A gate that just asked for a backoff is talking about capacity, which
@@ -87,6 +97,8 @@ class ScheduledBackoffTest < DispatchPolicy::IntegrationTest
 
     assert_in_delta gate_backoff.to_f, partition.next_eligible_at.to_f, 0.001,
                     "the gate's backoff must survive"
+    refute_nil partition.scheduled_eligible_at,
+               "and the scheduled horizon is tracked alongside it, not instead of it"
   end
 
   # Due work must still be admitted normally — the park only applies when
@@ -100,5 +112,142 @@ class ScheduledBackoffTest < DispatchPolicy::IntegrationTest
     assert_equal 1, DispatchPolicy::StagedJob.count, "the due job is admitted"
     assert_nil partition.next_eligible_at,
                "an admitting tick must not park the partition"
+    assert_nil partition.scheduled_eligible_at,
+               "work that is due now means there is no horizon to wait for"
+  end
+
+  # The bug the separate column exists for. A partition parked on a
+  # far-future job used to be invisible to `claim_partitions` until that
+  # horizon arrived, so a job enqueued for RIGHT NOW sat in staged_jobs
+  # for the whole wait — an hour here, a week with `wait: 1.week` — with
+  # no gate having denied it and nothing in the logs. Overwriting
+  # `next_eligible_at` from the enqueue path is not the fix either: that
+  # is where gates keep their backoff, and clearing it on every enqueue
+  # brings back the busy-loop the backoff exists to prevent.
+  def test_a_job_due_now_wakes_a_partition_parked_on_a_future_one
+    ScheduledJob.set(wait: 1.hour).perform_later
+    DispatchPolicy::Tick.run(policy_name: "scheduled_backoff")
+    refute_nil partition.scheduled_eligible_at, "parked on the future job"
+
+    ScheduledJob.perform_later # due now
+
+    assert_nil partition.scheduled_eligible_at,
+               "due work has to clear the horizon or it will never be claimed"
+
+    DispatchPolicy::Tick.run(policy_name: "scheduled_backoff")
+
+    assert_equal 1, DispatchPolicy::StagedJob.count,
+                 "the due job goes out on the next tick, not in an hour"
+    assert_equal 1, DispatchPolicy::TickSample.where("partitions_seen > 0").count
+  end
+
+  # The bulk path stages through `stage_many!`, which upserts once per
+  # partition for the whole group — so it has to answer the same question
+  # the single path does, and one due job in the batch settles it for the
+  # group. Missing this leaves `perform_all_later` unable to wake a parked
+  # partition, which is the same stranding bug through a different door.
+  def test_a_bulk_enqueue_of_due_work_wakes_a_parked_partition
+    ScheduledJob.set(wait: 1.hour).perform_later
+    DispatchPolicy::Tick.run(policy_name: "scheduled_backoff")
+    refute_nil partition.scheduled_eligible_at, "parked on the future job"
+
+    DispatchPolicy::Repository.stage_many!([
+      { policy_name: "scheduled_backoff", partition_key: "k", queue_name: nil,
+        job_class: ScheduledJob.name, job_data: {}, context: {},
+        scheduled_at: 2.hours.from_now, priority: 0 },
+      { policy_name: "scheduled_backoff", partition_key: "k", queue_name: nil,
+        job_class: ScheduledJob.name, job_data: {}, context: {},
+        scheduled_at: nil, priority: 0 }
+    ])
+
+    assert_nil partition.scheduled_eligible_at,
+               "one due job in the batch means the partition has work now"
+  end
+
+  def test_a_bulk_enqueue_of_only_future_work_parks_at_the_soonest
+    DispatchPolicy::Repository.stage_many!([
+      { policy_name: "scheduled_backoff", partition_key: "k", queue_name: nil,
+        job_class: ScheduledJob.name, job_data: {}, context: {},
+        scheduled_at: 3.hours.from_now, priority: 0 },
+      { policy_name: "scheduled_backoff", partition_key: "k", queue_name: nil,
+        job_class: ScheduledJob.name, job_data: {}, context: {},
+        scheduled_at: 20.minutes.from_now, priority: 0 }
+    ])
+
+    assert_in_delta 20.minutes.from_now.to_f, partition.scheduled_eligible_at.to_f, 5.0,
+                    "parking at the latest would hold back the one due sooner"
+  end
+
+  # ...and the reverse must not happen: a future job arriving cannot
+  # install a horizon over a partition that already has due work waiting,
+  # or one `wait: 1.week` call would strand everything behind it.
+  def test_a_future_job_does_not_park_a_partition_that_has_due_work
+    ScheduledJob.perform_later
+    ScheduledJob.set(wait: 1.week).perform_later
+
+    assert_nil partition.scheduled_eligible_at
+
+    DispatchPolicy::Tick.run(policy_name: "scheduled_backoff")
+
+    assert_equal 1, DispatchPolicy::StagedJob.count, "the due job left"
+  end
+  # The park runs after the claim's DELETE and after record_partition_admit!
+  # takes the row lock, and its own subquery only looks at rows scheduled
+  # in the FUTURE. So a job that became due inside that gap — an enqueue
+  # whose transaction committed while the tick waited on the lock, or a
+  # row another tick released from SKIP LOCKED — gets hidden behind a
+  # horizon the park never saw it beside. Reproduced here with a second
+  # connection holding the due row, which needs no threads and no timing.
+  def test_the_park_does_not_hide_work_that_became_due_meanwhile
+    ScheduledJob.set(wait: 1.week).perform_later
+    ScheduledJob.perform_later # due now
+    due_id = DispatchPolicy::StagedJob.where(scheduled_at: nil).pick(:id)
+
+    other = ActiveRecord::Base.connection_pool.checkout
+    begin
+      other.begin_db_transaction
+      # The tick's claim skips it (FOR UPDATE SKIP LOCKED), so the tick
+      # sees nothing claimable and reaches the park.
+      other.exec_query("SELECT id FROM dispatch_policy_staged_jobs WHERE id = #{due_id} FOR UPDATE")
+
+      DispatchPolicy::Tick.run(policy_name: "scheduled_backoff")
+    ensure
+      other.rollback_db_transaction
+      ActiveRecord::Base.connection_pool.checkin(other)
+    end
+
+    assert_nil partition.scheduled_eligible_at,
+               "a due row exists; parking a week out strands it with nothing in the logs"
+
+    DispatchPolicy::Tick.run(policy_name: "scheduled_backoff")
+    assert_equal 1, DispatchPolicy::StagedJob.count, "the due job goes out on the next tick"
+  end
+  # The guard is `scheduled_at IS NULL OR scheduled_at <= now()`, and the
+  # test above only pins the first half — narrowing the SQL to just
+  # `IS NULL` leaves the whole suite green. The second half is the
+  # ordinary case: any `set(wait:)` job the moment it comes due.
+  def test_the_park_sees_a_scheduled_job_that_has_just_come_due
+    ScheduledJob.set(wait: 1.week).perform_later
+    ScheduledJob.set(wait: 1.second).perform_later
+    soon_id = DispatchPolicy::StagedJob.order(:scheduled_at).first.id
+    sleep 1.1 # it is now due, and carries a timestamp rather than NULL
+
+    other = ActiveRecord::Base.connection_pool.checkout
+    begin
+      other.begin_db_transaction
+      other.exec_query("SELECT id FROM dispatch_policy_staged_jobs WHERE id = #{soon_id} FOR UPDATE")
+
+      DispatchPolicy::Tick.run(policy_name: "scheduled_backoff")
+    ensure
+      other.rollback_db_transaction
+      ActiveRecord::Base.connection_pool.checkin(other)
+    end
+
+    horizon = partition.scheduled_eligible_at
+    # Not assert_nil: the enqueue wrote this row's own due time into the
+    # horizon and nothing clears a past one — what matters is that the
+    # park did not push it a week out.
+    assert(horizon.nil? || horizon <= Time.current,
+           "a due row exists; parking past it strands the job for a week")
   end
 end

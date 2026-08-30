@@ -19,7 +19,7 @@ See `README.md` for the API and examples.
 v0.1 (on master). The whole main flow is implemented and tested.
 What's pending lives in `IDEAS.md` with the rationale.
 
-124 tests / 284 assertions. `bundle exec rake test` from the root.
+262 runs / 621 assertions. `bundle exec rake test` from the root.
 
 ## Architecture — 6 tables
 
@@ -75,13 +75,76 @@ dispatch_policy_policy_settings               one row per policy — pause flag
   its job class opts in with `dispatch_policy_inflight_tracking`
   (which buys a dashboard count, nothing else — no admission decision
   reads those rows).
+- **Two columns park a partition, and they are not interchangeable.**
+  `next_eligible_at` is a GATE backoff ("we asked, capacity said wait");
+  `scheduled_eligible_at` is the scheduled-work horizon ("there is
+  nothing due yet"). `claim_partitions` requires both to be clear.
+  Sharing one column was M10's bug: an enqueue cannot lower a gate
+  backoff without resurrecting the busy-loop the backoff prevents, so a
+  job due NOW stayed invisible behind a `set(wait: 1.week)` sibling for
+  a week. `upsert_partition!` maintains the horizon on every enqueue
+  and NULL is absorbing in both directions — due work clears it, and a
+  future job cannot install one over a partition that already has due
+  work.
+- **"Not in `DispatchPolicy.registry`" means "we can't see it", NOT "it
+  was deleted".** The registry fills as a side effect of job classes
+  loading, so a dashboard process, a lazily-loaded worker or a rolling
+  deploy all reach code with a policy the rest of the fleet knows.
+  `ManualAdmission` learned this once (ISSUES.md R3) and `TickLoop`'s
+  catch-all sweep learned it again: collecting such a partition deletes
+  its token bucket and hands the tenant a fresh quota. A row carrying a
+  bucket now waits out `config.unknown_policy_retention` there. Any new
+  code that branches on registry membership has to err the same way.
 - **`partitions.context` is refreshed on every `perform_later`** via
   UPSERT. Gates read that ctx, NOT `staged_jobs.context` (which is
   historical). This lets a change in the host DB (e.g. new
   `max_per_account`) take effect on the next enqueue.
-- **`shard_by` must be ≥ as coarse as the most restrictive throttle's
-  scope.** If not, the bucket duplicates across shards and the
-  effective rate becomes `rate × N_shards`.
+- **One tick loop per (policy, shard) — the throttle's burst depends on
+  it, not its long-run rate.** `evaluate` reads the token bucket before
+  the admission TX opens, so two loops on the same shard can both see a
+  full bucket and both admit it. The CHARGE is atomic (the bucket is
+  recomputed inside the admission UPDATE from the row's own value), so
+  the two costs compose, the bucket goes negative, and the debt is
+  repaid out of the next window — the rate holds over time, the burst
+  does not. The generated `DispatchTickLoopJob` helps but does not
+  guarantee it: its good_job / solid_queue concurrency key is
+  `"dispatch_tick_loop:#{policy}:#{shard}"`, so it dedupes an identical
+  argument tuple — it does NOT stop a catch-all
+  `perform_later` (key `all:all`) from overlapping a
+  `perform_later("events")` (key `events:all`), and the no-adapter
+  branch of the template has no concurrency control at all.
+  Do NOT go back to writing the bucket as a literal jsonb patch computed
+  in Ruby: that is a read-modify-write, the second writer wins, and the
+  rate silently becomes `rate × N_loops` forever.
+- **The token bucket lives on ONE clock: `DispatchPolicy.config.now`.**
+  The charge is settled in SQL from the row's own value, but the
+  timestamps it reads and writes are bound as parameters from the gate's
+  clock — never `EXTRACT(EPOCH FROM now())`. Only the token COUNT has to
+  come from the row. `evaluate` refills from `config.now`, so sourcing
+  the other end from the database puts one subtraction on two clocks:
+  an offset O silently adds `O × refill_rate` phantom tokens to every
+  evaluate, permanently. `now()` is also the TRANSACTION timestamp, so
+  inside an enclosing transaction (Rails transactional tests, a host
+  wrapping the tick) it stops advancing entirely. The stamp is written
+  as `GREATEST(now, stored)`: two admission transactions can execute in
+  the opposite order to the one they started in, and a stamp that moves
+  backwards makes that interval refill twice.
+- **The partition sweeper holds a throttled partition until its bucket
+  has REFILLED, not until its window is out.** `sweep_inactive_partitions!`
+  refills the stored value to now with the same expression the admission
+  UPDATE uses (hence `Policy#static_throttle_refill_rate`, which is not
+  `capacity / window` — a sub-unit rate floors capacity at one token).
+  Comparing the stored snapshot instead would be inert: the admission
+  UPDATE is its only writer and always subtracts, so a partition that
+  ever admitted anything is frozen below capacity forever. "One window
+  has passed" is not the same test in either direction — a bucket in
+  debt needs more than a window, a `rate: 0.5` bucket needs two — and
+  collecting early is the M11 quota reset.
+  (The older warning here — that a too-fine `shard_by` duplicates the
+  bucket across shards for `rate × N_shards` — no longer applies: since
+  `partition_by` became policy-level, `(policy_name, partition_key)` is
+  unique and the shard is pinned on first write, so one partition_key is
+  exactly one row on exactly one shard.)
 - **`BulkEnqueue.perform_all_later` checks `Bypass.active?`** and
   delegates to `super` when active. Without it, the call from
   `Forwarder.dispatch` (deserialize + `perform_all_later` under
@@ -107,6 +170,24 @@ dispatch_policy_policy_settings               one row per policy — pause flag
   `preinserted_inflight_ids`**: TX rollback covers that. If you ever
   support a non-PG adapter, think first about how to keep
   at-least-once without this invariant.
+- **The forward must not be deferrable.** ActiveJob 7.2+ lets a job class
+  set `enqueue_after_transaction_commit = true`, which reroutes its
+  enqueue through `ActiveRecord.after_all_transactions_commit` — i.e.
+  onto the gem's OWN admission transaction, landing after COMMIT and
+  outside `Bypass`. That re-stages the job the tick just admitted (or
+  rolls the admission back) forever. `Forwarder.dispatch` therefore wraps
+  the enqueue in a NON-JOINABLE savepoint when any job in the batch
+  defers: `ActiveRecord.all_open_transactions` skips non-joinable
+  transactions, so the deferral finds nothing to wait for and runs
+  inline. Only when needed — a non-joinable savepoint runs its commit
+  callbacks on RELEASE rather than at the real COMMIT.
+- **The sweep cadence counter lives on the module, not in `run`.** The
+  generated tick job calls `TickLoop.run` for one `tick_max_duration`
+  window and re-enqueues itself, and the shipped defaults put exactly
+  `sweep_every_ticks` iterations in a window — so a per-invocation
+  counter never reaches the modulo and NOTHING is ever swept. Don't move
+  it back into a local, and don't assume a fresh `run` starts a fresh
+  cadence.
 - **Non-PG adapter = warn at boot, no hard-fail.** The railtie calls
   `DispatchPolicy.warn_unsupported_adapter` in `after_initialize`.
   If the host runs Sidekiq/Resque, a warning explains atomicity is
@@ -137,11 +218,22 @@ dispatch_policy_policy_settings               one row per policy — pause flag
   classes loading, so an unknown policy there means "we can't see it",
   NOT "it has no gate" — the helper inserts unless it knows there is no
   tracked gate, and `force!` warns. Erring the other way over-admits.
-- **Inflight rows are reaped on `discard.active_job`.** The railtie
-  subscribes and calls `InflightTracker.handle_discard`, deleting the
-  row by `active_job_id`. This covers jobs killed BEFORE around_perform
-  (e.g. `discard_on ActiveJob::DeserializationError`), whose `ensure`
-  never runs — otherwise the Tick's pre-inserted row sits until the
+  It also charges the throttle, for the same reason: the button exists to
+  bypass the gate's DECISION, not its COST, and a drain that leaves the
+  bucket alone hands the tenant everything it forwarded plus an untouched
+  window. Only a fixed `rate` and `per` can be charged here — a proc
+  needs the partition's ctx, which this path never loads — so a dynamic
+  throttle is left alone and warns.
+- **Inflight rows are reaped on `perform.active_job` AND
+  `discard.active_job`.** The railtie subscribes to both and calls
+  `InflightTracker.handle_discard`, deleting the row by `active_job_id`.
+  `discard` alone is NOT enough: ActiveJob instruments it in exactly one
+  place, the rescue_from handler `discard_on` installs, so a job class
+  with no handler dies in perform_now's bare `rescue Exception` and emits
+  nothing. `perform.active_job` wraps the whole of perform_now — argument
+  deserialization included — and carries an `:exception` payload when the
+  job dies, which is what actually covers a job killed BEFORE
+  around_perform, whose `ensure` never runs — otherwise the Tick's pre-inserted row sits until the
   `inflight_queued_stale_after` sweeper (1h), holding a slot.
 - **Adding a table?** Add it to `Repository::ALL_TABLES` — the test
   bootstrap (`PostgresTest`) and the benchmark harness (`Bench`) both
@@ -257,7 +349,7 @@ http://localhost:3000/                       # forms to enqueue
 http://localhost:3000/dispatch_policy        # dashboard
 
 # Tests
-bundle exec rake test                        # 101 runs / 225 asserts
+bundle exec rake test                        # 262 runs / 621 assertions
 
 # When you add a column or table:
 #   1. Edit db/migrate/20260501000001_create_dispatch_policy_tables.rb
@@ -286,9 +378,20 @@ FROM dispatch_policy_partitions
 GROUP BY policy_name, shard, status
 ORDER BY pending DESC;
 
--- Partitions currently in backoff
+-- Partitions currently in backoff.
+-- `tokens` is the balance AS OF `refilled_at`, and nothing rewrites it
+-- between admissions (evaluate persists nothing), so read the raw column
+-- and you will see a bucket frozen at the last admit. `live_tokens`
+-- applies the refill the gate would apply — substitute the policy's own
+-- rate/per for the 10/60 below, and its capacity for the LEAST bound.
 SELECT policy_name, partition_key,
-       gate_state -> 'throttle' ->> 'tokens' AS tokens,
+       (gate_state -> 'throttle' ->> 'tokens')::float AS tokens_at_last_admit,
+       LEAST(
+         (gate_state -> 'throttle' ->> 'tokens')::float
+         + GREATEST(EXTRACT(EPOCH FROM now())
+                    - (gate_state -> 'throttle' ->> 'refilled_at')::float, 0) * (10 / 60.0),
+         10
+       ) AS live_tokens,
        (next_eligible_at - now()) AS time_left
 FROM dispatch_policy_partitions
 WHERE next_eligible_at > now();

@@ -42,13 +42,7 @@ class DispatchTickLoopJob < ApplicationJob
   private
 
   def adapter_shutting_down?
-    case ENV["DUMMY_ADAPTER"].to_s
-    when "good_job"
-      defined?(GoodJob) && GoodJob.respond_to?(:current_thread_shutting_down?) && GoodJob.current_thread_shutting_down?
-    when "solid_queue"
-      defined?(SolidQueue::Process) && SolidQueue::Process.current_process&.shutdown?
-    else
-      false
-    end
+    adapter = self.class.queue_adapter
+    adapter.respond_to?(:stopping?) && adapter.stopping?
   end
 end

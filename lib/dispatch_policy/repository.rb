@@ -87,7 +87,8 @@ module DispatchPolicy
           queue_name:    queue_name,
           shard:         shard,
           context:       context,
-          delta_pending: 1
+          delta_pending: 1,
+          scheduled_at:  scheduled_at
         )
       end
       true
@@ -141,27 +142,43 @@ module DispatchPolicy
         # Postgres resolves by killing one of the transactions, losing
         # that whole batch's staging.
         rows.group_by { |r| [r[:policy_name], r[:partition_key]] }.sort_by(&:first).each do |(policy_name, partition_key), group|
+          # nil wins over any timestamp: one job in this batch that is due
+          # now means the partition has work to do now, whatever the rest
+          # of the batch is scheduled for.
+          scheduled = group.map { |r| r[:scheduled_at] }
+          soonest   = scheduled.include?(nil) ? nil : scheduled.min
+
           upsert_partition!(
             policy_name:   policy_name,
             partition_key: partition_key,
             queue_name:    group.first[:queue_name],
             shard:         group.first[:shard] || Policy::DEFAULT_SHARD,
             context:       group.last[:context] || {},
-            delta_pending: group.size
+            delta_pending: group.size,
+            scheduled_at:  soonest
           )
         end
       end
       rows.size
     end
 
+    # `scheduled_at` is the new job's own due time (nil = due now). It
+    # maintains `scheduled_eligible_at`, the soonest moment this partition
+    # can have work to do — see `defer_partition_to_next_scheduled!` for
+    # why that lives in its own column rather than in `next_eligible_at`.
+    # NULL is absorbing in both directions: a job due NOW clears the
+    # horizon, and a future job cannot install one over a partition that
+    # already has due work waiting.
     def upsert_partition!(policy_name:, partition_key:, queue_name:, context:, delta_pending:,
-                          shard: Policy::DEFAULT_SHARD)
+                          shard: Policy::DEFAULT_SHARD, scheduled_at: nil)
       connection.exec_query(
         <<~SQL.squish,
           INSERT INTO #{PARTITIONS_TABLE}
             (policy_name, partition_key, queue_name, shard, context, context_updated_at,
-             pending_count, last_enqueued_at, status, gate_state, created_at, updated_at)
-          VALUES ($1, $2, $3, $4, $5::jsonb, now(), $6, now(), 'active', '{}'::jsonb, now(), now())
+             pending_count, last_enqueued_at, status, gate_state, scheduled_eligible_at,
+             created_at, updated_at)
+          VALUES ($1, $2, $3, $4, $5::jsonb, now(), $6, now(), 'active', '{}'::jsonb, $7,
+                  now(), now())
           ON CONFLICT (policy_name, partition_key) DO UPDATE SET
             context             = EXCLUDED.context,
             context_updated_at  = EXCLUDED.context_updated_at,
@@ -169,10 +186,17 @@ module DispatchPolicy
             shard               = #{PARTITIONS_TABLE}.shard,
             pending_count       = #{PARTITIONS_TABLE}.pending_count + EXCLUDED.pending_count,
             last_enqueued_at    = EXCLUDED.last_enqueued_at,
+            scheduled_eligible_at = CASE
+              WHEN EXCLUDED.scheduled_eligible_at IS NULL THEN NULL
+              WHEN #{PARTITIONS_TABLE}.scheduled_eligible_at IS NULL THEN NULL
+              ELSE LEAST(#{PARTITIONS_TABLE}.scheduled_eligible_at,
+                         EXCLUDED.scheduled_eligible_at)
+            END,
             updated_at          = now()
         SQL
         "upsert_partition",
-        [policy_name, partition_key, queue_name, shard, JSON.dump(context), delta_pending]
+        [policy_name, partition_key, queue_name, shard, JSON.dump(context), delta_pending,
+         scheduled_at]
       )
     end
 
@@ -201,6 +225,7 @@ module DispatchPolicy
             AND status = 'active'
             AND pending_count > 0
             AND (next_eligible_at IS NULL OR next_eligible_at <= now())
+            AND (scheduled_eligible_at IS NULL OR scheduled_eligible_at <= now())
             AND NOT EXISTS (
               SELECT 1 FROM #{POLICY_SETTINGS_TABLE} ps
               WHERE ps.policy_name = $1 AND ps.paused
@@ -230,15 +255,25 @@ module DispatchPolicy
     # the tick.
     def claim_staged_jobs!(policy_name:, partition_key:, limit:, retry_after:,
                            gate_state_patch: nil, half_life_seconds: nil,
-                           preserve_next_eligible: false)
+                           preserve_next_eligible: false, throttle_charge: nil)
       raise ArgumentError, "claim_staged_jobs! requires limit > 0" unless limit.positive?
 
+      # priority ASC, not DESC: ActiveJob priority follows the adapters'
+      # convention, where a SMALLER number is more urgent (good_job's
+      # `priority_ordered` is "priority ASC NULLS LAST", solid_queue's
+      # `ordered` is "priority: :asc"). The enqueue path stores
+      # `job.priority` verbatim, so ordering DESC admitted the host's
+      # LEAST urgent work first and could starve an urgent job behind a
+      # steady stream of default-priority ones.
+      #
+      # (Keep comments out of the heredoc: it is `.squish`ed onto one
+      # line, where a `--` would comment out the rest of the statement.)
       sql_select = <<~SQL.squish
         WITH claimed AS (
           SELECT id FROM #{STAGED_TABLE}
           WHERE policy_name = $1 AND partition_key = $2
             AND (scheduled_at IS NULL OR scheduled_at <= now())
-          ORDER BY priority DESC, scheduled_at NULLS FIRST, id
+          ORDER BY priority ASC, scheduled_at NULLS FIRST, id
           LIMIT $3
           FOR UPDATE SKIP LOCKED
         )
@@ -263,7 +298,8 @@ module DispatchPolicy
         gate_state_patch:  patch,
         retry_after:       retry_after,
         half_life_seconds: half_life_seconds,
-        preserve_next_eligible: preserve_next_eligible
+        preserve_next_eligible: preserve_next_eligible,
+        throttle_charge:   throttle_charge
       )
 
       rows.map { |r| normalize_staged(r) }
@@ -287,9 +323,32 @@ module DispatchPolicy
     # therefore learned nothing about capacity — clearing the backoff there
     # just makes the next tick re-claim the partition, re-evaluate it and
     # back it off again.
+    # `throttle_charge` — {capacity:, refill_rate:, now:} — makes the token
+    # bucket settle IN this UPDATE, from the row's own current value,
+    # instead of writing back a number Ruby computed from a read that
+    # happened earlier. That read-modify-write was a real hole: two tick
+    # loops covering the same (policy, shard) each evaluated a full
+    # bucket, each admitted it, and the second write simply overwrote the
+    # first — the second admission was never charged, so the effective
+    # rate became rate x loops, indefinitely. Computed here, the two
+    # charges compose: the bucket goes negative and the debt is repaid
+    # out of the next window, so the long-run rate holds. (The transient
+    # burst is still possible — the ADMISSION decision is not
+    # serialised, only the charge — which is why one tick loop per
+    # (policy, shard) remains the recommended setup.)
+    #
+    # `now` is the gate's own clock (DispatchPolicy.config.now), NOT
+    # Postgres `now()`. Only the TOKEN COUNT has to come from the row;
+    # the clock does not, and taking it from the database would put the
+    # two ends of the same subtraction on different clocks — `evaluate`
+    # refills from config.now, so an offset O between the two adds
+    # O * refill_rate phantom tokens to every evaluate, permanently.
+    # `now()` is also the TRANSACTION timestamp: inside an enclosing
+    # transaction it stops advancing altogether.
     def record_partition_admit!(policy_name:, partition_key:, admitted:, gate_state_patch:,
                                 retry_after:, half_life_seconds: nil,
-                                preserve_next_eligible: false)
+                                preserve_next_eligible: false,
+                                throttle_charge: nil)
       next_eligible_sql, next_eligible_params =
         if preserve_next_eligible
           ["next_eligible_at", []]
@@ -331,13 +390,56 @@ module DispatchPolicy
         decay_sql = ""
       end
 
+      # Recompute the bucket from the row: refill by the time elapsed
+      # since ITS refilled_at, clamp to capacity, then subtract what we
+      # actually admitted. Deliberately NOT floored at zero — a negative
+      # balance is how a concurrent over-admission gets repaid instead of
+      # forgiven, and `evaluate` treats anything under one whole token as
+      # empty. Built with `||` on top of the literal patch, so it wins for
+      # the "throttle" key while other gates' keys survive; every
+      # gate_state reference below reads the pre-UPDATE row.
+      #
+      # The stamp is GREATEST(now, stored) rather than a plain `now`: two
+      # admission transactions can execute in the opposite order to the
+      # one they started in, and a stamp that moves BACKWARDS makes the
+      # interval between them refill twice. Paired with the GREATEST(…, 0)
+      # on the elapsed term, a stale clock then credits nothing instead.
+      if throttle_charge
+        cap_idx  = params.size + 1
+        rate_idx = params.size + 2
+        now_idx  = params.size + 3
+        params << throttle_charge.fetch(:capacity).to_f
+        params << throttle_charge.fetch(:refill_rate).to_f
+        params << throttle_charge.fetch(:now).to_f
+        stored_refilled_at = "(gate_state -> 'throttle' ->> 'refilled_at')::double precision"
+        gate_state_sql = <<~SQL.squish
+          (gate_state || $4::jsonb) || jsonb_build_object('throttle', jsonb_build_object(
+            'tokens', LEAST(
+                COALESCE((gate_state -> 'throttle' ->> 'tokens')::double precision, $#{cap_idx}::double precision)
+                + GREATEST(
+                    $#{now_idx}::double precision
+                    - COALESCE(#{stored_refilled_at}, $#{now_idx}::double precision),
+                    0
+                  ) * $#{rate_idx}::double precision,
+                $#{cap_idx}::double precision
+              ) - $3,
+            'refilled_at', GREATEST(
+                $#{now_idx}::double precision,
+                COALESCE(#{stored_refilled_at}, $#{now_idx}::double precision)
+              )
+          ))
+        SQL
+      else
+        gate_state_sql = "gate_state || $4::jsonb"
+      end
+
       connection.exec_query(
         <<~SQL.squish,
           UPDATE #{PARTITIONS_TABLE}
           SET pending_count    = GREATEST(pending_count - $3, 0),
               total_admitted   = total_admitted + $3,
               last_admit_at    = CASE WHEN $3 > 0 THEN now() ELSE last_admit_at END,
-              gate_state       = gate_state || $4::jsonb,
+              gate_state       = #{gate_state_sql},
               next_eligible_at = #{next_eligible_sql},
               #{decay_sql}
               updated_at       = now()
@@ -358,22 +460,36 @@ module DispatchPolicy
     # `partition_batch_size` slot burned every tick until the job is due,
     # with `no_rows_claimed` filling the denial breakdown meanwhile.
     #
-    # Only sets the value when there is no backoff already: a gate that
-    # just asked for one is asking about capacity, which outranks this.
-    # A NULL result (another tick took the rows in between) leaves the
-    # partition immediately eligible, which is correct.
+    # The horizon lives in its own column, so there is no backoff to
+    # protect from it any more — gates keep theirs in `next_eligible_at`
+    # and `claim_partitions` requires both. A NULL result (another tick
+    # took the rows in between) leaves the partition immediately
+    # eligible, which is correct.
+    #
+    # The NOT EXISTS is what keeps this from hiding work it cannot see.
+    # This runs after the claim's DELETE and after `record_partition_admit!`
+    # takes the row lock, and its own subquery only looks at rows
+    # scheduled in the FUTURE — so a job that became due in that gap (an
+    # enqueue whose transaction committed while we waited on the lock, or
+    # a row another tick released from SKIP LOCKED) would be parked behind
+    # the far horizon it never saw. Asking "is anything due?" in the same
+    # statement and the same snapshot as the write is what closes it.
     def defer_partition_to_next_scheduled!(policy_name:, partition_key:)
       connection.exec_query(
         <<~SQL.squish,
           UPDATE #{PARTITIONS_TABLE} p
-          SET next_eligible_at = (
+          SET scheduled_eligible_at = (
                 SELECT MIN(s.scheduled_at) FROM #{STAGED_TABLE} s
                 WHERE s.policy_name = $1 AND s.partition_key = $2
                   AND s.scheduled_at > now()
               ),
               updated_at = now()
           WHERE p.policy_name = $1 AND p.partition_key = $2
-            AND p.next_eligible_at IS NULL
+            AND NOT EXISTS (
+              SELECT 1 FROM #{STAGED_TABLE} d
+              WHERE d.policy_name = $1 AND d.partition_key = $2
+                AND (d.scheduled_at IS NULL OR d.scheduled_at <= now())
+            )
         SQL
         "defer_partition_to_next_scheduled",
         [policy_name, partition_key]
@@ -408,7 +524,7 @@ module DispatchPolicy
           e[:policy_name],
           e[:partition_key],
           JSON.dump(e[:gate_state_patch] || {}),
-          e[:retry_after].nil? ? nil : e[:retry_after].to_f.round(3)
+          e[:retry_after].nil? ? nil : clamp_backoff(e[:retry_after])
         )
       end
 
@@ -418,7 +534,7 @@ module DispatchPolicy
           SET gate_state       = p.gate_state || v.gate_state_patch,
               next_eligible_at = CASE
                 WHEN v.retry_after_secs IS NULL THEN p.next_eligible_at
-                ELSE now() + (v.retry_after_secs || ' seconds')::interval
+                ELSE now() + (v.retry_after_secs * interval '1 second')
               END,
               updated_at       = now()
           FROM (VALUES #{values_sql.join(", ")})
@@ -915,6 +1031,39 @@ module DispatchPolicy
       )
     end
 
+    # Collect adaptive stats whose partition is gone. Every other table in
+    # the gem is bounded — staged rows are deleted on claim, partitions at
+    # `partition_inactive_after`, inflight in two tiers, samples at
+    # `metrics_retention` — but `adaptive_seed!` runs on EVERY evaluate of
+    # EVERY partition and nothing ever deleted from here, so the row count
+    # was "every partition key this policy has ever seen". With a
+    # high-cardinality `partition_by` (per user, per endpoint, per upload)
+    # that grows without bound and without a knob.
+    #
+    # The anti-join, rather than age alone: the partition row is already
+    # the gem's authority on liveness, and its own sweeper knows about a
+    # throttle's refill window. A stats row can therefore only go once the
+    # partition it describes has gone, and re-seeding costs one
+    # ON CONFLICT DO NOTHING insert at `initial_max` — which is also what
+    # the `in_flight == 0` safety valve grants a cold partition anyway.
+    # Both tables carry a unique index on (policy_name, partition_key), so
+    # the anti-join is index-supported.
+    def sweep_orphan_adaptive_stats!(cutoff_seconds:)
+      connection.exec_query(
+        <<~SQL.squish,
+          DELETE FROM #{ADAPTIVE_TABLE} a
+          WHERE a.updated_at < now() - ($1 || ' seconds')::interval
+            AND NOT EXISTS (
+              SELECT 1 FROM #{PARTITIONS_TABLE} p
+              WHERE p.policy_name = a.policy_name
+                AND p.partition_key = a.partition_key
+            )
+        SQL
+        "sweep_orphan_adaptive_stats",
+        [cutoff_seconds.to_i]
+      )
+    end
+
     # ----- tick samples sweep -------------------------------------------------
 
     def sweep_old_tick_samples!(cutoff_seconds:)
@@ -940,7 +1089,39 @@ module DispatchPolicy
     # stay that way. Nothing is lost by collecting one: the pause flag
     # lives in dispatch_policy_policy_settings, so it still applies when
     # the partition reappears.
-    def sweep_inactive_partitions!(cutoff_seconds:, policy_name: nil, except_policies: [])
+    # `refilled_bucket` — {capacity:, refill_rate:, now:} — replaces the
+    # blunt "hold a throttled partition for one window" rule with the
+    # thing that rule was approximating: hold it until its bucket has
+    # actually refilled to capacity. The bucket lives in the row, so
+    # collecting the row early hands the tenant a fresh quota; but a
+    # bucket AT capacity is worth nothing, since a partition that
+    # reappears starts full anyway.
+    #
+    # The test refills the stored value to `now` instead of comparing the
+    # raw snapshot. Nothing rewrites gate_state while a partition is idle
+    # (the admission UPDATE is its only writer and it runs only while
+    # pending_count > 0, whereas this sweeps pending_count = 0), so the
+    # snapshot is frozen at the last admission and is ALWAYS below
+    # capacity for a partition that ever admitted anything — comparing it
+    # directly would make this clause fire only for rows that never spent
+    # a token.
+    #
+    # One window is not the same thing, in either direction: a bucket in
+    # debt (concurrent loops over-admitted; see record_partition_admit!)
+    # needs more than a window to climb back to capacity, and a sub-unit
+    # rate needs `capacity / rate` windows. Both were quota resets.
+    # Only available when both throttle knobs are fixed numbers —
+    # capacity and refill rate are unknowable here otherwise.
+    # `throttled_cutoff_seconds` gives rows that still carry a token bucket
+    # a longer grace than the rest. The catch-all pass uses it: it sweeps
+    # policies this process does not know, and "unknown" there means "no
+    # job class referencing it has loaded here", which a dashboard-only
+    # process, lazy loading or a half-finished deploy all produce.
+    # Deleting such a row resets its bucket — the M11 quota reset — and
+    # unlike the per-policy passes, nothing here can say how long that
+    # policy's window is.
+    def sweep_inactive_partitions!(cutoff_seconds:, policy_name: nil, except_policies: [],
+                                   refilled_bucket: nil, throttled_cutoff_seconds: nil)
       params = [cutoff_seconds.to_i]
       filter = ""
       if policy_name
@@ -954,16 +1135,51 @@ module DispatchPolicy
         filter = "AND policy_name NOT IN (#{placeholders.join(', ')})"
       end
 
+      if refilled_bucket
+        cap_idx  = params.size + 1
+        rate_idx = params.size + 2
+        now_idx  = params.size + 3
+        params << refilled_bucket.fetch(:capacity).to_f
+        params << refilled_bucket.fetch(:refill_rate).to_f
+        params << refilled_bucket.fetch(:now).to_f
+        stored_refilled_at = "(gate_state -> 'throttle' ->> 'refilled_at')::double precision"
+        # Same expression the admission UPDATE settles with, on the same
+        # clock (config.now, not the database's). A row with no bucket
+        # recorded at all has nothing to lose, hence the COALESCE to
+        # capacity.
+        refilled_bucket_sql = <<~SQL.squish
+          AND LEAST(
+                COALESCE((gate_state -> 'throttle' ->> 'tokens')::double precision, $#{cap_idx}::double precision)
+                + GREATEST(
+                    $#{now_idx}::double precision
+                    - COALESCE(#{stored_refilled_at}, $#{now_idx}::double precision),
+                    0
+                  ) * $#{rate_idx}::double precision,
+                $#{cap_idx}::double precision
+              ) >= $#{cap_idx}::double precision
+        SQL
+      else
+        refilled_bucket_sql = ""
+      end
+
+      if throttled_cutoff_seconds
+        params << throttled_cutoff_seconds.to_i
+        age_sql = <<~SQL.squish
+          COALESCE(last_admit_at, created_at) < now() - (
+            CASE WHEN gate_state ? 'throttle' THEN $#{params.size} ELSE $1 END || ' seconds'
+          )::interval
+        SQL
+      else
+        age_sql = "COALESCE(last_admit_at, created_at) < now() - ($1 || ' seconds')::interval"
+      end
+
       connection.exec_query(
         <<~SQL.squish,
           DELETE FROM #{PARTITIONS_TABLE}
           WHERE pending_count = 0
             #{filter}
-            AND (
-              (last_admit_at IS NOT NULL AND last_admit_at < now() - ($1 || ' seconds')::interval)
-              OR
-              (last_admit_at IS NULL AND created_at < now() - ($1 || ' seconds')::interval)
-            )
+            AND #{age_sql}
+            #{refilled_bucket_sql}
         SQL
         "sweep_inactive_partitions",
         params
@@ -1011,12 +1227,48 @@ module DispatchPolicy
       end
     end
 
+    # A backoff longer than this is not a backoff, it is a partition
+    # nobody will look at again this century — and every way of writing an
+    # interval in Postgres has a ceiling somewhere, so pick one that is
+    # ours rather than one that raises. 1e9 seconds is ~31 years.
+    MAX_BACKOFF_SECONDS = 1_000_000_000.0
+
+    # Clamp before the value reaches SQL. Both callers build an interval
+    # from it, and both are on paths where a raise is expensive: the deny
+    # flush is ONE statement for the whole tick and `Tick#flush_denies!`
+    # only logs, so one bad value discards every denied partition's
+    # backoff AND gate_state patch in that batch — the M4 busy-loop, for a
+    # whole policy.
+    def clamp_backoff(seconds)
+      [seconds.to_f, MAX_BACKOFF_SECONDS].min.round(3)
+    end
+
+    # Multiplication, not `(n || ' seconds')::interval`. Postgres' interval
+    # INPUT PARSER rejects a seconds field above INT_MAX, and a backoff is
+    # derived from a token debt, which has no such bound: a forced
+    # admission charges the bucket for everything it forwarded, so
+    # `retry_after = (1 - tokens) / refill_rate` crosses INT_MAX after
+    # roughly `2.147e9 * rate/per` jobs — about 7,100 for a
+    # `rate: 2, per: 7.days` policy, well inside one drain click.
+    #
+    # The multiply raises that ceiling ~4295x; it does not remove it.
+    # `interval` stores microseconds in an int64, so the value still has
+    # to stay under ~9.22e12 seconds, which is why `clamp_backoff` exists
+    # rather than trusting the arithmetic.
+    #
+    # This is not cosmetic. The same expression in
+    # `bulk_record_partition_denies!` builds ONE statement for the whole
+    # tick, and `Tick#flush_denies!` only logs on failure — so a single
+    # unparseable interval discards every denied partition's backoff AND
+    # gate_state patch in that batch. Those partitions are then re-claimed
+    # every tick with nothing recorded: the M4 busy-loop, for a whole
+    # policy, from one UI click.
     def next_eligible_clause(retry_after)
       if retry_after.nil?
         ["NULL", []]
       else
         # 5th param ($5) — caller appends params to those of the parent UPDATE
-        ["now() + ($5 || ' seconds')::interval", [retry_after.to_f.round(3)]]
+        ["now() + ($5 * interval '1 second')", [clamp_backoff(retry_after)]]
       end
     end
 
@@ -1048,7 +1300,7 @@ module DispatchPolicy
     ROLE_ROUTING_EXCLUDED = %i[
       connection with_connection
       normalize_partition normalize_staged parse_jsonb
-      sample_filter next_eligible_clause trend_direction
+      sample_filter next_eligible_clause trend_direction clamp_backoff
     ].freeze
 
     (singleton_methods(false) - ROLE_ROUTING_EXCLUDED).each do |method_name|

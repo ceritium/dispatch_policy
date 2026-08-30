@@ -13,6 +13,18 @@ module DispatchPolicy
     # `partition_by` (declared in the policy DSL block, not on the gate).
     # The bucket lives on the staged partition row — one row per
     # `policy.partition_for(ctx)` value, one bucket per row, no dilution.
+    #
+    # Concurrency: `evaluate` reads the bucket OUTSIDE the admission
+    # transaction, so two tick loops covering the same (policy, shard)
+    # can both see a full bucket and both admit it — the same caveat
+    # Gates::Concurrency documents for its COUNT(*). What they cannot do
+    # is escape the cost: the bucket is settled inside the admission
+    # UPDATE from the row's own value (Repository#record_partition_admit!),
+    # so the two charges compose, the bucket goes negative, and the debt
+    # comes out of the next window. The long-run rate holds; the burst is
+    # transient. Run one tick loop per (policy, shard) — shard the policy
+    # rather than duplicating loops on one shard — if you need the burst
+    # gone too.
     class Throttle < Gate
       attr_reader :rate_proc, :per_proc
 
@@ -23,9 +35,24 @@ module DispatchPolicy
       # that is still being spent hands the tenant a fresh quota.
       attr_reader :static_per
 
+      # Bucket size when `rate` is a fixed number, nil when it is a proc.
+      # Paired with `static_refill_rate` it lets the sweeper work out what
+      # the bucket holds RIGHT NOW — the stored value plus the refill
+      # accrued since `refilled_at` — rather than trusting the stored
+      # snapshot, which nothing refreshes while a partition sits idle.
+      attr_reader :static_capacity
+
+      # Tokens per second, when BOTH knobs are fixed. Not derivable from
+      # `static_capacity`: a sub-unit rate floors the capacity at 1.0
+      # while still refilling at the true `rate`, so `capacity / per`
+      # would refill such a bucket twice as fast as the policy allows.
+      attr_reader :static_refill_rate
+
       def initialize(rate:, per:)
         super()
         @rate_proc = rate.respond_to?(:call) ? rate : ->(_ctx) { rate }
+        static_rate = rate.respond_to?(:call) ? nil : Float(rate || 0)
+        @static_capacity = static_rate&.positive? ? [static_rate, 1.0].max : nil
         if per.respond_to?(:call)
           # Dynamic window (per-ctx), symmetric with a dynamic rate. Validated
           # per-evaluate since the value isn't known until admission time.
@@ -37,6 +64,7 @@ module DispatchPolicy
           @per_proc   = ->(_ctx) { fixed }
           @static_per = fixed
         end
+        @static_refill_rate = @static_capacity && @static_per ? static_rate / @static_per : nil
       end
 
       def name
@@ -66,27 +94,43 @@ module DispatchPolicy
         elapsed     = [now - refilled_at, 0.0].max
         tokens      = [tokens + (elapsed * refill_rate), capacity].min
 
-        # The patch records the post-refill bucket WITHOUT deducting yet.
-        # The actual deduction is deferred to #consume, which runs once
-        # the admission TX knows how many staged rows were really claimed.
-        # Deducting `allowed` here over-charges the bucket whenever fewer
-        # jobs are admitted than allowed — a later gate capping admit_count,
-        # future-scheduled rows skipped by the `scheduled_at <= now()`
-        # filter, or rows another tick grabbed under SKIP LOCKED.
-        patch = { "tokens" => tokens, "refilled_at" => now }
+        # Nothing is written from here. The refill above is a pure
+        # function of the stored `refilled_at` and the clock, so
+        # persisting it buys nothing — and persisting it on the DENY path
+        # actively hurt: a deny landing after a concurrent admission
+        # overwrote the charged bucket with an uncharged refill, undoing
+        # the admission's cost. What the bucket owes is settled in the
+        # admission UPDATE instead, from the row's own value; `charge`
+        # carries the numbers that needs. `tokens` rides along so #consume
+        # can mirror the result in memory for the tick's second pass.
+        #
+        # `now` travels with it because the bucket must be read and
+        # written on ONE clock. The charge recomputes the refill in SQL,
+        # but from THIS timestamp — not from Postgres `now()`. Mixing the
+        # two means the app clock refills a bucket the database clock
+        # stamped: an offset O between them silently adds O * refill_rate
+        # phantom tokens to every evaluate, and `now()` is the
+        # TRANSACTION timestamp, so an enclosing transaction (Rails
+        # transactional tests, a host wrapping the tick) freezes it while
+        # `config.now` keeps moving.
+        charge = { capacity:    capacity,
+                   refill_rate: refill_rate,
+                   tokens:      tokens,
+                   now:         now }
 
-        whole = tokens.floor
-        if whole.zero?
-          missing      = 1.0 - tokens
-          retry_after  = missing / refill_rate
+        # Under one whole token, not `floor == 0`: the bucket can be
+        # NEGATIVE now that a concurrent over-admission is repaid rather
+        # than forgiven, and a debt is even less admissible than an empty
+        # bucket. `missing` is then > 1 and the backoff covers the debt.
+        if tokens < 1.0
+          missing = 1.0 - tokens
           return Decision.new(allowed: 0,
-                              retry_after: retry_after,
-                              gate_state_patch: { "throttle" => patch },
+                              retry_after: missing / refill_rate,
                               reason: "throttle_empty")
         end
 
-        allowed = [whole, admit_budget].min
-        Decision.new(allowed: allowed, gate_state_patch: { "throttle" => patch })
+        allowed = [tokens.floor, admit_budget].min
+        Decision.new(allowed: allowed, charge: charge)
       end
 
       # Settles the bucket against the number of jobs actually admitted.
@@ -94,12 +138,18 @@ module DispatchPolicy
       # patch; here we subtract exactly `admitted_count` (≤ allowed), so
       # the bucket is charged for jobs that really left, never for unspent
       # budget. Called by Pipeline.settle after the claim.
+      # The persisted value is computed in SQL (see the `charge` above);
+      # what this returns is the in-memory mirror the Tick applies to the
+      # partition it is holding, so the second admission pass in the same
+      # tick evaluates against a bucket that already reflects the first.
+      # Without it pass-2 would re-read the pre-admission count and hand
+      # out the same tokens twice inside one tick.
       def consume(decision, admitted_count)
-        st = decision.gate_state_patch && decision.gate_state_patch["throttle"]
-        return nil unless st
+        c = decision.charge
+        return nil unless c
 
-        { "throttle" => { "tokens"      => st["tokens"].to_f - admitted_count,
-                          "refilled_at" => st["refilled_at"] } }
+        { "throttle" => { "tokens"      => c[:tokens] - admitted_count,
+                          "refilled_at" => c[:now] } }
       end
 
       private

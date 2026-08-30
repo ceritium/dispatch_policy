@@ -72,7 +72,9 @@ module DispatchPolicy
       # reflects what would actually be admitted first, not the reverse.
       @recent_jobs = StagedJob
         .for_partition(@partition.policy_name, @partition.partition_key)
-        .order(Arel.sql("priority DESC, scheduled_at ASC NULLS FIRST, id ASC"))
+        # Mirrors claim_staged_jobs! exactly (audit L9): the list is
+        # "what comes out next", so the two orders must not drift.
+        .order(Arel.sql("priority ASC, scheduled_at ASC NULLS FIRST, id ASC"))
         .limit(50)
       # The whole policy may be paused even if this partition's own status
       # is 'active' (it was created after the pause). claim_partitions skips
@@ -100,11 +102,13 @@ module DispatchPolicy
     # huge backlog can't time the controller out — the operator clicks again
     # for the next batch.
     def drain
-      drained, due_remaining, scheduled_remaining =
+      drained, due_remaining, scheduled_remaining, failed =
         self.class.drain_partition!(@partition)
 
       notice =
-        if due_remaining.positive?
+        if failed
+          "Drained #{drained} job(s); this partition's next job could not be forwarded — see logs."
+        elsif due_remaining.positive?
           "Drained #{drained} job(s); #{due_remaining} still pending — click drain again to continue."
         elsif scheduled_remaining.positive?
           # The claim only picks up rows whose scheduled_at has arrived, so
@@ -119,19 +123,42 @@ module DispatchPolicy
 
     # Force-admits up to DRAIN_MAX_PER_REQUEST due jobs in DRAIN_BATCH_SIZE
     # batches. Optional `cap` lets the policy-wide drain bound the TOTAL
-    # across partitions. Returns [drained, due_remaining, scheduled_remaining]
-    # — due_remaining is claimable-now work the cap left behind;
-    # scheduled_remaining is future-scheduled rows the claim can't touch yet.
+    # across partitions. Returns [drained, due_remaining, scheduled_remaining,
+    # failed] — due_remaining is claimable-now work the cap left behind;
+    # scheduled_remaining is future-scheduled rows the claim can't touch
+    # yet; failed says a batch raised and this partition was abandoned.
+    #
+    # The rescue is the isolation `Tick#admit_partition` already gives the
+    # automatic path, and the drain button needs it more: it is what an
+    # operator reaches for precisely when something is wrong. One
+    # undeserialisable row — a job class renamed or deleted in a deploy
+    # while its staged rows are still around — made `Forwarder.dispatch`
+    # raise NameError out of the controller as a bare 500: no flash, no
+    # partition name, no count, nothing drained, and every healthy
+    # partition behind it never reached, on every click. The raise itself
+    # stays where it is; that is what rolls the claim TX back and saves
+    # the staged rows. Break rather than continue, too: the poison row is
+    # at the head of the queue, so retrying the same batch would spin.
     def self.drain_partition!(partition, cap: DRAIN_MAX_PER_REQUEST)
       cap     = [cap, DRAIN_MAX_PER_REQUEST].min
       drained = 0
+      failed  = false
       while drained < cap
         batch_limit = [DRAIN_BATCH_SIZE, cap - drained].min
-        forwarded   = ManualAdmission.force!(
-          policy_name:   partition.policy_name,
-          partition_key: partition.partition_key,
-          limit:         batch_limit
-        )
+        begin
+          forwarded = ManualAdmission.force!(
+            policy_name:   partition.policy_name,
+            partition_key: partition.partition_key,
+            limit:         batch_limit
+          )
+        rescue StandardError => e
+          DispatchPolicy.config.logger&.error(
+            "[dispatch_policy] drain failed for " \
+            "#{partition.policy_name}/#{partition.partition_key}: #{e.class}: #{e.message}"
+          )
+          failed = true
+          break
+        end
         break if forwarded.zero?
 
         drained += forwarded
@@ -140,7 +167,7 @@ module DispatchPolicy
       scope               = StagedJob.for_partition(partition.policy_name, partition.partition_key)
       due_remaining       = scope.due.count
       scheduled_remaining = scope.count - due_remaining
-      [drained, due_remaining, scheduled_remaining]
+      [drained, due_remaining, scheduled_remaining, failed]
     end
 
     private
