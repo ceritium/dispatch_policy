@@ -17,6 +17,16 @@ class CreateDispatchPolicyTables < ActiveRecord::Migration[7.1]
               [:policy_name, :partition_key, :scheduled_at, :id],
               name: "idx_dp_staged_admission",
               order: { scheduled_at: "ASC NULLS FIRST", id: :asc }
+    # The claim orders `priority ASC, scheduled_at NULLS FIRST, id`, which
+    # the index above cannot serve — priority is not in it — so a deep
+    # backlog in one partition sorts itself on every admission. Keep BOTH:
+    # `defer_partition_to_next_scheduled!` takes MIN(scheduled_at) over
+    # future rows, which needs scheduled_at third and this one cannot
+    # serve either.
+    add_index :dispatch_policy_staged_jobs,
+              [:policy_name, :partition_key, :priority, :scheduled_at, :id],
+              name:  "idx_dp_staged_claim_order",
+              order: { scheduled_at: "ASC NULLS FIRST", id: :asc }
     add_index :dispatch_policy_staged_jobs, :enqueued_at,
               name: "idx_dp_staged_enqueued_at"
 

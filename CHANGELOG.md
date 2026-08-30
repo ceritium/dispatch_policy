@@ -12,6 +12,10 @@
   ALTER TABLE dispatch_policy_partitions
     ADD COLUMN scheduled_eligible_at timestamp(6) without time zone;
 
+  CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_dp_staged_claim_order
+    ON dispatch_policy_staged_jobs
+    (policy_name, partition_key, priority, scheduled_at ASC NULLS FIRST, id ASC);
+
   CREATE INDEX CONCURRENTLY idx_dp_partitions_scheduled_order
     ON dispatch_policy_partitions
     (policy_name, shard, status, scheduled_eligible_at NULLS FIRST,
@@ -22,7 +26,17 @@
   so an upgraded install matches a fresh one; using `timestamptz` instead
   works at runtime but leaves this one column disagreeing with the eight
   others on the table and with every fresh install's schema dump. The
-  index matters once the table is large and most of the work is
+  `idx_dp_staged_claim_order` matters once any single partition holds a
+  deep backlog: the claim orders by `priority`, which no existing index
+  covers, so it sorts the partition's whole backlog on every admission —
+  measured at 118 ms and 13.7 MB of temp files to return 200 ids from a
+  500k-row partition, twice per tick. Both CREATE INDEX statements are
+  CONCURRENTLY because `dispatch_policy_staged_jobs` is the write-hot
+  enqueue-path table; run them outside a transaction. Do not drop
+  `idx_dp_staged_admission` in favour of the new one — the scheduled-work
+  park needs `scheduled_at` third and the new index cannot serve it.
+
+  The partitions index matters once the table is large and most of the work is
   `set(wait:)`-scheduled: `claim_partitions` filters on both horizons, and
   without it the parked rows are eliminated by a heap filter. It is not
   free — the claim rewrites `last_checked_at` on every pass, so the table
