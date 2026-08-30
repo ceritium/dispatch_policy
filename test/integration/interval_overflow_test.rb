@@ -98,4 +98,24 @@ class IntervalOverflowTest < DispatchPolicy::IntegrationTest
 
     refute_nil next_eligible("debtor")
   end
+  # The multiply raises the ceiling ~4295x but does not remove it:
+  # `interval` stores microseconds in an int64, so it still raises past
+  # ~9.22e12 seconds. That is ~3e7 drained jobs on this policy and ~292k
+  # on `rate: 1, per: 1.year` — far, but a backoff nobody clamps is a
+  # backoff waiting to take the deny flush down again.
+  def test_an_absurd_backoff_is_clamped_rather_than_raised
+    seed_partition!("absurd")
+
+    DispatchPolicy::Repository.bulk_record_partition_denies!([{
+      policy_name: POLICY, partition_key: "absurd",
+      gate_state_patch: {}, retry_after: 1e14
+    }])
+
+    eligible = next_eligible("absurd")
+    refute_nil eligible
+    assert_operator eligible, :<, 100.years.from_now,
+                    "clamped to MAX_BACKOFF_SECONDS, not stored as written"
+    assert_operator eligible, :>, 10.years.from_now,
+                    "and still a very long backoff — the clamp is a ceiling, not a reset"
+  end
 end

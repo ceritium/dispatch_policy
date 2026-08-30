@@ -67,7 +67,12 @@
   batch. Those partitions were then re-claimed on every tick with
   nothing recorded — the M4 busy-loop, for a whole policy, from one UI
   click, silent but for a single log line. Both clauses multiply an
-  interval instead, which takes the full double range.
+  interval instead — and clamp first, at `MAX_BACKOFF_SECONDS` (1e9, about
+  31 years). The multiply raises the ceiling ~4295x but does not remove
+  it: `interval` stores microseconds in an int64, so it still raises past
+  ~9.22e12 seconds, which a `rate: 1, per: 1.year` policy reaches at
+  ~292k drained jobs. A backoff longer than the clamp is not a backoff
+  anyone will outlive anyway.
 
 - **A job that dies before `around_perform` releases its slot even
   without `discard_on`.** The railtie reaped the Tick's pre-inserted

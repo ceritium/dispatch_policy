@@ -61,16 +61,18 @@ class InflightTrackerDiscardTest < Minitest::Test
   def test_a_beat_releases_its_connection_inside_the_configured_role
     DispatchPolicy.config.database_role = :queue
 
-    depth       = 0
-    released_at = nil
+    open_roles    = []
+    released_under = :never_ran
     connected_to = lambda do |role:, &blk|
-      depth += 1
+      open_roles.push(role)
       blk.call
     ensure
-      depth -= 1
+      open_roles.pop
     end
     pool = Object.new
-    pool.define_singleton_method(:release_connection) { released_at = depth }
+    # The role, not just the nesting depth: releasing under a hardcoded
+    # :writing would nest just as deep and still aim at the wrong pool.
+    pool.define_singleton_method(:release_connection) { released_under = open_roles.last }
 
     DispatchPolicy::Repository.stub(:heartbeat_inflight!, nil) do
       ActiveRecord::Base.stub(:connected_to, connected_to) do
@@ -80,8 +82,9 @@ class InflightTrackerDiscardTest < Minitest::Test
       end
     end
 
-    assert_equal 1, released_at,
-                 "released outside the role block, i.e. against the wrong pool"
+    assert_equal :queue, released_under,
+                 "the lease belongs to the role's pool; releasing under any other " \
+                 "role — including outside the block, where it is :writing — leaks it"
   ensure
     DispatchPolicy.reset_config!
   end

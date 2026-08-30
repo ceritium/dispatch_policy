@@ -222,4 +222,32 @@ class ScheduledBackoffTest < DispatchPolicy::IntegrationTest
     DispatchPolicy::Tick.run(policy_name: "scheduled_backoff")
     assert_equal 1, DispatchPolicy::StagedJob.count, "the due job goes out on the next tick"
   end
+  # The guard is `scheduled_at IS NULL OR scheduled_at <= now()`, and the
+  # test above only pins the first half — narrowing the SQL to just
+  # `IS NULL` leaves the whole suite green. The second half is the
+  # ordinary case: any `set(wait:)` job the moment it comes due.
+  def test_the_park_sees_a_scheduled_job_that_has_just_come_due
+    ScheduledJob.set(wait: 1.week).perform_later
+    ScheduledJob.set(wait: 1.second).perform_later
+    soon_id = DispatchPolicy::StagedJob.order(:scheduled_at).first.id
+    sleep 1.1 # it is now due, and carries a timestamp rather than NULL
+
+    other = ActiveRecord::Base.connection_pool.checkout
+    begin
+      other.begin_db_transaction
+      other.exec_query("SELECT id FROM dispatch_policy_staged_jobs WHERE id = #{soon_id} FOR UPDATE")
+
+      DispatchPolicy::Tick.run(policy_name: "scheduled_backoff")
+    ensure
+      other.rollback_db_transaction
+      ActiveRecord::Base.connection_pool.checkin(other)
+    end
+
+    horizon = partition.scheduled_eligible_at
+    # Not assert_nil: the enqueue wrote this row's own due time into the
+    # horizon and nothing clears a past one — what matters is that the
+    # park did not push it a week out.
+    assert(horizon.nil? || horizon <= Time.current,
+           "a due row exists; parking past it strands the job for a week")
+  end
 end

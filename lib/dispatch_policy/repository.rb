@@ -524,7 +524,7 @@ module DispatchPolicy
           e[:policy_name],
           e[:partition_key],
           JSON.dump(e[:gate_state_patch] || {}),
-          e[:retry_after].nil? ? nil : e[:retry_after].to_f.round(3)
+          e[:retry_after].nil? ? nil : clamp_backoff(e[:retry_after])
         )
       end
 
@@ -1227,14 +1227,34 @@ module DispatchPolicy
       end
     end
 
+    # A backoff longer than this is not a backoff, it is a partition
+    # nobody will look at again this century — and every way of writing an
+    # interval in Postgres has a ceiling somewhere, so pick one that is
+    # ours rather than one that raises. 1e9 seconds is ~31 years.
+    MAX_BACKOFF_SECONDS = 1_000_000_000.0
+
+    # Clamp before the value reaches SQL. Both callers build an interval
+    # from it, and both are on paths where a raise is expensive: the deny
+    # flush is ONE statement for the whole tick and `Tick#flush_denies!`
+    # only logs, so one bad value discards every denied partition's
+    # backoff AND gate_state patch in that batch — the M4 busy-loop, for a
+    # whole policy.
+    def clamp_backoff(seconds)
+      [seconds.to_f, MAX_BACKOFF_SECONDS].min.round(3)
+    end
+
     # Multiplication, not `(n || ' seconds')::interval`. Postgres' interval
     # INPUT PARSER rejects a seconds field above INT_MAX, and a backoff is
     # derived from a token debt, which has no such bound: a forced
     # admission charges the bucket for everything it forwarded, so
     # `retry_after = (1 - tokens) / refill_rate` crosses INT_MAX after
     # roughly `2.147e9 * rate/per` jobs — about 7,100 for a
-    # `rate: 2, per: 7.days` policy, well inside one drain click. The
-    # multiply accepts the full double range instead.
+    # `rate: 2, per: 7.days` policy, well inside one drain click.
+    #
+    # The multiply raises that ceiling ~4295x; it does not remove it.
+    # `interval` stores microseconds in an int64, so the value still has
+    # to stay under ~9.22e12 seconds, which is why `clamp_backoff` exists
+    # rather than trusting the arithmetic.
     #
     # This is not cosmetic. The same expression in
     # `bulk_record_partition_denies!` builds ONE statement for the whole
@@ -1248,7 +1268,7 @@ module DispatchPolicy
         ["NULL", []]
       else
         # 5th param ($5) — caller appends params to those of the parent UPDATE
-        ["now() + ($5 * interval '1 second')", [retry_after.to_f.round(3)]]
+        ["now() + ($5 * interval '1 second')", [clamp_backoff(retry_after)]]
       end
     end
 
@@ -1280,7 +1300,7 @@ module DispatchPolicy
     ROLE_ROUTING_EXCLUDED = %i[
       connection with_connection
       normalize_partition normalize_staged parse_jsonb
-      sample_filter next_eligible_clause trend_direction
+      sample_filter next_eligible_clause trend_direction clamp_backoff
     ].freeze
 
     (singleton_methods(false) - ROLE_ROUTING_EXCLUDED).each do |method_name|
