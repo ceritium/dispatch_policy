@@ -336,6 +336,15 @@ dispatch_policy_policy_settings               one row per policy — pause flag
   `lib/dispatch_policy/*` requires restarting foreman.
 - Foreman defaults `PORT=5000`. On macOS port 5000 is AirPlay → 403.
   The Procfile pins `-p 3000`.
+- **`.ruby-version` (3.2.2) is NOT the supported floor.** The gemspec
+  still says `>= 3.1.0` and CI still runs the 3.1 leg — that matrix row
+  exists precisely to prove the floor. Local dev moved off 3.1.4 because
+  it does not build on current macOS: `ext/socket` fails silently, so
+  `rbenv` reports success and you get a Ruby whose `require "socket"`
+  raises, which takes `openssl`, bundler and `pg` down with it. Do not
+  "align" the two by raising the gemspec floor or dropping the CI row —
+  the cost of the split is that a 3.2-only idiom compiles locally and is
+  caught only by CI, which is the right place for it to be caught.
 
 ## How to develop
 
