@@ -107,11 +107,14 @@
   pod cannot yet resolve a class the web pods already stage for. A
   terminal hold would turn that deploy into a silent, permanent drop of
   that class's whole backlog — worse than the visible, self-healing stall
-  it replaced. A class that really is gone simply re-quarantines. Only an
-  unresolvable `job_class` triggers it (`NoMethodError` is a `NameError`,
-  so a custom argument serializer touching a nil used to land in the same
-  bucket), the dashboard counts held-back rows in their own tile rather
-  than as backlog, and an operator hint names them.
+  it replaced. A class that really is gone simply re-quarantines. Any row
+  the tick process cannot deserialize triggers it, not just an
+  unresolvable `job_class` — anything narrower escapes to the tick's
+  generic rescue, which writes no `failed_at`, so nothing releases the row
+  and it heads every claim of that partition forever. The dashboard counts
+  held-back rows in their own tile rather than as backlog, and an operator
+  hint names them — saying plainly that the hold does NOT expire when
+  `quarantine_retry_after` or `sweep_every_ticks` is 0.
 
   Put them back sooner with the Requeue button on the
   partition page (`Repository.requeue_quarantined_jobs!`), which restores

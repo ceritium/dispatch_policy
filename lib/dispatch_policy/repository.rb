@@ -126,6 +126,11 @@ module DispatchPolicy
     # headroom. A single perform_all_later with more rows than this would
     # otherwise blow the limit and fail the whole batch.
     STAGE_MANY_BATCH = 1_000
+    # Partitions per quarantine-release transaction. Same bind ceiling,
+    # plus a lock-hold bound: one transaction over every held partition
+    # was measured holding FOR UPDATE for 10s on 60k keys, with a
+    # concurrent perform_later blocked behind it the whole time.
+    QUARANTINE_RELEASE_BATCH = 1_000
 
     def stage_many!(rows)
       return 0 if rows.empty?
@@ -404,8 +409,6 @@ module DispatchPolicy
     # Locks byte-ordered first, like `bulk_record_partition_denies!`: this
     # writes many partition rows in one statement, and one statement locks
     # in heap order, which deadlocks against `stage_many!`.
-    QUARANTINE_RELEASE_BATCH = 1_000
-
     def release_aged_quarantines!(policy_name:, older_than:)
       keys = connection.exec_query(
         <<~SQL.squish,
@@ -422,10 +425,11 @@ module DispatchPolicy
       # per key hits Postgres' 65,535-parameter ceiling, and one
       # transaction over every key holds FOR UPDATE on all of them for the
       # whole loop — measured at ~0.5s on 2,500 partitions, with a
-      # concurrent perform_later blocked 453ms behind it. The keys are
-      # already byte-sorted, so slicing preserves the lock order
-      # `stage_many!` needs, and partial progress is harmless: the next
-      # sweep re-selects whatever is left.
+      # concurrent perform_later blocked 453ms behind it. The lock order
+      # that matters is WITHIN a slice's statement, since each slice
+      # commits before the next one locks; the `.sort` above is what makes
+      # each slice's own ORDER BY agree with `stage_many!`. Partial
+      # progress is harmless: the next sweep re-selects whatever is left.
       released = 0
       keys.each_slice(QUARANTINE_RELEASE_BATCH) do |slice|
         connection.transaction(requires_new: true) do

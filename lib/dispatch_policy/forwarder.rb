@@ -106,25 +106,27 @@ module DispatchPolicy
     # not have yet. So the row is held back rather than failed, and
     # `TickLoop.sweep!` releases the hold on a cadence.
     #
-    # `NameError` broadly, not just `UnresolvableJobClass`. Narrowing it
-    # reopens the wedge this exists to prevent: anything else out of
+    # Every deserialize failure, not just `UnresolvableJobClass`. Narrowing
+    # it reopens the wedge this exists to prevent: anything else out of
     # `klass.deserialize` escapes to Tick's generic rescue, which only
     # queues a backoff — no `failed_at`, so nothing releases it, and the
-    # row heads every subsequent claim of that partition forever. Now
-    # that the hold EXPIRES, holding a transient failure for an hour is
-    # strictly better than wedging the partition permanently. The
-    # narrowing was argued from custom argument serializers, which do not
-    # run here at all: `Base.deserialize` only stores
-    # @serialized_arguments. `UnresolvableJobClass` stays first because it
-    # is the case worth naming in the log. Raising a plain NameError here rolls the batch back
-    # (correct — that rollback is the at-least-once guarantee) and leaves
-    # the row at the head of the claim, where it poisons every subsequent
-    # admission of that partition forever, healthy neighbours included.
+    # row heads every subsequent claim of that partition forever, healthy
+    # neighbours included. Two reachable examples with no custom code: a
+    # `scheduled_at` stored as a Float by an older Rails makes stock
+    # `deserialize_time` raise TypeError, and an override reading a field
+    # a pre-upgrade payload lacks raises KeyError. Neither is a NameError.
+    # Now that the hold EXPIRES, holding a transient failure for one
+    # `quarantine_retry_after` window is strictly better than wedging the
+    # partition permanently. `UnresolvableJobClass` stays listed first
+    # because it is the case worth naming in the log, not because the
+    # rescue is narrower. Nothing else runs in this method — the adapter
+    # enqueue and the savepoint are in `dispatch`/`enqueuing_inline` — so
+    # widening it cannot swallow an adapter or transaction error.
     # UndeliverableJob names the offending ids so the caller can
     # quarantine exactly those and admit the rest.
     def deserialize!(row)
       Serializer.deserialize(row["job_data"])
-    rescue UnresolvableJobClass, NameError, InvalidPolicy => e
+    rescue UnresolvableJobClass, StandardError => e
       raise UndeliverableJob.new(
         "staged row #{row['id']} (#{row['job_class']}): #{e.class}: #{e.message}",
         staged_ids: [row["id"]]

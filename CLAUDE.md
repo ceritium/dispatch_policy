@@ -353,7 +353,7 @@ dispatch_policy_policy_settings               one row per policy — pause flag
   hold. `bulk_record_partition_denies!` does NOT touch the decay
   (no admission means no increment).
 - **A staged row this process cannot deliver is HELD, not failed.** `Forwarder.dispatch` raises `UndeliverableJob` (carrying the
-  staged ids) when `job_class.constantize` fails, and both admission
+  staged ids) when the row cannot be deserialized, and both admission
   paths mark those rows `failed_at` outside the rolled-back transaction,
   decrement `pending_count`, and retry the admission ONCE. Without it the
   row sits at the head of its partition's claim order forever and the
@@ -371,13 +371,24 @@ dispatch_policy_policy_settings               one row per policy — pause flag
   a partition whose only remaining rows are quarantined.
   The hold EXPIRES — `TickLoop.sweep!` releases anything older than
   `config.quarantine_retry_after`. Do not make it terminal: the trigger
-  is "this process cannot resolve the class", and the ordinary cause is a
-  rolling deploy whose tick pod is a release behind the web pods, which
+  is "this process cannot deserialize the row", and the ordinary cause is
+  a rolling deploy whose tick pod is a release behind the web pods, which
   fixes itself minutes later. A terminal hold drops that class's whole
   backlog silently and for good, which is the at-least-once violation the
-  admission TX exists to prevent. Only an unresolvable job_class triggers
-  it; `NoMethodError` is a `NameError`, so anything a custom serializer
-  does downstream must NOT be caught here.
+  admission TX exists to prevent. **Any** deserialize failure is held, not
+  just an unresolvable constant: narrowing the rescue lets everything else
+  escape to `Tick`'s generic rescue, which queues a backoff but writes no
+  `failed_at`, so nothing ever releases the row and it heads every
+  subsequent claim of that partition forever. Two triggers need no custom
+  code at all — a `scheduled_at` stored as a Float by an older Rails makes
+  stock `deserialize_time` raise `TypeError`, and a `deserialize` override
+  reading a field a pre-upgrade payload lacks raises `KeyError`; neither
+  is a `NameError`. Now that the hold expires, holding a transient failure
+  for one `quarantine_retry_after` window beats wedging a partition
+  permanently. `UnresolvableJobClass` stays a distinct class only so the
+  log names the ordinary case — it is not a narrower rescue. Pinned by
+  `test_a_deserialize_failure_that_is_not_a_name_error_is_held_too`; this
+  rescue has been narrowed and reverted twice already.
 - **Every multi-row writer of `partitions` takes its locks in
   `(policy_name, partition_key)` BYTE order.** Which collation is not a
   detail: `stage_many!` sorts in Ruby, i.e. `String#<=>`, i.e. bytes, so

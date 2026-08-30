@@ -29,6 +29,8 @@ module DispatchPolicy
     #   in_backoff:             int
     #   total_partitions:       int
     #   adapter_target_jps:     int|nil  (config.adapter_throughput_target)
+    #   quarantine_auto_release: bool (defaults true; false when the
+    #                           sweeper or the retry window is disabled)
     #   paused:                 bool (policy-level pause flag)
     def for(metrics)
       hints = []
@@ -61,13 +63,28 @@ module DispatchPolicy
 
       # ---- backlog drain time ----------------------------------------
       if m[:quarantined].to_i.positive?
+        # `quarantine_retry_after = 0` ("hold forever") and
+        # `sweep_every_ticks <= 0` ("never sweep") are both documented
+        # settings, and either one means the release never runs. Promising
+        # an automatic retry there is the same defect class as a hint that
+        # crashes the page: the operator waits for something that is not
+        # coming. `fetch` with a true default, not `[]`, because
+        # auto-release is the shipped behaviour and callers that omit the
+        # key must keep the ordinary text.
+        tail =
+          if m.fetch(:quarantine_auto_release, true)
+            "A rolling deploy clears itself — the hold is retried automatically after " \
+              "quarantine_retry_after. A row that is really broken stays here; open the " \
+              "partition to see which, and Requeue to retry sooner."
+          else
+            "The hold does not expire in this configuration (quarantine_retry_after or " \
+              "sweep_every_ticks is 0): open the partition to see which, and Requeue — " \
+              "that is the only way out."
+          end
         hints << Hint.new(
           level:   :warn,
           message: "#{m[:quarantined]} staged job(s) are held back: this process could not " \
-                   "resolve their job class. A rolling deploy clears itself — the hold is " \
-                   "retried automatically after quarantine_retry_after. A class that is " \
-                   "really gone stays here; open the partition to see which, and Requeue " \
-                   "to retry sooner."
+                   "deserialize them. #{tail}"
         )
       end
 

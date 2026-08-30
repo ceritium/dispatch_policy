@@ -153,6 +153,18 @@ class DenyLockOrderTest < DispatchPolicy::IntegrationTest
     assert_equal 2, locks.size,
                  "one statement for #{keys.size} keys hits the bind ceiling and holds " \
                  "every lock for the whole loop"
+
+    # The slice COUNT alone does not pin the fix: hoisting the transaction
+    # around the loop still emits two lock statements while putting the
+    # whole sweep back under one FOR UPDATE hold. The shape does.
+    shape = seen.filter_map do |p|
+      next p[:sql].strip[0, 6] if p[:name] == "TRANSACTION"
+
+      "LOCK" if p[:name] == "lock_partitions_for_quarantine_release"
+    end
+    assert_equal %w[BEGIN LOCK COMMIT BEGIN LOCK COMMIT], shape,
+                 "one transaction per slice, so a slow release never holds every " \
+                 "partition's row lock for the whole pass"
     assert_equal keys.size, DispatchPolicy::StagedJob.deliverable.count
   end
 end

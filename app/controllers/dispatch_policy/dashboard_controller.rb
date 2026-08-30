@@ -46,6 +46,10 @@ module DispatchPolicy
         max_tick_ms:          @capacity[:max_tick_ms],
         pending_total:        @totals[:staged],
         quarantined:          @totals[:quarantined],
+        # Both are documented as "off" values, and either one stops the
+        # hold from ever expiring — so the hint must not promise a retry.
+        quarantine_auto_release: cfg.quarantine_retry_after.to_i.positive? &&
+                                 cfg.sweep_every_ticks.to_i.positive?,
         admitted_per_minute:  @capacity[:admitted_per_minute],
         forward_failures:     @windows["1m"][:forward_failures],
         jobs_admitted:        @windows["1m"][:jobs_admitted],

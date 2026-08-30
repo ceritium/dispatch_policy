@@ -272,3 +272,26 @@ or have the gate record its own saturation observation from `evaluate`.
 column-plus-plumbing version is a schema change that wants a real
 workload to justify its shape. Worth doing if someone reports a cap
 sitting at `max` on a partition that never actually saturates.
+
+## Bound the quarantine release's total wall time
+
+**Symptom.** `Repository.release_aged_quarantines!` selects every held
+partition for a policy with no `LIMIT`, then releases them a slice at a
+time. Slicing bounded the two things that hurt others — the 65,535-bind
+ceiling and the FOR UPDATE hold, now ~200ms per slice instead of the
+whole pass — but not the total: measured at ~12.5s for 70,000 held
+partitions, and the sweep runs inside the tick loop, so that is 12.5s the
+loop is not admitting anything.
+
+**Possible design.** Cap the SELECT (`LIMIT n * QUARANTINE_RELEASE_BATCH`)
+and let the next sweep pick up the rest; the release is already
+idempotent and its partial progress already converges, so a cap costs
+only latency on the tail. The open question is the cap's shape — a fixed
+number, or derived from `tick_max_duration` so a slow database doesn't
+overshoot the tick deadline.
+
+**Why deferred.** It needs 70k simultaneously-held partitions to matter,
+which means a deploy that broke deserialization for a large fraction of
+a policy's tenants at once. At that point the 12.5s stall is not the
+operator's biggest problem. Worth doing if anyone reports a sweep
+visibly stalling the loop.

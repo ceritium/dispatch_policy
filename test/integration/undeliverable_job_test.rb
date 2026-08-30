@@ -216,10 +216,11 @@ class UndeliverableJobTest < DispatchPolicy::IntegrationTest
                  "releasing the hold must not lose the row either"
   end
 
-  # NoMethodError is a NameError, so anything a custom argument serializer
-  # does downstream would otherwise land in the same permanent-looking
-  # bucket as a missing constant. Only the job_class lookup counts.
-  def test_only_an_unresolvable_job_class_is_held_back
+  # The Serializer wraps ONLY the constantize, so the log can name the
+  # ordinary missing-class case. That split is about the error class, not
+  # about what gets held: the Forwarder holds the row for any deserialize
+  # failure — see the two tests below.
+  def test_the_serializer_only_wraps_the_class_lookup
     err = assert_raises(NoMethodError) do
       DispatchPolicy::Serializer.deserialize(
         { "job_class" => LiveJob.name, "arguments" => nil, "boom" => true }.tap do |p|
@@ -269,6 +270,59 @@ class UndeliverableJobTest < DispatchPolicy::IntegrationTest
     assert_match(/staged:\s+StagedJob\.deliverable\.count/, source,
                  "counting held rows as staged is what made the tile lie")
     assert_match(/quarantined:\s+StagedJob\.quarantined\.count/, source)
+  end
+  # `String.deserialize` raises NoMethodError, which IS a NameError — so a
+  # rescue listing NameError catches it and the test above passes either
+  # way. Most of what `klass.deserialize` can raise is not a NameError at
+  # all, and stock ActiveJob supplies the cheapest example: a
+  # `scheduled_at` stored as a Float (what Rails <= 7.1 wrote) makes
+  # `deserialize_time` raise TypeError. Uncaught, that escapes to the
+  # Tick's generic rescue, which queues a backoff and writes no
+  # `failed_at` — so nothing releases the row and it heads every claim of
+  # that partition forever, healthy neighbours included. That is the
+  # wedge, reopened from the far side.
+  def test_a_deserialize_failure_that_is_not_a_name_error_is_held_too
+    DispatchPolicy::Repository.stage!(
+      policy_name: "undeliverable", partition_key: "k", queue_name: nil,
+      job_class: LiveJob.name,
+      job_data: LiveJob.new.serialize.merge("scheduled_at" => Time.now.to_f),
+      context: {}
+    )
+    stage!(LiveJob.name)
 
+    DispatchPolicy::Tick.run(policy_name: "undeliverable")
+
+    held = DispatchPolicy::StagedJob.quarantined
+    assert_equal 1, held.count,
+                 "not held means not released either — it wedges the partition forever"
+    refute_match(/NameError/, held.first.failure_reason,
+                 "if this is a NameError the test proves nothing the sibling did not")
+    assert_equal 0, DispatchPolicy::StagedJob.deliverable.count,
+                 "and the healthy row behind it still goes out"
+  end
+  # The release runs FIRST inside `sweep_inactive_partitions!`, so without
+  # its own rescue anything it raises — a deadlock against `stage_many!`
+  # is the realistic one — takes the whole sweep with it: no partition GC,
+  # no tick-sample retention, no adaptive-stat GC. A condition that does
+  # not clear itself does that on every sweep for the life of the process,
+  # silently, because `sweep!`'s outer rescue only logs.
+  def test_a_failed_quarantine_release_does_not_take_the_rest_of_the_sweep_with_it
+    DispatchPolicy::Repository.record_tick_sample!(
+      policy_name: "undeliverable", duration_ms: 1, partitions_seen: 0,
+      partitions_admitted: 0, partitions_denied: 0, jobs_admitted: 0,
+      forward_failures: 0, pending_total: 0, inflight_total: 0, denied_reasons: {}
+    )
+    ActiveRecord::Base.connection.execute(
+      "UPDATE dispatch_policy_tick_samples SET sampled_at = now() - interval '48 hours'"
+    )
+
+    boom = ->(**) { raise ActiveRecord::Deadlocked, "release lost the tie" }
+    DispatchPolicy::Repository.stub(:release_aged_quarantines!, boom) do
+      DispatchPolicy::TickLoop.sweep!
+    end
+
+    assert_equal 0, DispatchPolicy::TickSample.count,
+                 "the retention sweep runs after the release; one rescue for the whole " \
+                 "pass means a wedged release stops every other sweep forever"
   end
 end
