@@ -30,10 +30,8 @@ module DispatchPolicy
       return if rows.empty?
 
       scheduled, immediate = rows.partition { |row| row["scheduled_at"] }
-      immediate_jobs = immediate.map { |row| Serializer.deserialize(row["job_data"]) }
-      scheduled_jobs = scheduled.map do |row|
-        [Serializer.deserialize(row["job_data"]), enqueue_wait_until(row)]
-      end
+      immediate_jobs = immediate.map { |row| deserialize!(row) }
+      scheduled_jobs = scheduled.map { |row| [deserialize!(row), enqueue_wait_until(row)] }
 
       enqueuing_inline(immediate_jobs + scheduled_jobs.map(&:first)) do
         if immediate_jobs.any?
@@ -100,6 +98,23 @@ module DispatchPolicy
     def defers_its_own_enqueue?(job)
       job.class.respond_to?(:enqueue_after_transaction_commit) &&
         job.class.enqueue_after_transaction_commit
+    end
+
+    # A row whose job_class no longer resolves can never be delivered: the
+    # deploy that renamed or dropped the constant is not coming back on
+    # the next tick. Raising a plain NameError here rolls the batch back
+    # (correct — that rollback is the at-least-once guarantee) and leaves
+    # the row at the head of the claim, where it poisons every subsequent
+    # admission of that partition forever, healthy neighbours included.
+    # UndeliverableJob names the offending ids so the caller can
+    # quarantine exactly those and admit the rest.
+    def deserialize!(row)
+      Serializer.deserialize(row["job_data"])
+    rescue NameError, InvalidPolicy => e
+      raise UndeliverableJob.new(
+        "staged row #{row['id']} (#{row['job_class']}): #{e.class}: #{e.message}",
+        staged_ids: [row["id"]]
+      )
     end
 
     def enqueue_wait_until(row)

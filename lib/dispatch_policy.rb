@@ -36,6 +36,19 @@ module DispatchPolicy
   class InvalidPolicy < Error; end
   class EnqueueFailed < Error; end
 
+  # A staged row that can never be delivered, however many times it is
+  # retried — today, a job_class this process cannot resolve. Carries the
+  # staged ids so the caller can quarantine exactly those rows and admit
+  # the rest, instead of the whole partition wedging behind them.
+  class UndeliverableJob < Error
+    attr_reader :staged_ids
+
+    def initialize(message, staged_ids:)
+      super(message)
+      @staged_ids = staged_ids
+    end
+  end
+
   # Adapters whose enqueue runs against ActiveRecord::Base.connection (so
   # the adapter INSERT can join the admission TX) or whose semantics make
   # atomicity moot (test/inline). Substring match against the adapter

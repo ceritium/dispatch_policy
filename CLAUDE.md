@@ -328,6 +328,19 @@ dispatch_policy_policy_settings               one row per policy — pause flag
   admitted` and `decayed_admits_at = now()`. Same row lock we already
   hold. `bulk_record_partition_denies!` does NOT touch the decay
   (no admission means no increment).
+- **A staged row that can never be delivered is quarantined, not
+  retried.** `Forwarder.dispatch` raises `UndeliverableJob` (carrying the
+  staged ids) when `job_class.constantize` fails, and both admission
+  paths mark those rows `failed_at` outside the rolled-back transaction,
+  decrement `pending_count`, and retry the admission ONCE. Without it the
+  row sits at the head of its partition's claim order forever and the
+  healthy rows behind it never leave — the claim is the only thing that
+  deletes from `staged_jobs` and there is no retention sweep for it.
+  Marked rather than deleted on purpose: dropping a staged job silently
+  is exactly the at-least-once violation the admission TX exists to
+  prevent, and clearing `failed_at` requeues it once the class is back.
+  Anything else that can never succeed however often it is retried
+  belongs in the same channel; do not add a second mechanism.
 - **Every multi-row writer of `partitions` takes its locks in
   `(policy_name, partition_key)` order.** `stage_many!` sorts its groups
   for this reason and says so; `bulk_record_partition_denies!` now takes

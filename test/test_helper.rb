@@ -46,7 +46,7 @@ module DispatchPolicy
     # workflow in CLAUDE.md — that's what makes the suite rebuild a
     # stale local database instead of failing on a missing column.
     SCHEMA_COLUMNS = %w[total_admitted shard decayed_admits decayed_admits_at
-                        scheduled_eligible_at].freeze
+                        scheduled_eligible_at failed_at].freeze
 
     module_function
 

@@ -23,7 +23,7 @@ module DispatchPolicy
 
     # Force-admit up to `limit` staged jobs for the partition, bypassing
     # all gates, atomically. Returns the number of jobs forwarded.
-    def force!(policy_name:, partition_key:, limit:)
+    def force!(policy_name:, partition_key:, limit:, retried: false)
       return 0 unless limit.positive?
 
       # Unlike Tick — which raises on an unknown policy — this runs in the
@@ -92,6 +92,24 @@ module DispatchPolicy
         end
       end
       forwarded
+    rescue UndeliverableJob => e
+      # Same as the Tick: the claim TX has rolled back, so the staged rows
+      # are back; quarantine the offenders in their own write and try once
+      # more, or the drain button can never get past a poisoned row.
+      DispatchPolicy.config.logger&.error(
+        "[dispatch_policy] undeliverable staged job in #{policy_name}/#{partition_key}, " \
+        "quarantining: #{e.message}"
+      )
+      Repository.with_connection do
+        Repository.quarantine_staged_jobs!(
+          policy_name: policy_name, partition_key: partition_key,
+          ids: e.staged_ids, reason: e.message
+        )
+      end
+      raise if retried
+
+      force!(policy_name: policy_name, partition_key: partition_key,
+             limit: limit, retried: true)
     end
 
     # Same precedence the Tick uses: the policy's override, else the

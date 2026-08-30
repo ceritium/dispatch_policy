@@ -220,6 +220,22 @@ module DispatchPolicy
       settled_patch = nil
       half_life = @policy.fairness_half_life_seconds || @config.fairness_half_life_seconds
 
+      attempt_admission(partition, result, half_life, pending_denies)
+    end
+
+    # One retry, and only after quarantining the rows that caused it. A
+    # staged row whose job_class no longer resolves cannot be delivered by
+    # any number of attempts, and because the claim orders it to the head
+    # of its partition it poisons every subsequent admission there — the
+    # healthy rows behind it never leave. The first attempt rolls back
+    # (which is what keeps at-least-once), we mark the offending ids
+    # outside that transaction, and the second attempt admits everything
+    # else. If the second one finds another one, the next tick handles it:
+    # retrying in a loop here would let one bad batch own the tick.
+    def attempt_admission(partition, result, half_life, pending_denies, retried: false)
+      admitted      = 0
+      settled_patch = nil
+
       Repository.with_connection do
         ActiveRecord::Base.transaction(requires_new: true) do
           # The gate_state we persist depends on how many rows actually
@@ -334,6 +350,24 @@ module DispatchPolicy
       else
         { admitted: admitted, failures: 0, reasons: [] }
       end
+    rescue UndeliverableJob => e
+      # The admission TX has already rolled back, so the staged rows are
+      # back and the quarantine has to be its own write.
+      DispatchPolicy.config.logger&.error(
+        "[dispatch_policy] undeliverable staged job in #{@policy_name}/" \
+        "#{partition['partition_key']}, quarantining: #{e.message}"
+      )
+      Repository.with_connection do
+        Repository.quarantine_staged_jobs!(
+          policy_name:   @policy_name,
+          partition_key: partition["partition_key"],
+          ids:           e.staged_ids,
+          reason:        e.message
+        )
+      end
+      return { admitted: 0, failures: 1, reasons: ["undeliverable_job"] } if retried
+
+      attempt_admission(partition, result, half_life, pending_denies, retried: true)
     rescue StandardError => e
       DispatchPolicy.config.logger&.error(
         "[dispatch_policy] forward failed for #{@policy_name}/#{partition['partition_key']}: " \

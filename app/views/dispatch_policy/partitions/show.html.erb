@@ -97,6 +97,33 @@
   <% end %>
 </section>
 
+<% if @quarantined_jobs.any? %>
+  <section class="dp-section">
+    <h2>Undeliverable (max 50)</h2>
+    <p class="dp-empty">
+      These rows could not be handed to the adapter and are held back so
+      they stop blocking the rest of the partition — most often a job
+      class a deploy renamed or removed. They are not counted as pending
+      and nothing will admit them until the class resolves again, at
+      which point clearing <code>failed_at</code> requeues them.
+    </p>
+    <table class="dp-table">
+      <thead><tr><th>id</th><th>Job class</th><th>Failed</th><th>Reason</th><th></th></tr></thead>
+      <tbody>
+        <% @quarantined_jobs.each do |j| %>
+          <tr>
+            <td><%= j.id %></td>
+            <td><code><%= j.job_class %></code></td>
+            <td><%= format_time(j.failed_at) %></td>
+            <td><%= j.failure_reason %></td>
+            <td><%= link_to "inspect", staged_job_path(j), class: "dp-link" %></td>
+          </tr>
+        <% end %>
+      </tbody>
+    </table>
+  </section>
+<% end %>
+
 <section class="dp-section">
   <h2>Actions</h2>
   <%= button_to "Force admit 1",  admit_partition_path(@partition, count: 1),   class: "dp-btn", method: :post, form: { class: "dp-form-inline" } %>

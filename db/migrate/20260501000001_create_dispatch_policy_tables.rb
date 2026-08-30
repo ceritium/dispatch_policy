@@ -12,6 +12,13 @@ class CreateDispatchPolicyTables < ActiveRecord::Migration[7.1]
       t.integer :priority,      default: 0, null: false
       t.datetime :enqueued_at,  null: false, default: -> { "now()" }
       t.jsonb   :context,       null: false, default: {}
+      # Quarantine. A row the Forwarder can never deliver — a job_class
+      # the process cannot resolve, because a deploy renamed or dropped it
+      # — otherwise heads every claim of its partition forever and takes
+      # the healthy rows behind it down with it. Marked rather than
+      # deleted: dropping a staged job silently would break at-least-once.
+      t.datetime :failed_at
+      t.string   :failure_reason
     end
     add_index :dispatch_policy_staged_jobs,
               [:policy_name, :partition_key, :scheduled_at, :id],

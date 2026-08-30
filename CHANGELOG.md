@@ -4,13 +4,18 @@
 
 ### Upgrade notes
 
-- **New column**: `dispatch_policy_partitions.scheduled_eligible_at`
-  (nullable timestamp). The gem ships a single migration, so an existing
+- **New columns**: `dispatch_policy_partitions.scheduled_eligible_at`,
+  and `failed_at` / `failure_reason` on `dispatch_policy_staged_jobs`
+  (all nullable). The gem ships a single migration, so an existing
   install does not get it from `db:migrate` — run it yourself:
 
   ```sql
   ALTER TABLE dispatch_policy_partitions
     ADD COLUMN scheduled_eligible_at timestamp(6) without time zone;
+
+  ALTER TABLE dispatch_policy_staged_jobs
+    ADD COLUMN failed_at timestamp(6) without time zone,
+    ADD COLUMN failure_reason character varying;
 
   CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_dp_staged_claim_order
     ON dispatch_policy_staged_jobs
@@ -49,6 +54,31 @@
   `next_eligible_at` and simply becomes claimable one tick earlier,
   after which the tick re-parks it in the new column.
 ### Fixed
+
+- **One undeliverable staged row no longer wedges its whole partition
+  forever.** `Forwarder.dispatch` deserializes every row of a batch
+  before enqueuing any of them, inside the admission transaction, so a
+  `job_class` the process cannot resolve — a deploy renamed it, dropped
+  it, or moved it into a component the tick does not load — rolled the
+  whole batch back. That rollback is correct; it is the at-least-once
+  guarantee. What was not is what followed: the claim orders by priority
+  then id, so the same row headed every subsequent batch forever and the
+  healthy jobs behind it in that partition were never admitted again.
+  Nothing else deletes from `dispatch_policy_staged_jobs`, there is no
+  staged retention sweep, and the partition sweeper keeps a partition
+  that still has rows — so the only exit was hand-written SQL. The drain
+  button could not get past it either, and `admit` had no rescue at all,
+  so it answered with a bare 500.
+
+  Such a row is now quarantined rather than retried: marked with
+  `failed_at` / `failure_reason`, skipped by the claim, taken out of
+  `pending_count`, and listed on the partition page under "Undeliverable"
+  with its reason. Marked, not deleted — dropping a staged job silently
+  would break at-least-once — so clearing `failed_at` requeues it once
+  the class resolves again. The admission retries once after
+  quarantining, so the healthy rows in the same batch go out on the same
+  tick, and the denial reason is `undeliverable_job` rather than
+  `forward_failed`, which pointed at the adapter.
 
 - **The deny flush no longer deadlocks against bulk enqueues.**
   `bulk_record_partition_denies!` is one `UPDATE … FROM (VALUES …)`, and

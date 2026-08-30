@@ -289,6 +289,7 @@ module DispatchPolicy
         WITH claimed AS (
           SELECT id FROM #{STAGED_TABLE}
           WHERE policy_name = $1 AND partition_key = $2
+            AND failed_at IS NULL
             AND (scheduled_at IS NULL OR scheduled_at <= now())
           ORDER BY priority ASC, scheduled_at NULLS FIRST, id
           LIMIT $3
@@ -320,6 +321,41 @@ module DispatchPolicy
       )
 
       rows.map { |r| normalize_staged(r) }
+    end
+
+    # Quarantine staged rows the Forwarder can never deliver, and take
+    # them out of the partition's pending count in the same statement so
+    # the dashboard and `claim_partitions` stop counting work that will
+    # never move. Its own transaction on purpose: the caller reaches here
+    # AFTER the admission TX rolled back, so the marks have to survive
+    # independently of it.
+    def quarantine_staged_jobs!(policy_name:, partition_key:, ids:, reason:)
+      return 0 if ids.empty?
+
+      marked = connection.exec_query(
+        <<~SQL.squish,
+          UPDATE #{STAGED_TABLE}
+          SET failed_at = now(), failure_reason = $3
+          WHERE policy_name = $1 AND partition_key = $2
+            AND id = ANY($4::bigint[]) AND failed_at IS NULL
+          RETURNING id
+        SQL
+        "quarantine_staged_jobs",
+        [policy_name, partition_key, reason.to_s[0, 500], "{#{ids.join(',')}}"]
+      ).rows.size
+
+      if marked.positive?
+        connection.exec_query(
+          <<~SQL.squish,
+            UPDATE #{PARTITIONS_TABLE}
+            SET pending_count = GREATEST(pending_count - $3, 0), updated_at = now()
+            WHERE policy_name = $1 AND partition_key = $2
+          SQL
+          "decrement_pending_for_quarantine",
+          [policy_name, partition_key, marked]
+        )
+      end
+      marked
     end
 
     # Per-partition admit-state UPDATE. Runs inside the per-partition
