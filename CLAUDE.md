@@ -384,9 +384,16 @@ dispatch_policy_policy_settings               one row per policy — pause flag
   fixes nothing. Without it the two deadlock under an ordinary tick loop
   plus one `perform_all_later` process, and losing the flush loses every
   denied partition's backoff for that tick. If you add another statement
-  that writes several partition rows, give it the same order —
-  `sweep_inactive_partitions!`'s DELETE has the same unordered shape and
-  is only safe because it runs every `sweep_every_ticks`.
+  that writes several partition rows, give it the same order. Two do not
+  have it today: `sweep_inactive_partitions!`'s DELETE, safe only because
+  it runs every `sweep_every_ticks`, and `PoliciesController#pause` /
+  `#resume`, whose `update_all` covers every partition of the policy in
+  index order. The second fires on an operator click, at the worst
+  possible moment — during the load that made someone want to pause —
+  and a deadlock there rolls the whole transaction back, so the policy is
+  NOT paused, the tick keeps admitting, and the controller answers 500
+  with nothing saying the pause failed. Measured at 5 deadlocks in 12
+  clicks against one bulk-enqueuing process.
 - **`claim_staged_jobs!` requires `limit > 0`** (it's now the
   admit-only path). The pure-deny path goes through
   `Repository.bulk_record_partition_denies!`: the Tick accumulates
