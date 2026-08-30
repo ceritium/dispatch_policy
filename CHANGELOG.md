@@ -50,6 +50,22 @@
   after which the tick re-parks it in the new column.
 ### Fixed
 
+- **Introducing or changing `shard_by` no longer strands every existing
+  partition.** The shard was pinned on first write and never rewritten,
+  so the day a policy gained a `shard_by` — the documented way to
+  parallelise a policy across worker pools — every partition that already
+  existed kept `default` while the tick loops were started for the new
+  shard names. `claim_partitions` filters on shard, nothing rewrites it,
+  and new tenants get the new shard and drain normally, so the dashboard
+  looks healthy while every existing tenant goes silent, permanently. The
+  pin now applies only while the partition holds work: a drained
+  partition re-shards on its next enqueue, which is the normal state
+  between bursts. A partition stranded while `pending_count > 0` (a
+  deploy landing mid-burst) still needs a manual `UPDATE`; that limit is
+  documented rather than papered over. CLAUDE.md described this clause as
+  `COALESCE(EXCLUDED.shard, partitions.shard)`, which is not what the code
+  did and would not have had this behaviour either; corrected.
+
 - **Editing `partition_by` no longer silently removes the concurrency
   cap.** Both concurrency gates counted in-flight rows under a key
   recomputed from the context at evaluate time, while everything on the

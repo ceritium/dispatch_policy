@@ -481,6 +481,19 @@ The generated `DispatchTickLoopJob` template uses
 queue it monitors. Workers listening on `events-shard-*` queues run
 both the tick loops and the admitted jobs from one pool per shard.
 
+**Adding or changing `shard_by` on a running install.** The shard is
+pinned while a partition holds work, so a partition re-shards on its
+next enqueue only once it has drained — the normal state between
+bursts. A partition that still has `pending_count > 0` when the deploy
+lands keeps its old shard, and if no loop is started for that shard it
+will not be claimed. Either start a loop for the old shard until those
+drain, or move them yourself:
+
+```sql
+UPDATE dispatch_policy_partitions SET shard = '<new shard>'
+WHERE policy_name = '<policy>' AND shard = 'default';
+```
+
 The gem's automatic context enrichment puts `:queue_name` into the
 ctx hash so `shard_by` can use it directly without your `context`
 proc having to know about it.

@@ -162,6 +162,20 @@ module DispatchPolicy
       rows.size
     end
 
+    # The `shard` clause pins while the partition holds work and recomputes
+    # once it is drained. Pinning unconditionally is what strands every
+    # pre-existing partition the day `shard_by` is introduced or changed:
+    # those rows keep a shard no tick loop is started for,
+    # `claim_partitions` filters on it, and nothing ever rewrites it —
+    # while NEW partitions get the new shard and drain normally, so the
+    # dashboard looks healthy while old tenants go silent. `pending_count`
+    # in the CASE is the PRE-update value, so a partition re-shards on the
+    # first enqueue that finds it empty — the normal state between bursts
+    # — and never moves out from under a tick mid-claim.
+    #
+    # (Keep comments out of the heredoc below: it is `.squish`ed onto one
+    # line, where a `--` would comment out the rest of the statement.)
+    #
     # `scheduled_at` is the new job's own due time (nil = due now). It
     # maintains `scheduled_eligible_at`, the soonest moment this partition
     # can have work to do — see `defer_partition_to_next_scheduled!` for
@@ -183,7 +197,10 @@ module DispatchPolicy
             context             = EXCLUDED.context,
             context_updated_at  = EXCLUDED.context_updated_at,
             queue_name          = COALESCE(EXCLUDED.queue_name, #{PARTITIONS_TABLE}.queue_name),
-            shard               = #{PARTITIONS_TABLE}.shard,
+            shard               = CASE
+              WHEN #{PARTITIONS_TABLE}.pending_count = 0 THEN EXCLUDED.shard
+              ELSE #{PARTITIONS_TABLE}.shard
+            END,
             pending_count       = #{PARTITIONS_TABLE}.pending_count + EXCLUDED.pending_count,
             last_enqueued_at    = EXCLUDED.last_enqueued_at,
             scheduled_eligible_at = CASE

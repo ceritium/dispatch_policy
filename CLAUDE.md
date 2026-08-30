@@ -56,9 +56,18 @@ dispatch_policy_policy_settings               one row per policy — pause flag
 ## Invariants — don't break without thinking
 
 - **`partition_key` identifies a partition; `shard` is routing
-  metadata.** The shard is pinned on first write
-  (`COALESCE(EXCLUDED.shard, partitions.shard)`) so partitions don't
-  jump between tick workers.
+  metadata.** The shard is pinned while the partition holds work and
+  recomputed once it is drained — `CASE WHEN pending_count = 0 THEN
+  EXCLUDED.shard ELSE partitions.shard END` in `upsert_partition!`, where
+  `pending_count` is the pre-UPDATE value. That keeps a partition from
+  jumping between tick workers mid-claim, while still letting it follow
+  `shard_by` when the declaration changes. Pinning it unconditionally —
+  which is what the code did, and what this note used to describe, wrongly,
+  as `COALESCE(EXCLUDED.shard, partitions.shard)` — stranded every
+  pre-existing partition the day `shard_by` was introduced: their rows
+  kept a shard no loop was started for, and nothing ever rewrote it.
+  A partition stranded while it still holds work does NOT self-heal; only
+  a drained one does.
 - **`partition_by` is policy-level and required.** A single
   declaration `partition_by ->(ctx) { … }` in the policy block. The
   staged_job's `partition_key` and the concurrency gate's
