@@ -97,6 +97,44 @@
   <% end %>
 </section>
 
+<% if @quarantined_jobs.any? %>
+  <section class="dp-section">
+    <h2>Undeliverable (max 50)</h2>
+    <p class="dp-empty">
+      These rows could not be deserialized by the tick process and are
+      held back so they stop blocking the rest of the partition — most
+      often a job class a deploy renamed or removed, but any error out of
+      the job's own <code>deserialize</code> does it. See the Reason
+      column. They are not counted as pending and nothing will admit them
+      until that error stops happening — deploy the missing class, or fix
+      the payload, then press Requeue. (Clearing <code>failed_at</code> by
+      hand is not enough: the partition's pending count was decremented when they
+      were held back, and the tick only claims partitions with pending
+      work.)
+    </p>
+    <p>
+      <%= button_to "Requeue undeliverable", requeue_partition_path(@partition),
+                    class: "dp-btn",
+                    form: { data: { turbo: false },
+                            onsubmit: "return confirm('Put these back in the queue? They will be retried on the next tick, and held back again if they still cannot be delivered.');" } %>
+    </p>
+    <table class="dp-table">
+      <thead><tr><th>id</th><th>Job class</th><th>Failed</th><th>Reason</th><th></th></tr></thead>
+      <tbody>
+        <% @quarantined_jobs.each do |j| %>
+          <tr>
+            <td><%= j.id %></td>
+            <td><code><%= j.job_class %></code></td>
+            <td><%= format_time(j.failed_at) %></td>
+            <td><%= j.failure_reason %></td>
+            <td><%= link_to "inspect", staged_job_path(j), class: "dp-link" %></td>
+          </tr>
+        <% end %>
+      </tbody>
+    </table>
+  </section>
+<% end %>
+
 <section class="dp-section">
   <h2>Actions</h2>
   <%= button_to "Force admit 1",  admit_partition_path(@partition, count: 1),   class: "dp-btn", method: :post, form: { class: "dp-form-inline" } %>

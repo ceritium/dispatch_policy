@@ -59,8 +59,8 @@ module DispatchPolicy
     # JobExtension.dispatch_policy installs the around_perform that
     # releases those rows for exactly those policies. A policy may
     # declare both :concurrency and :adaptive_concurrency; either one
-    # keys the row the same way, since inflight_partition_key is
-    # policy.partition_for(ctx) in both.
+    # keys the row the same way, since both read the partition row's own
+    # `partition_key` rather than recomputing it.
     def inflight_tracked_gate
       @gates.find { |g| InflightTracker::TRACKED_GATES.include?(g.name) }
     end

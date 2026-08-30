@@ -9,6 +9,7 @@ module DispatchPolicy
                   :idle_pause,
                   :busy_pause,
                   :partition_inactive_after,
+                  :quarantine_retry_after,
                   :unknown_policy_retention,
                   :inflight_stale_after,
                   :inflight_queued_stale_after,
@@ -19,6 +20,7 @@ module DispatchPolicy
                   :sweep_every_ticks,
                   :metrics_retention,
                   :database_role,
+                  :database_connection_class,
                   :fairness_half_life_seconds,
                   :tick_admission_budget,
                   :adapter_throughput_target,
@@ -46,6 +48,14 @@ module DispatchPolicy
       # throughput ceiling becomes admission_batch_size / busy_pause.
       @busy_pause                = 0.0
       @partition_inactive_after  = 24 * 60 * 60
+      # How long a staged row the Forwarder could not deliver is held back
+      # before the sweeper tries it again. The trigger is "this process
+      # cannot resolve the job class", which a rolling deploy produces and
+      # then resolves minutes later — so the hold has to expire, or an
+      # ordinary deploy drops that class's whole backlog silently and for
+      # good. A class that really is gone just re-quarantines, at a couple
+      # of rows per tick per hour. Set to 0 to hold forever.
+      @quarantine_retry_after    = 60 * 60
       # How long a partition whose policy is absent from THIS process's
       # registry is kept when it still carries a token bucket. "Absent
       # from the registry" is not the same as "deleted from the code" —
@@ -87,6 +97,14 @@ module DispatchPolicy
       # AR role for the admission TX. nil = default connection. Set to
       # e.g. :queue when the host runs solid_queue on a separate DB.
       @database_role             = nil
+      # The ActiveRecord class the gem opens its connection on. nil means
+      # ActiveRecord::Base, which is right unless the adapter writes
+      # through a different one: on a separate-queue-database install set
+      # it to the adapter's record class ("SolidQueue::Record", or
+      # good_job's active_record_parent_class). The gem's guarantee is
+      # that the adapter's INSERT joins the admission transaction, and
+      # that only holds when both are on the same connection.
+      @database_connection_class = nil
       # Fairness: the half-life of decayed_admits (per-partition EWMA).
       # 60s means a partition's "recent activity" weight halves every
       # 60s of idleness. Tick reorders claimed partitions by lowest

@@ -149,10 +149,12 @@ class PolicyDSLTest < Minitest::Test
     end
     DispatchPolicy.registry.register(policy)
 
-    concurrency = policy.gates.find { |g| g.name == :concurrency }
     ctx = policy.build_context(["acme"])
-    # Inflight key matches the staged partition_key — same canonical scope.
-    assert_equal "tenant:acme", concurrency.inflight_partition_key("p", ctx)
+    # The gates key their state on the partition row, which carries exactly
+    # this value — recomputing it from ctx is what let an edit to
+    # `partition_by` silently unhook the concurrency cap from the rows the
+    # admission path had already written.
+    assert_equal "tenant:acme", policy.partition_for(ctx)
   ensure
     DispatchPolicy.reset_registry!
   end

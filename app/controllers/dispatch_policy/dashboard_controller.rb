@@ -6,7 +6,12 @@ module DispatchPolicy
 
     def index
       @totals = {
-        staged:        StagedJob.count,
+        # Deliverable only. A held-back row is not backlog — nothing is
+        # trying to admit it — so counting it as "staged" told the
+        # operator there was work moving when there was not, and fed a
+        # drain-time estimate that could never come true.
+        staged:        StagedJob.deliverable.count,
+        quarantined:   StagedJob.quarantined.count,
         partitions:    Partition.count,
         active_parts:  Partition.active.count,
         paused_parts:  Partition.paused.count,
@@ -40,6 +45,11 @@ module DispatchPolicy
         avg_tick_ms:          @capacity[:avg_tick_ms],
         max_tick_ms:          @capacity[:max_tick_ms],
         pending_total:        @totals[:staged],
+        quarantined:          @totals[:quarantined],
+        # Both are documented as "off" values, and either one stops the
+        # hold from ever expiring — so the hint must not promise a retry.
+        quarantine_auto_release: cfg.quarantine_retry_after.to_i.positive? &&
+                                 cfg.sweep_every_ticks.to_i.positive?,
         admitted_per_minute:  @capacity[:admitted_per_minute],
         forward_failures:     @windows["1m"][:forward_failures],
         jobs_admitted:        @windows["1m"][:jobs_admitted],

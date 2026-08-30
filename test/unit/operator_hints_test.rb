@@ -140,4 +140,75 @@ class OperatorHintsTest < Minitest::Test
     hints = call(admitted_per_minute: 200_000, adapter_target_jps: nil)
     refute(hints.any? { |h| h.message.include?("adapter ceiling") })
   end
+  # Every hint is a Hint struct and the view calls `hint.level` /
+  # `hint.message`. This one shipped as a bare Hash with a `:text` key, so
+  # the dashboard 500'd whenever anything was held back — the exact state
+  # the hint exists to surface. Asserting on hash contents would have
+  # passed against the broken code, so call the readers the view calls.
+  def test_the_held_back_hint_is_renderable
+    hints = DispatchPolicy::OperatorHints.for(quarantined: 2)
+    hint  = hints.find { |h| h.message.include?("held back") }
+
+    refute_nil hint
+    assert_equal :warn, hint.level
+    assert_match(/2 staged job\(s\) are held back/, hint.message)
+    assert_match(/retried automatically/, hint.message,
+                 "telling the operator to Requeue by hand what the sweeper releases " \
+                 "on its own sends them chasing a non-problem")
+  end
+
+  def test_no_held_back_hint_when_nothing_is_held
+    hints = DispatchPolicy::OperatorHints.for(quarantined: 0)
+    assert_empty hints.select { |h| h.message.include?("held back") }
+  end
+  # `quarantine_retry_after = 0` and `sweep_every_ticks = 0` are both
+  # documented "off" values, and either one means the hold never expires.
+  # Telling that operator to wait for an automatic retry is the same
+  # failure as a hint that crashes: it is wrong exactly when held rows
+  # are the problem. Asserting only the default text passes against that.
+  # The suite has no request-level test, which is how a hint that 500'd
+  # the dashboard shipped: every unit test here built its own hash and
+  # never touched the readers the template calls. Read them out of the
+  # template instead, so a view that starts calling `hint.text` — or a
+  # hint that stops being a Hint — fails here rather than in production.
+  def test_every_reader_the_template_calls_exists_on_every_hint
+    template = File.read(File.expand_path(
+      "../../app/views/dispatch_policy/shared/_hints.html.erb", __dir__
+    ))
+    readers = template.scan(/\bhint\.([a-z_]+)/).flatten.uniq
+    refute_empty readers, "the partial stopped reading hints; this test is now blind"
+
+    # One call per hint-producing branch, so no branch can return a shape
+    # the template cannot render.
+    produced = [
+      DispatchPolicy::OperatorHints.for(paused: true),
+      DispatchPolicy::OperatorHints.for(quarantined: 2),
+      DispatchPolicy::OperatorHints.for(quarantined: 2, quarantine_auto_release: false),
+      call(avg_tick_ms: 20_000, tick_max_duration_ms: 25_000),
+      call(admitted_per_minute: 1, pending_total: 10_000),
+      call(forward_failures: 50, partitions_seen: 100),
+      call(never_checked: 3)
+    ].flatten
+    assert_operator produced.size, :>=, 7, "some branch stopped firing; widen the inputs"
+
+    produced.each do |hint|
+      readers.each do |reader|
+        assert_respond_to hint, reader,
+                          "the partial calls hint.#{reader}; #{hint.inspect} cannot render"
+      end
+    end
+  end
+
+  def test_the_held_back_hint_does_not_promise_a_retry_that_cannot_happen
+    held = lambda do |auto|
+      DispatchPolicy::OperatorHints
+        .for(quarantined: 2, quarantine_auto_release: auto)
+        .find { |h| h.message.include?("held back") }
+    end
+
+    assert_match(/retried automatically/, held.call(true).message)
+    refute_match(/retried automatically/, held.call(false).message,
+                 "nothing releases the hold in this configuration")
+    assert_match(/only way out/, held.call(false).message)
+  end
 end

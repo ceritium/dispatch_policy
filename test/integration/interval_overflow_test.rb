@@ -118,4 +118,30 @@ class IntervalOverflowTest < DispatchPolicy::IntegrationTest
     assert_operator eligible, :>, 10.years.from_now,
                     "and still a very long backoff — the clamp is a ceiling, not a reset"
   end
+  # The clamp is what makes the backoff safe today, so nothing an input
+  # can do distinguishes a multiply from a string parse — 1e9 is below
+  # INT_MAX. The multiply is the second line of defence, and the only way
+  # to pin it is the shape of the statement. Without this, raising
+  # MAX_BACKOFF_SECONDS one day silently re-arms the overflow.
+  def test_the_backoff_interval_is_built_by_multiplication
+    sql = nil
+    sub = ActiveSupport::Notifications.subscribe("sql.active_record") do |*, payload|
+      sql = payload[:sql] if payload[:name] == "record_partition_admit"
+    end
+    begin
+      seed_partition!("shape")
+      DispatchPolicy::Repository.record_partition_admit!(
+        policy_name: POLICY, partition_key: "shape", admitted: 0,
+        gate_state_patch: {}, retry_after: 30
+      )
+    ensure
+      ActiveSupport::Notifications.unsubscribe(sub)
+    end
+
+    refute_nil sql
+    assert_match(/interval '1 second'/, sql,
+                 "the string form raises on a seconds field above INT_MAX, which a " \
+                 "token debt can reach the moment the clamp is raised")
+    refute_match(/\|\| ' seconds'\)::interval/, sql)
+  end
 end

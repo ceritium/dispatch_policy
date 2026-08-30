@@ -2,7 +2,7 @@
 
 module DispatchPolicy
   class PartitionsController < ApplicationController
-    before_action :find_partition, only: %i[show drain admit]
+    before_action :find_partition, only: %i[show drain admit requeue]
 
     DRAIN_MAX_PER_REQUEST = 10_000
     DRAIN_BATCH_SIZE      = 200
@@ -72,10 +72,17 @@ module DispatchPolicy
       # reflects what would actually be admitted first, not the reverse.
       @recent_jobs = StagedJob
         .for_partition(@partition.policy_name, @partition.partition_key)
+        .deliverable
         # Mirrors claim_staged_jobs! exactly (audit L9): the list is
-        # "what comes out next", so the two orders must not drift.
+        # "what comes out next", so the two orders must not drift — and
+        # the claim skips quarantined rows, so this must too.
         .order(Arel.sql("priority ASC, scheduled_at ASC NULLS FIRST, id ASC"))
         .limit(50)
+      # Listed separately because they are the opposite of "what comes out
+      # next": nothing will ever admit them until someone acts.
+      @quarantined_jobs = StagedJob
+        .for_partition(@partition.policy_name, @partition.partition_key)
+        .quarantined.order(failed_at: :desc).limit(50)
       # The whole policy may be paused even if this partition's own status
       # is 'active' (it was created after the pause). claim_partitions skips
       # the policy regardless, so surface the effective state.
@@ -89,12 +96,39 @@ module DispatchPolicy
       # request timeouts and giant transactions. A non-numeric value falls
       # back to 1 instead of raising (ArgumentError → 500).
       count     = (Integer(params[:count], exception: false) || 1).clamp(1, DRAIN_MAX_PER_REQUEST)
-      forwarded = ManualAdmission.force!(
-        policy_name:   @partition.policy_name,
-        partition_key: @partition.partition_key,
-        limit:         count
-      )
+      begin
+        forwarded = ManualAdmission.force!(
+          policy_name:   @partition.policy_name,
+          partition_key: @partition.partition_key,
+          limit:         count
+        )
+      rescue StandardError => e
+        # #drain has had this isolation since the audit; admit did not, so
+        # anything the forward raises — a job_class the web process cannot
+        # resolve is the usual one — reached the operator as a bare 500.
+        DispatchPolicy.config.logger&.error(
+          "[dispatch_policy] admit failed for #{@partition.policy_name}/" \
+          "#{@partition.partition_key}: #{e.class}: #{e.message}"
+        )
+        return redirect_to partition_path(@partition),
+                           alert: "Could not forward: #{e.class} — see logs."
+      end
       redirect_to partition_path(@partition), notice: "Forwarded #{forwarded} job(s)."
+    end
+
+    # Puts quarantined rows back in play. This is the only correct inverse
+    # of the quarantine: clearing `failed_at` by hand leaves pending_count
+    # where the quarantine left it, and `claim_partitions` requires
+    # `pending_count > 0`, so the rows come back deliverable and no tick
+    # ever claims them again.
+    def requeue
+      requeued = Repository.requeue_quarantined_jobs!(
+        policy_name:   @partition.policy_name,
+        partition_key: @partition.partition_key
+      )
+      redirect_to partition_path(@partition),
+                  notice: "Requeued #{requeued} undeliverable job(s); the next tick will " \
+                          "try them again."
     end
 
     # Empties the partition by force-admitting every staged job through the
@@ -165,6 +199,7 @@ module DispatchPolicy
       end
 
       scope               = StagedJob.for_partition(partition.policy_name, partition.partition_key)
+                                     .deliverable
       due_remaining       = scope.due.count
       scheduled_remaining = scope.count - due_remaining
       [drained, due_remaining, scheduled_remaining, failed]

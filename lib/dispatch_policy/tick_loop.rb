@@ -150,6 +150,27 @@ module DispatchPolicy
 
       DispatchPolicy.registry.each do |policy|
         registered << policy.name
+
+        # Release aged holds before anything else: a quarantined row is a
+        # row we could not deliver YET, and the ordinary reason is a
+        # rolling deploy that has since finished.
+        if cfg.quarantine_retry_after.to_i.positive?
+          begin
+            Repository.release_aged_quarantines!(
+              policy_name: policy.name, older_than: cfg.quarantine_retry_after
+            )
+          rescue StandardError => e
+            # Its own rescue: `sweep!` has one for the whole pass, so
+            # anything raised here would also skip partition GC, the tick
+            # samples and the adaptive stats — and a condition that does
+            # not clear itself would skip them on every sweep for the life
+            # of the process.
+            cfg.logger&.error(
+              "[dispatch_policy] quarantine release failed for #{policy.name}: " \
+              "#{e.class}: #{e.message}"
+            )
+          end
+        end
         window = policy.static_throttle_window
         warn_unbounded_sweep(policy) if window.nil? && throttled?(policy)
 

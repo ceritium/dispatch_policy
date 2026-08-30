@@ -4,13 +4,22 @@
 
 ### Upgrade notes
 
-- **New column**: `dispatch_policy_partitions.scheduled_eligible_at`
-  (nullable timestamp). The gem ships a single migration, so an existing
+- **New columns**: `dispatch_policy_partitions.scheduled_eligible_at`,
+  and `failed_at` / `failure_reason` on `dispatch_policy_staged_jobs`
+  (all nullable). The gem ships a single migration, so an existing
   install does not get it from `db:migrate` — run it yourself:
 
   ```sql
   ALTER TABLE dispatch_policy_partitions
     ADD COLUMN scheduled_eligible_at timestamp(6) without time zone;
+
+  ALTER TABLE dispatch_policy_staged_jobs
+    ADD COLUMN failed_at timestamp(6) without time zone,
+    ADD COLUMN failure_reason character varying;
+
+  CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_dp_staged_claim_order
+    ON dispatch_policy_staged_jobs
+    (policy_name, partition_key, priority, scheduled_at ASC NULLS FIRST, id ASC);
 
   CREATE INDEX CONCURRENTLY idx_dp_partitions_scheduled_order
     ON dispatch_policy_partitions
@@ -22,7 +31,17 @@
   so an upgraded install matches a fresh one; using `timestamptz` instead
   works at runtime but leaves this one column disagreeing with the eight
   others on the table and with every fresh install's schema dump. The
-  index matters once the table is large and most of the work is
+  `idx_dp_staged_claim_order` matters once any single partition holds a
+  deep backlog: the claim orders by `priority`, which no existing index
+  covers, so it sorts the partition's whole backlog on every admission —
+  measured at 118 ms and 13.7 MB of temp files to return 200 ids from a
+  500k-row partition, twice per tick. Both CREATE INDEX statements are
+  CONCURRENTLY because `dispatch_policy_staged_jobs` is the write-hot
+  enqueue-path table; run them outside a transaction. Do not drop
+  `idx_dp_staged_admission` in favour of the new one — the scheduled-work
+  park needs `scheduled_at` third and the new index cannot serve it.
+
+  The partitions index matters once the table is large and most of the work is
   `set(wait:)`-scheduled: `claim_partitions` filters on both horizons, and
   without it the parked rows are eliminated by a heap filter. It is not
   free — the claim rewrites `last_checked_at` on every pass, so the table
@@ -35,6 +54,141 @@
   `next_eligible_at` and simply becomes claimable one tick earlier,
   after which the tick re-parks it in the new column.
 ### Fixed
+
+- **The documented separate-queue-database install can admit jobs.**
+  `Repository.with_connection` opened its role on `ActiveRecord::Base`,
+  which swaps the role for every class in that hierarchy — the host's own
+  models included — for the duration of the block. On the multi-database
+  setup the README describes (solid_queue on its own database, gem tables
+  migrated there, `config.database_role = :queue`) that moved the whole
+  process onto the queue database while the adapter still wrote through
+  its own record class on its own connection: the admission transaction
+  and the adapter's INSERT were never on one connection, so the
+  at-least-once guarantee the whole design exists for did not hold, and
+  on stock Rails the first `perform_later` raised outright.
+
+  The gem now has a connection identity of its own:
+  `config.database_connection_class` names the class it opens on — the
+  adapter's record class on a multi-DB install (`"SolidQueue::Record"`,
+  or good_job's `active_record_parent_class`), `ActiveRecord::Base` by
+  default. `with_connection` scopes the role swap to that class instead
+  of the global hierarchy, and the four remaining hard-coded
+  `ActiveRecord::Base` entry points — the admission transaction, the
+  forced-admission transaction, the forwarder's savepoint and the
+  heartbeat's connection release — go through it. Verified against two
+  real databases: staging lands in the queue database, the host's own
+  connection is untouched while the gem works, and an INSERT through the
+  adapter's class inside the admission transaction rolls back with it.
+  The railtie warns at boot when it can see the adapter's record class
+  differ from the one the gem opens on.
+
+- **One undeliverable staged row no longer wedges its whole partition
+  forever.** `Forwarder.dispatch` deserializes every row of a batch
+  before enqueuing any of them, inside the admission transaction, so a
+  `job_class` the process cannot resolve — a deploy renamed it, dropped
+  it, or moved it into a component the tick does not load — rolled the
+  whole batch back. That rollback is correct; it is the at-least-once
+  guarantee. What was not is what followed: the claim orders by priority
+  then id, so the same row headed every subsequent batch forever and the
+  healthy jobs behind it in that partition were never admitted again.
+  Nothing else deletes from `dispatch_policy_staged_jobs`, there is no
+  staged retention sweep, and the partition sweeper keeps a partition
+  that still has rows — so the only exit was hand-written SQL. The drain
+  button could not get past it either, and `admit` had no rescue at all,
+  so it answered with a bare 500.
+
+  Such a row is now quarantined rather than retried: marked with
+  `failed_at` / `failure_reason`, skipped by the claim, taken out of
+  `pending_count`, and listed on the partition page under "Undeliverable"
+  with its reason. Marked, not deleted — dropping a staged job silently
+  would break at-least-once — and the hold EXPIRES: `TickLoop.sweep!`
+  releases anything older than `config.quarantine_retry_after` (1 hour by
+  default), because the ordinary trigger is a rolling deploy whose tick
+  pod cannot yet resolve a class the web pods already stage for. A
+  terminal hold would turn that deploy into a silent, permanent drop of
+  that class's whole backlog — worse than the visible, self-healing stall
+  it replaced. A class that really is gone simply re-quarantines. Any row
+  the tick process cannot deserialize triggers it, not just an
+  unresolvable `job_class` — anything narrower escapes to the tick's
+  generic rescue, which writes no `failed_at`, so nothing releases the row
+  and it heads every claim of that partition forever. The dashboard counts
+  held-back rows in their own tile rather than as backlog, and an operator
+  hint names them — saying plainly that the hold does NOT expire when
+  `quarantine_retry_after` or `sweep_every_ticks` is 0.
+
+  Put them back sooner with the Requeue button on the
+  partition page (`Repository.requeue_quarantined_jobs!`), which restores
+  `pending_count` in the same statement — clearing `failed_at` by hand
+  leaves the row deliverable and unclaimable at once, since the tick only
+  claims partitions with pending work. The scheduled park ignores
+  quarantined rows too, and the partition sweeper will not collect a
+  partition that still holds any, which would otherwise orphan them. The admission retries once after
+  quarantining, so the healthy rows in the same batch go out on the same
+  tick, and the denial reason is `undeliverable_job` rather than
+  `forward_failed`, which pointed at the adapter.
+
+- **The deny flush no longer deadlocks against bulk enqueues.**
+  `bulk_record_partition_denies!` is one `UPDATE … FROM (VALUES …)`, and
+  one statement gives no lock-ordering guarantee: the planner joins the
+  VALUES list against a sequential scan, so it takes row locks in heap
+  order — unrelated to `(policy_name, partition_key)` and unrelated to
+  the order of the list, so sorting the Ruby array does not help.
+  `stage_many!` sorts its per-partition upserts precisely so concurrent
+  bulk enqueues agree on an order; against that, the deny crossed.
+  Measured with no misconfiguration at all — one tick loop for a policy,
+  default config, plus one process calling `perform_all_later` over the
+  same partitions: **16 Postgres deadlocks in 20 seconds**. Seven aborted
+  the caller's bulk enqueue, leaving the staged half rolled back while
+  the non-policy half had already reached the adapter — a batch that is
+  not whole-retryable. The other nine killed `Tick#flush_denies!`, which
+  rescues and only logs, so every denied partition in that tick lost both
+  its backoff and its `gate_state` patch and was immediately
+  re-claimable: the M4 busy-loop, tick-wide. The flush now takes its row
+  locks up front in the same canonical order `stage_many!` uses. A
+  deadlock-retry wrapper would not have done — it leaves the lock convoy
+  (bulk enqueue throughput measured ~4× lower) and still surfaces partial
+  batches once the retry budget is spent.
+
+- **Introducing or changing `shard_by` no longer strands every existing
+  partition.** The shard was pinned on first write and never rewritten,
+  so the day a policy gained a `shard_by` — the documented way to
+  parallelise a policy across worker pools — every partition that already
+  existed kept `default` while the tick loops were started for the new
+  shard names. `claim_partitions` filters on shard, nothing rewrites it,
+  and new tenants get the new shard and drain normally, so the dashboard
+  looks healthy while every existing tenant goes silent, permanently. The
+  pin now applies only while the partition holds work: a drained
+  partition re-shards on its next enqueue, which is the normal state
+  between bursts. A partition stranded while `pending_count > 0` (a
+  deploy landing mid-burst) still needs a manual `UPDATE`; that limit is
+  documented rather than papered over. CLAUDE.md described this clause as
+  `COALESCE(EXCLUDED.shard, partitions.shard)`, which is not what the code
+  did and would not have had this behaviour either; corrected.
+
+- **Editing `partition_by` no longer silently removes the concurrency
+  cap.** Both concurrency gates counted in-flight rows under a key
+  recomputed from the context at evaluate time, while everything on the
+  admission path — the staged row, the pre-inserted inflight row, the
+  token bucket — is filed under the partition row's own key. The two
+  agree until somebody renames or coarsens the expression, which is an
+  ordinary deploy; from then on the gate counts zero for every partition
+  that predates the edit and hands out the full cap on top of whatever is
+  already running. The gates read the row now — and the adaptive gate's
+  observations, written at perform time where there is no partition row
+  in hand, take their key from the inflight row the Tick pre-inserted, so
+  the state it writes and the state it reads cannot drift apart either.
+  CLAUDE.md described the two values as identical "by construction",
+  which is what kept this invisible for three audits; corrected.
+
+- **A concurrency cap that came back through jsonb no longer wedges the
+  partition.** `Gates::Concurrency` resolved its `max:` with `Integer()`,
+  but the context a tick evaluates has been through a jsonb round trip,
+  which retypes anything that is not a JSON primitive. The README's own
+  example backs the cap with a host database column, and a `numeric`
+  column arrives as the String `"5.0"` — on which `Integer()` raises,
+  inside the admission transaction, so the partition backs off and
+  repeats forever. Resolved with `Float().floor`, mirroring what the
+  throttle already does with its rate.
 
 - **One poisoned staged row no longer kills the whole drain.** The UI's
   drain buttons called `ManualAdmission.force!` with no error isolation,

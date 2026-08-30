@@ -36,20 +36,44 @@ module DispatchPolicy
 
     module_function
 
-    def connection
-      ActiveRecord::Base.connection
+    # The class the gem opens its connection on — which must be the class
+    # the ADAPTER writes through, because the whole at-least-once
+    # guarantee is that the adapter's INSERT joins our transaction.
+    #
+    # `config.database_connection_class` is how you say so on a multi-DB
+    # install: "SolidQueue::Record", or good_job's
+    # `active_record_parent_class`. Default nil = ActiveRecord::Base,
+    # which is right for the single-database case and for good_job's
+    # default shape.
+    def base_class
+      klass = DispatchPolicy.config.database_connection_class
+      return ActiveRecord::Base if klass.nil?
+
+      klass.is_a?(String) ? klass.constantize : klass
     end
 
-    # Wraps `block` in `connected_to(role: …)` when DispatchPolicy.config
-    # .database_role is set. Used by Tick to ensure the admission TX is
-    # opened against the same DB role that good_job / solid_queue uses,
-    # critical for multi-DB Rails setups (e.g. solid_queue on a separate
-    # `:queue` DB) where atomicity only holds when the staging TX and the
-    # adapter INSERT share a connection.
+    def connection
+      base_class.connection
+    end
+
+    # Wraps `block` in `connected_to(role: …)` when
+    # DispatchPolicy.config.database_role is set.
+    #
+    # Scoped to `base_class`, NOT to ActiveRecord::Base.
+    # `ActiveRecord::Base.connected_to` swaps the role for every class in
+    # that connection hierarchy — the host's models included — so on the
+    # documented separate-queue-DB install it moved the whole process onto
+    # the queue database for the duration, and the adapter still wrote
+    # through its own class on its own connection. Naming the class keeps
+    # the swap to the gem's own frame and, once
+    # `database_connection_class` is the adapter's record class, the
+    # adapter's INSERT lands on the very connection the transaction was
+    # opened on — which is the point.
     def with_connection
-      role = DispatchPolicy.config.database_role
-      if role && ActiveRecord::Base.respond_to?(:connected_to)
-        ActiveRecord::Base.connected_to(role: role) { yield }
+      role  = DispatchPolicy.config.database_role
+      klass = base_class
+      if role && klass.respond_to?(:connected_to)
+        klass.connected_to(role: role) { yield }
       else
         yield
       end
@@ -102,6 +126,11 @@ module DispatchPolicy
     # headroom. A single perform_all_later with more rows than this would
     # otherwise blow the limit and fail the whole batch.
     STAGE_MANY_BATCH = 1_000
+    # Partitions per quarantine-release transaction. Same bind ceiling,
+    # plus a lock-hold bound: one transaction over every held partition
+    # was measured holding FOR UPDATE for 10s on 60k keys, with a
+    # concurrent perform_later blocked behind it the whole time.
+    QUARANTINE_RELEASE_BATCH = 1_000
 
     def stage_many!(rows)
       return 0 if rows.empty?
@@ -162,6 +191,20 @@ module DispatchPolicy
       rows.size
     end
 
+    # The `shard` clause pins while the partition holds work and recomputes
+    # once it is drained. Pinning unconditionally is what strands every
+    # pre-existing partition the day `shard_by` is introduced or changed:
+    # those rows keep a shard no tick loop is started for,
+    # `claim_partitions` filters on it, and nothing ever rewrites it —
+    # while NEW partitions get the new shard and drain normally, so the
+    # dashboard looks healthy while old tenants go silent. `pending_count`
+    # in the CASE is the PRE-update value, so a partition re-shards on the
+    # first enqueue that finds it empty — the normal state between bursts
+    # — and never moves out from under a tick mid-claim.
+    #
+    # (Keep comments out of the heredoc below: it is `.squish`ed onto one
+    # line, where a `--` would comment out the rest of the statement.)
+    #
     # `scheduled_at` is the new job's own due time (nil = due now). It
     # maintains `scheduled_eligible_at`, the soonest moment this partition
     # can have work to do — see `defer_partition_to_next_scheduled!` for
@@ -183,7 +226,10 @@ module DispatchPolicy
             context             = EXCLUDED.context,
             context_updated_at  = EXCLUDED.context_updated_at,
             queue_name          = COALESCE(EXCLUDED.queue_name, #{PARTITIONS_TABLE}.queue_name),
-            shard               = #{PARTITIONS_TABLE}.shard,
+            shard               = CASE
+              WHEN #{PARTITIONS_TABLE}.pending_count = 0 THEN EXCLUDED.shard
+              ELSE #{PARTITIONS_TABLE}.shard
+            END,
             pending_count       = #{PARTITIONS_TABLE}.pending_count + EXCLUDED.pending_count,
             last_enqueued_at    = EXCLUDED.last_enqueued_at,
             scheduled_eligible_at = CASE
@@ -272,6 +318,7 @@ module DispatchPolicy
         WITH claimed AS (
           SELECT id FROM #{STAGED_TABLE}
           WHERE policy_name = $1 AND partition_key = $2
+            AND failed_at IS NULL
             AND (scheduled_at IS NULL OR scheduled_at <= now())
           ORDER BY priority ASC, scheduled_at NULLS FIRST, id
           LIMIT $3
@@ -303,6 +350,130 @@ module DispatchPolicy
       )
 
       rows.map { |r| normalize_staged(r) }
+    end
+
+    # Quarantine staged rows the Forwarder can never deliver, and take
+    # them out of the partition's pending count in the same statement so
+    # the dashboard and `claim_partitions` stop counting work that will
+    # never move. Its own transaction on purpose: the caller reaches here
+    # AFTER the admission TX rolled back, so the marks have to survive
+    # independently of it.
+    def quarantine_staged_jobs!(policy_name:, partition_key:, ids:, reason:)
+      return 0 if ids.empty?
+
+      marked = connection.exec_query(
+        <<~SQL.squish,
+          UPDATE #{STAGED_TABLE}
+          SET failed_at = now(), failure_reason = $3
+          WHERE policy_name = $1 AND partition_key = $2
+            AND id = ANY($4::bigint[]) AND failed_at IS NULL
+          RETURNING id
+        SQL
+        "quarantine_staged_jobs",
+        [policy_name, partition_key, reason.to_s[0, 500], "{#{ids.join(',')}}"]
+      ).rows.size
+
+      if marked.positive?
+        connection.exec_query(
+          <<~SQL.squish,
+            UPDATE #{PARTITIONS_TABLE}
+            SET pending_count = GREATEST(pending_count - $3, 0), updated_at = now()
+            WHERE policy_name = $1 AND partition_key = $2
+          SQL
+          "decrement_pending_for_quarantine",
+          [policy_name, partition_key, marked]
+        )
+      end
+      marked
+    end
+
+    # The inverse of the quarantine, and the only correct one: clearing
+    # `failed_at` by hand leaves `pending_count` where the quarantine left
+    # it, and `claim_partitions` requires `pending_count > 0`, so the row
+    # comes back deliverable and no tick ever claims it. One statement so
+    # a revive cannot commit without the counter.
+    #
+    # `scheduled_eligible_at` is cleared too: a partition parked behind a
+    # horizon computed while these rows were invisible would otherwise
+    # stay parked. `next_eligible_at` is left alone — a gate's backoff is
+    # still a legitimate reason to wait.
+    # Release every hold in a policy that has aged past `older_than`.
+    # Quarantine is a HOLD, not a verdict: the ordinary trigger is a
+    # rolling deploy whose tick pod cannot resolve a class the web pods
+    # already stage for, and that resolves itself minutes later. Without a
+    # cadence those rows are dropped silently and permanently, which is
+    # the at-least-once failure the admission TX exists to prevent — worse
+    # than the visible, self-healing stall this replaced. A class that is
+    # genuinely gone simply re-quarantines on the next tick.
+    #
+    # Locks byte-ordered first, like `bulk_record_partition_denies!`: this
+    # writes many partition rows in one statement, and one statement locks
+    # in heap order, which deadlocks against `stage_many!`.
+    def release_aged_quarantines!(policy_name:, older_than:)
+      keys = connection.exec_query(
+        <<~SQL.squish,
+          SELECT DISTINCT partition_key FROM #{STAGED_TABLE}
+          WHERE policy_name = $1 AND failed_at IS NOT NULL
+            AND failed_at < now() - ($2 || ' seconds')::interval
+        SQL
+        "aged_quarantine_partitions",
+        [policy_name, older_than.to_i]
+      ).rows.flatten.sort
+      return 0 if keys.empty?
+
+      # Sliced for the same two reasons STAGE_MANY_BATCH exists: one bind
+      # per key hits Postgres' 65,535-parameter ceiling, and one
+      # transaction over every key holds FOR UPDATE on all of them for the
+      # whole loop — measured at ~0.5s on 2,500 partitions, with a
+      # concurrent perform_later blocked 453ms behind it. The lock order
+      # that matters is WITHIN a slice's statement, and each slice's own
+      # `ORDER BY … COLLATE "C"` supplies it; since a slice commits before
+      # the next one locks, the `.sort` above buys determinism and stable
+      # slice boundaries, not lock ordering. Partial progress is harmless:
+      # the next sweep re-selects whatever is left.
+      released = 0
+      keys.each_slice(QUARANTINE_RELEASE_BATCH) do |slice|
+        connection.transaction(requires_new: true) do
+          placeholders = slice.each_index.map { |i| "$#{i + 2}" }
+          connection.exec_query(
+            <<~SQL.squish,
+              SELECT 1 FROM #{PARTITIONS_TABLE}
+              WHERE policy_name = $1 AND partition_key IN (#{placeholders.join(', ')})
+              ORDER BY policy_name COLLATE "C", partition_key COLLATE "C"
+              FOR UPDATE
+            SQL
+            "lock_partitions_for_quarantine_release",
+            [policy_name, *slice]
+          )
+          slice.each do |key|
+            released += requeue_quarantined_jobs!(policy_name: policy_name, partition_key: key,
+                                                  older_than: older_than)
+          end
+        end
+      end
+      released
+    end
+
+    def requeue_quarantined_jobs!(policy_name:, partition_key:, older_than: nil)
+      connection.exec_query(
+        <<~SQL.squish,
+          WITH requeued AS (
+            UPDATE #{STAGED_TABLE} SET failed_at = NULL, failure_reason = NULL
+            WHERE policy_name = $1 AND partition_key = $2 AND failed_at IS NOT NULL
+              AND ($3::bigint IS NULL OR failed_at < now() - ($3 || ' seconds')::interval)
+            RETURNING id
+          ), bumped AS (
+            UPDATE #{PARTITIONS_TABLE}
+            SET pending_count = pending_count + (SELECT count(*) FROM requeued),
+                scheduled_eligible_at = NULL,
+                updated_at = now()
+            WHERE policy_name = $1 AND partition_key = $2
+          )
+          SELECT count(*) AS requeued FROM requeued
+        SQL
+        "requeue_quarantined_jobs",
+        [policy_name, partition_key, older_than&.to_i]
+      ).first["requeued"].to_i
     end
 
     # Per-partition admit-state UPDATE. Runs inside the per-partition
@@ -466,6 +637,15 @@ module DispatchPolicy
     # took the rows in between) leaves the partition immediately
     # eligible, which is correct.
     #
+    # The `failed_at IS NULL` in the MIN is defensive and, today,
+    # unreachable: quarantine happens in the Forwarder, which only ever
+    # sees rows the claim handed it, and the claim only takes rows that
+    # are already due — so a quarantined row can never satisfy
+    # `scheduled_at > now()`. It is kept because the day something else
+    # can quarantine a future row, a horizon pointing at one would wake
+    # the partition for work nothing will claim. No test pins it; nothing
+    # can, by construction.
+    #
     # The NOT EXISTS is what keeps this from hiding work it cannot see.
     # This runs after the claim's DELETE and after `record_partition_admit!`
     # takes the row lock, and its own subquery only looks at rows
@@ -481,6 +661,7 @@ module DispatchPolicy
           SET scheduled_eligible_at = (
                 SELECT MIN(s.scheduled_at) FROM #{STAGED_TABLE} s
                 WHERE s.policy_name = $1 AND s.partition_key = $2
+                  AND s.failed_at IS NULL
                   AND s.scheduled_at > now()
               ),
               updated_at = now()
@@ -488,6 +669,7 @@ module DispatchPolicy
             AND NOT EXISTS (
               SELECT 1 FROM #{STAGED_TABLE} d
               WHERE d.policy_name = $1 AND d.partition_key = $2
+                AND d.failed_at IS NULL
                 AND (d.scheduled_at IS NULL OR d.scheduled_at <= now())
             )
         SQL
@@ -528,22 +710,67 @@ module DispatchPolicy
         )
       end
 
-      connection.exec_query(
-        <<~SQL.squish,
-          UPDATE #{PARTITIONS_TABLE} p
-          SET gate_state       = p.gate_state || v.gate_state_patch,
-              next_eligible_at = CASE
-                WHEN v.retry_after_secs IS NULL THEN p.next_eligible_at
-                ELSE now() + (v.retry_after_secs * interval '1 second')
-              END,
-              updated_at       = now()
-          FROM (VALUES #{values_sql.join(", ")})
-            AS v(policy_name, partition_key, gate_state_patch, retry_after_secs)
-          WHERE p.policy_name = v.policy_name AND p.partition_key = v.partition_key
-        SQL
-        "bulk_record_partition_denies",
-        params
-      )
+      # Take the row locks up front, in the same canonical order
+      # `stage_many!` uses — which is Ruby's, i.e. BYTE order, so the SQL
+      # has to say COLLATE "C" and not just ORDER BY. A bare ORDER BY
+      # inherits the database's collation, and en_US.UTF-8 — the default
+      # on RDS, Heroku, the official postgres image and Debian/Ubuntu —
+      # disagrees with byte order on ordinary keys: acct:10 vs acct:1:eu,
+      # acme vs Acme, user1 vs user_1. Two writers ordering by different
+      # collations is not ordering at all, and the deadlock comes
+      # straight back (measured: 18 in 20s with a bare ORDER BY on an
+      # en_US.UTF-8 database, 0 with COLLATE "C"). This UPDATE is one statement, and one statement
+      # gives no ordering guarantee: the planner joins VALUES against a
+      # seq scan, so it locks in heap order — unrelated to
+      # (policy_name, partition_key) and unrelated to the order of the
+      # VALUES list, which is why sorting the Ruby array does not help.
+      # Against `upsert_partition!`'s ON CONFLICT, which does take its
+      # locks in key order, that deadlocks: measured at 16 deadlocks in
+      # 20s from ONE tick loop plus ONE process calling perform_all_later,
+      # with no misconfiguration. Half of them aborted the caller's bulk
+      # enqueue mid-batch; the other half killed `Tick#flush_denies!`,
+      # which only logs — so every denied partition in that tick lost its
+      # backoff AND its gate_state patch and was immediately re-claimable.
+      # A retry wrapper would not do: it leaves the lock convoy (bulk
+      # enqueue throughput was ~4x lower) and still surfaces partial
+      # batches once the retry budget is spent.
+      lock_values = []
+      lock_params = []
+      entries.map { |e| [e[:policy_name], e[:partition_key]] }.uniq.sort.each_with_index do |pair, idx|
+        base = idx * 2
+        lock_values << "($#{base + 1}::text, $#{base + 2}::text)"
+        lock_params.concat(pair)
+      end
+
+      connection.transaction(requires_new: true) do
+        connection.exec_query(
+          <<~SQL.squish,
+            SELECT 1 FROM #{PARTITIONS_TABLE}
+            WHERE (policy_name, partition_key) IN (VALUES #{lock_values.join(", ")})
+            ORDER BY policy_name COLLATE "C", partition_key COLLATE "C"
+            FOR UPDATE
+          SQL
+          "lock_partitions_for_deny",
+          lock_params
+        )
+
+        connection.exec_query(
+          <<~SQL.squish,
+            UPDATE #{PARTITIONS_TABLE} p
+            SET gate_state       = p.gate_state || v.gate_state_patch,
+                next_eligible_at = CASE
+                  WHEN v.retry_after_secs IS NULL THEN p.next_eligible_at
+                  ELSE now() + (v.retry_after_secs * interval '1 second')
+                END,
+                updated_at       = now()
+            FROM (VALUES #{values_sql.join(", ")})
+              AS v(policy_name, partition_key, gate_state_patch, retry_after_secs)
+            WHERE p.policy_name = v.policy_name AND p.partition_key = v.partition_key
+          SQL
+          "bulk_record_partition_denies",
+          params
+        )
+      end
     end
 
     # ----- policy settings ------------------------------------------------------
@@ -1126,13 +1353,13 @@ module DispatchPolicy
       filter = ""
       if policy_name
         params << policy_name
-        filter = "AND policy_name = $#{params.size}"
+        filter = "AND p.policy_name = $#{params.size}"
       elsif except_policies.any?
         placeholders = except_policies.map do |name|
           params << name
           "$#{params.size}"
         end
-        filter = "AND policy_name NOT IN (#{placeholders.join(', ')})"
+        filter = "AND p.policy_name NOT IN (#{placeholders.join(', ')})"
       end
 
       if refilled_bucket
@@ -1142,14 +1369,14 @@ module DispatchPolicy
         params << refilled_bucket.fetch(:capacity).to_f
         params << refilled_bucket.fetch(:refill_rate).to_f
         params << refilled_bucket.fetch(:now).to_f
-        stored_refilled_at = "(gate_state -> 'throttle' ->> 'refilled_at')::double precision"
+        stored_refilled_at = "(p.gate_state -> 'throttle' ->> 'refilled_at')::double precision"
         # Same expression the admission UPDATE settles with, on the same
         # clock (config.now, not the database's). A row with no bucket
         # recorded at all has nothing to lose, hence the COALESCE to
         # capacity.
         refilled_bucket_sql = <<~SQL.squish
           AND LEAST(
-                COALESCE((gate_state -> 'throttle' ->> 'tokens')::double precision, $#{cap_idx}::double precision)
+                COALESCE((p.gate_state -> 'throttle' ->> 'tokens')::double precision, $#{cap_idx}::double precision)
                 + GREATEST(
                     $#{now_idx}::double precision
                     - COALESCE(#{stored_refilled_at}, $#{now_idx}::double precision),
@@ -1165,21 +1392,26 @@ module DispatchPolicy
       if throttled_cutoff_seconds
         params << throttled_cutoff_seconds.to_i
         age_sql = <<~SQL.squish
-          COALESCE(last_admit_at, created_at) < now() - (
-            CASE WHEN gate_state ? 'throttle' THEN $#{params.size} ELSE $1 END || ' seconds'
+          COALESCE(p.last_admit_at, p.created_at) < now() - (
+            CASE WHEN p.gate_state ? 'throttle' THEN $#{params.size} ELSE $1 END || ' seconds'
           )::interval
         SQL
       else
-        age_sql = "COALESCE(last_admit_at, created_at) < now() - ($1 || ' seconds')::interval"
+        age_sql = "COALESCE(p.last_admit_at, p.created_at) < now() - ($1 || ' seconds')::interval"
       end
 
       connection.exec_query(
         <<~SQL.squish,
-          DELETE FROM #{PARTITIONS_TABLE}
-          WHERE pending_count = 0
+          DELETE FROM #{PARTITIONS_TABLE} p
+          WHERE p.pending_count = 0
             #{filter}
             AND #{age_sql}
             #{refilled_bucket_sql}
+            AND NOT EXISTS (
+              SELECT 1 FROM #{STAGED_TABLE} s
+              WHERE s.policy_name = p.policy_name
+                AND s.partition_key = p.partition_key
+            )
         SQL
         "sweep_inactive_partitions",
         params
@@ -1256,6 +1488,14 @@ module DispatchPolicy
     # to stay under ~9.22e12 seconds, which is why `clamp_backoff` exists
     # rather than trusting the arithmetic.
     #
+    # Be honest about which of the two is load-bearing NOW: the clamp is.
+    # At MAX_BACKOFF_SECONDS = 1e9, below INT_MAX, no value that reaches
+    # SQL could break the string form either, so the multiply is the
+    # second line rather than the first. It stays because the clamp is one
+    # constant away from being raised, and because a multiply cannot fail
+    # on a value the parser would reject. Only the SQL shape pins it —
+    # no input can tell the two apart.
+    #
     # This is not cosmetic. The same expression in
     # `bulk_record_partition_denies!` builds ONE statement for the whole
     # tick, and `Tick#flush_denies!` only logs on failure — so a single
@@ -1301,6 +1541,7 @@ module DispatchPolicy
       connection with_connection
       normalize_partition normalize_staged parse_jsonb
       sample_filter next_eligible_clause trend_direction clamp_backoff
+      base_class
     ].freeze
 
     (singleton_methods(false) - ROLE_ROUTING_EXCLUDED).each do |method_name|

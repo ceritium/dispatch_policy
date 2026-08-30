@@ -56,9 +56,18 @@ dispatch_policy_policy_settings               one row per policy — pause flag
 ## Invariants — don't break without thinking
 
 - **`partition_key` identifies a partition; `shard` is routing
-  metadata.** The shard is pinned on first write
-  (`COALESCE(EXCLUDED.shard, partitions.shard)`) so partitions don't
-  jump between tick workers.
+  metadata.** The shard is pinned while the partition holds work and
+  recomputed once it is drained — `CASE WHEN pending_count = 0 THEN
+  EXCLUDED.shard ELSE partitions.shard END` in `upsert_partition!`, where
+  `pending_count` is the pre-UPDATE value. That keeps a partition from
+  jumping between tick workers mid-claim, while still letting it follow
+  `shard_by` when the declaration changes. Pinning it unconditionally —
+  which is what the code did, and what this note used to describe, wrongly,
+  as `COALESCE(EXCLUDED.shard, partitions.shard)` — stranded every
+  pre-existing partition the day `shard_by` was introduced: their rows
+  kept a shard no loop was started for, and nothing ever rewrote it.
+  A partition stranded while it still holds work does NOT self-heal; only
+  a drained one does.
 - **`partition_by` is policy-level and required.** A single
   declaration `partition_by ->(ctx) { … }` in the policy block. The
   staged_job's `partition_key` and the concurrency gate's
@@ -193,6 +202,18 @@ dispatch_policy_policy_settings               one row per policy — pause flag
   If the host runs Sidekiq/Resque, a warning explains atomicity is
   lost. Deliberate: a custom PG-backed adapter (not detected) can
   still work, and we don't want to break its deploy.
+- **`config.database_connection_class` is the gem's connection
+  IDENTITY, and it must be the adapter's.** The at-least-once guarantee
+  is that the adapter's INSERT joins the admission TX, which holds only
+  while both are on one connection — so `Repository.base_class` is what
+  every DB entry point opens on, including the admission transaction, the
+  forwarder's savepoint and the heartbeat's release. Do NOT put
+  `ActiveRecord::Base` back in any of them.
+  `ActiveRecord::Base.connected_to(role:)` is worse than it looks: it
+  swaps the role for the whole hierarchy, host models included, and still
+  leaves an adapter that writes through its own record class on a
+  different connection. That is why the documented separate-queue-DB
+  install could not admit a job.
 - **`config.database_role`**: for Rails multi-DB (e.g. solid_queue
   with a separate DB), sets the role every Repository call is opened
   against. **All** public `Repository` methods are auto-wrapped in
@@ -241,7 +262,10 @@ dispatch_policy_policy_settings               one row per policy — pause flag
   it silently breaks schema rebuilds and leaks state between tests —
   AND update both the migration and the generator template, per the
   workflow below. Column added? Add it to
-  `PostgresTest::SCHEMA_COLUMNS` too; that's the drift check that
+  `PostgresTest::SCHEMA_COLUMNS` too, UNDER ITS OWN TABLE KEY (the hash is
+  keyed by table; a column filed under the wrong one can never be
+  satisfied, so every integration test pays a full re-migrate); that's
+  the drift check that
   rebuilds a stale local database.
 - **Inflight tracking is decided from the POLICY at runtime, never
   from where the class was declared.** `Policy#inflight_tracked_gate`
@@ -258,10 +282,23 @@ dispatch_policy_policy_settings               one row per policy — pause flag
   and release macro-driven, and a class bound with
   `dispatch_policy_name = "x"` — public API, and the only way to share
   one policy across classes — got rows nothing ever deleted, wedging
-  the partition at `max` for an hour at a time. The key is always
-  `policy.partition_for(ctx)`, which is by construction the staged
-  `partition_key` the callers already hold, so don't recompute it per
-  row. `dispatch_policy_inflight_tracking` only sets a flag that ADDS
+  the partition at `max` for an hour at a time. The key is always the
+  partition ROW's `partition_key` — read it, never recompute it from ctx.
+  That is a GATE-side rule: gates always have the partition row. At
+  perform time there is none, so the key comes from the inflight row the
+  Tick pre-inserted (`InflightTracker.lookup_admission`), which is the
+  admission's own record of what it decided. One caller still recomputes
+  — `InflightTracker.track`'s own `insert_inflight!` — and that is inert
+  by `ON CONFLICT DO NOTHING` while the Tick's row exists. Closing it for
+  real means stamping the admitted key into the forwarded payload, a
+  format change larger than the exposure (a >1h queue wait plus an edit
+  to `partition_by`) justifies. An adaptive observation keyed on a
+  recomputed value files the AIMD state where `evaluate` will never look. `policy.partition_for(ctx)` returns the same value only while
+  nobody edits `partition_by`; the moment somebody does, a gate counting
+  under the recomputed key stops seeing the rows the admission path
+  wrote under the stored one, and the cap silently lapses for every
+  partition that predates the edit. "By construction the same value" was
+  the wording here for three audits and it is what made that invisible. `dispatch_policy_inflight_tracking` only sets a flag that ADDS
   tracking for a policy WITHOUT such a gate (a live in-flight count on
   the dashboard); it installs nothing.
 - **`:adaptive_concurrency` updates `current_max` in a single SQL
@@ -315,6 +352,74 @@ dispatch_policy_policy_settings               one row per policy — pause flag
   admitted` and `decayed_admits_at = now()`. Same row lock we already
   hold. `bulk_record_partition_denies!` does NOT touch the decay
   (no admission means no increment).
+- **A staged row this process cannot deliver is HELD, not failed.** `Forwarder.dispatch` raises `UndeliverableJob` (carrying the
+  staged ids) when the row cannot be deserialized, and both admission
+  paths mark those rows `failed_at` outside the rolled-back transaction,
+  decrement `pending_count`, and retry the admission ONCE. Without it the
+  row sits at the head of its partition's claim order forever and the
+  healthy rows behind it never leave — the claim is the only thing that
+  deletes from `staged_jobs` and there is no retention sweep for it.
+  Marked rather than deleted on purpose: dropping a staged job silently
+  is exactly the at-least-once violation the admission TX exists to
+  prevent. The inverse is `Repository.requeue_quarantined_jobs!` (the
+  Requeue button), NOT clearing `failed_at` by hand — the quarantine
+  decremented `pending_count` and `claim_partitions` needs it above zero,
+  so a hand-cleared row is deliverable and unclaimable at the same time.
+  Everything that reads staged rows has to agree with the claim's
+  `failed_at IS NULL`: the scheduled park's due-work guard does, and the
+  partition sweeper anti-joins against `staged_jobs` so it cannot collect
+  a partition whose only remaining rows are quarantined.
+  The hold EXPIRES — `TickLoop.sweep!` releases anything older than
+  `config.quarantine_retry_after`. Do not make it terminal: the trigger
+  is "this process cannot deserialize the row", and the ordinary cause is
+  a rolling deploy whose tick pod is a release behind the web pods, which
+  fixes itself minutes later. A terminal hold drops that class's whole
+  backlog silently and for good, which is the at-least-once violation the
+  admission TX exists to prevent. **Any** deserialize failure is held, not
+  just an unresolvable constant: narrowing the rescue lets everything else
+  escape to `Tick`'s generic rescue, which queues a backoff but writes no
+  `failed_at`, so nothing ever releases the row and it heads every
+  subsequent claim of that partition forever. The trigger is not exotic
+  and is usually not a `NameError`: ANY error out of `klass.deserialize`
+  does it — a `deserialize` override reading a field a pre-upgrade payload
+  lacks (`KeyError`), one that touches the database (`RecordNotFound`), or
+  a staged row whose `job_data` this gem did not write (a data migration,
+  an import, a hand-edited row) whose `scheduled_at` is not an iso8601
+  string (`TypeError` out of stock `deserialize_time`). Do not try to
+  enumerate the classes — enumerating is what got this rescue narrowed
+  twice. The invariant is "this process could not deserialize the row". Now that the hold expires, holding a transient failure
+  for one `quarantine_retry_after` window beats wedging a partition
+  permanently. `UnresolvableJobClass` stays a distinct class only so the
+  log names the ordinary case — it is not a narrower rescue. Pinned by
+  `test_a_deserialize_failure_that_is_not_a_name_error_is_held_too`; this
+  rescue has been narrowed and reverted twice already.
+- **Every multi-row writer of `partitions` takes its locks in
+  `(policy_name, partition_key)` BYTE order.** Which collation is not a
+  detail: `stage_many!` sorts in Ruby, i.e. `String#<=>`, i.e. bytes, so
+  the SQL side must say `COLLATE "C"` and not merely `ORDER BY`. A bare
+  `ORDER BY` inherits the database collation, and `en_US.UTF-8` — the
+  default on RDS, Heroku, the official postgres image and Debian/Ubuntu —
+  disagrees with byte order on ordinary keys (`acct:10` vs `acct:1:eu`,
+  `acme` vs `Acme`, `user1` vs `user_1`). Two writers ordering by
+  different collations is not ordering at all: measured at 18 deadlocks
+  in 20s with a bare ORDER BY, 0 with `COLLATE "C"`. `stage_many!` sorts its groups
+  for this reason and says so; `bulk_record_partition_denies!` now takes
+  an explicit ordered `SELECT … FOR UPDATE` before its
+  `UPDATE … FROM (VALUES …)`, because a single statement locks in HEAP
+  order — not the order of its VALUES list, so sorting the Ruby array
+  fixes nothing. Without it the two deadlock under an ordinary tick loop
+  plus one `perform_all_later` process, and losing the flush loses every
+  denied partition's backoff for that tick. If you add another statement
+  that writes several partition rows, give it the same order. Two do not
+  have it today: `sweep_inactive_partitions!`'s DELETE, safe only because
+  it runs every `sweep_every_ticks`, and `PoliciesController#pause` /
+  `#resume`, whose `update_all` covers every partition of the policy in
+  index order. The second fires on an operator click, at the worst
+  possible moment — during the load that made someone want to pause —
+  and a deadlock there rolls the whole transaction back, so the policy is
+  NOT paused, the tick keeps admitting, and the controller answers 500
+  with nothing saying the pause failed. Measured at 5 deadlocks in 12
+  clicks against one bulk-enqueuing process.
 - **`claim_staged_jobs!` requires `limit > 0`** (it's now the
   admit-only path). The pure-deny path goes through
   `Repository.bulk_record_partition_denies!`: the Tick accumulates
@@ -367,7 +472,8 @@ bundle exec rake test                        # 262 runs / 621 assertions
 #      migrations because v0.1 ships a single migration)
 #   4. Add the table to Repository::ALL_TABLES (the test bootstrap and
 #      the benchmark harness both build their DDL from it); for a new
-#      COLUMN, add it to PostgresTest::SCHEMA_COLUMNS in
+#      COLUMN, add it under its own TABLE KEY in
+#      PostgresTest::SCHEMA_COLUMNS in
 #      test/test_helper.rb, which is the drift check that rebuilds a
 #      stale local database.
 #   5. CHANGELOG: add/extend an "Upgrade notes" subsection under

@@ -30,10 +30,8 @@ module DispatchPolicy
       return if rows.empty?
 
       scheduled, immediate = rows.partition { |row| row["scheduled_at"] }
-      immediate_jobs = immediate.map { |row| Serializer.deserialize(row["job_data"]) }
-      scheduled_jobs = scheduled.map do |row|
-        [Serializer.deserialize(row["job_data"]), enqueue_wait_until(row)]
-      end
+      immediate_jobs = immediate.map { |row| deserialize!(row) }
+      scheduled_jobs = scheduled.map { |row| [deserialize!(row), enqueue_wait_until(row)] }
 
       enqueuing_inline(immediate_jobs + scheduled_jobs.map(&:first)) do
         if immediate_jobs.any?
@@ -87,7 +85,7 @@ module DispatchPolicy
       # same exception reaches admit_partition's own transaction and
       # aborts the admission. Re-raise so the two paths agree.
       completed = false
-      ActiveRecord::Base.transaction(requires_new: true, joinable: false) do
+      Repository.base_class.transaction(requires_new: true, joinable: false) do
         block.call
         completed = true
       end
@@ -100,6 +98,42 @@ module DispatchPolicy
     def defers_its_own_enqueue?(job)
       job.class.respond_to?(:enqueue_after_transaction_commit) &&
         job.class.enqueue_after_transaction_commit
+    end
+
+    # A row this process cannot deserialize. That is NOT the same as "can
+    # never be delivered": the ordinary case is a rolling deploy where the
+    # web pods already stage jobs for a class the tick pod's image does
+    # not have yet. So the row is held back rather than failed, and
+    # `TickLoop.sweep!` releases the hold on a cadence.
+    #
+    # Every deserialize failure, not just `UnresolvableJobClass`. Narrowing
+    # it reopens the wedge this exists to prevent: anything else out of
+    # `klass.deserialize` escapes to Tick's generic rescue, which only
+    # queues a backoff — no `failed_at`, so nothing releases it, and the
+    # row heads every subsequent claim of that partition forever, healthy
+    # neighbours included. The trigger is not exotic and is usually not a
+    # NameError: an override reading a field a pre-upgrade payload lacks
+    # raises KeyError, one that touches the database raises
+    # RecordNotFound, and a `job_data` this gem did not write (a data
+    # migration, an import) whose `scheduled_at` is not iso8601 raises
+    # TypeError out of stock `deserialize_time`. Enumerating the classes
+    # is what got this rescue narrowed twice.
+    # Now that the hold EXPIRES, holding a transient failure for one
+    # `quarantine_retry_after` window is strictly better than wedging the
+    # partition permanently. `UnresolvableJobClass` stays listed first
+    # because it is the case worth naming in the log, not because the
+    # rescue is narrower. Nothing else runs in this method — the adapter
+    # enqueue and the savepoint are in `dispatch`/`enqueuing_inline` — so
+    # widening it cannot swallow an adapter or transaction error.
+    # UndeliverableJob names the offending ids so the caller can
+    # quarantine exactly those and admit the rest.
+    def deserialize!(row)
+      Serializer.deserialize(row["job_data"])
+    rescue UnresolvableJobClass, StandardError => e
+      raise UndeliverableJob.new(
+        "staged row #{row['id']} (#{row['job_class']}): #{e.class}: #{e.message}",
+        staged_ids: [row["id"]]
+      )
     end
 
     def enqueue_wait_until(row)

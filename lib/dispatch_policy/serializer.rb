@@ -18,7 +18,16 @@ module DispatchPolicy
       job_class = payload["job_class"] || payload[:job_class]
       raise InvalidPolicy, "missing job_class in stored payload" unless job_class
 
-      klass = job_class.constantize
+      # Split so the log can name the ordinary case — "this process cannot
+      # resolve the class" — distinctly from anything that goes wrong
+      # afterwards. It is only about the error class: `Forwarder` holds the
+      # row back for both, and must, since anything it does not hold wedges
+      # the partition permanently.
+      klass = begin
+        job_class.constantize
+      rescue NameError => e
+        raise UnresolvableJobClass, "#{job_class}: #{e.class}: #{e.message}"
+      end
       klass.deserialize(payload)
     end
 

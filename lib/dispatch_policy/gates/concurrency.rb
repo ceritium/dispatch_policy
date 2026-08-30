@@ -38,9 +38,17 @@ module DispatchPolicy
         # over the SAME shard would let both read the same pre-admission
         # count and over-admit — shard the policy instead of duplicating
         # loops on one shard (see shard_by in the README).
+        # The row's OWN key, not one recomputed from ctx. They are the same
+        # value right up until someone edits `partition_by` — and then the
+        # rows `pre_insert_admitted!` wrote under the stored key become
+        # invisible to a count taken under the recomputed one, so the cap
+        # silently stops applying to every partition that predates the
+        # edit. Reading the row is also what `claim_staged_jobs!` and the
+        # pre-insert already do, and it drops a mutex-guarded registry
+        # fetch plus a user proc call per gate per partition per tick.
         in_flight = Repository.count_inflight(
           policy_name:   partition["policy_name"],
-          partition_key: inflight_partition_key(partition["policy_name"], ctx)
+          partition_key: partition["partition_key"]
         )
         remaining = cap - in_flight
         if remaining <= 0
@@ -52,21 +60,17 @@ module DispatchPolicy
         Decision.new(allowed: [remaining, admit_budget].min)
       end
 
-      # The inflight key is always the policy's canonical partition
-      # value — same as what's stored in staged_jobs.partition_key.
-      # This is what makes throttle + concurrency in the same policy
-      # enforce their state at exactly one consistent scope.
-      def inflight_partition_key(policy_name, ctx)
-        policy = DispatchPolicy.registry.fetch(policy_name)
-        raise InvalidPolicy, "unknown policy #{policy_name.inspect}" unless policy
-        policy.partition_for(ctx)
-      end
-
       private
 
       def capacity_for(ctx)
         value = @max_proc.call(ctx)
-        value.nil? ? 0 : Integer(value)
+        # Float().floor, not Integer(): the ctx a tick evaluates came back
+        # through jsonb, which retypes anything that is not a JSON
+        # primitive. A cap backed by a Postgres numeric column arrives as
+        # the String "5.0", Integer() raises on it, and the partition
+        # wedges behind forward_failure_backoff forever. Mirrors what
+        # Throttle#rate_for already does with Float().
+        value.nil? ? 0 : Float(value).floor
       end
     end
   end
