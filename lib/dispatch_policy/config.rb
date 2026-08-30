@@ -19,6 +19,7 @@ module DispatchPolicy
                   :sweep_every_ticks,
                   :metrics_retention,
                   :database_role,
+                  :database_connection_class,
                   :fairness_half_life_seconds,
                   :tick_admission_budget,
                   :adapter_throughput_target,
@@ -87,6 +88,14 @@ module DispatchPolicy
       # AR role for the admission TX. nil = default connection. Set to
       # e.g. :queue when the host runs solid_queue on a separate DB.
       @database_role             = nil
+      # The ActiveRecord class the gem opens its connection on. nil means
+      # ActiveRecord::Base, which is right unless the adapter writes
+      # through a different one: on a separate-queue-database install set
+      # it to the adapter's record class ("SolidQueue::Record", or
+      # good_job's active_record_parent_class). The gem's guarantee is
+      # that the adapter's INSERT joins the admission transaction, and
+      # that only holds when both are on the same connection.
+      @database_connection_class = nil
       # Fairness: the half-life of decayed_admits (per-partition EWMA).
       # 60s means a partition's "recent activity" weight halves every
       # 60s of idleness. Tick reorders claimed partitions by lowest

@@ -89,14 +89,42 @@ module DispatchPolicy
     return unless adapter
 
     klass_name = adapter.class.name.to_s
-    return if (PG_BACKED_ADAPTER_HINTS + EXEMPT_ADAPTER_HINTS).any? { |hint| klass_name.include?(hint) }
+    if (PG_BACKED_ADAPTER_HINTS + EXEMPT_ADAPTER_HINTS).any? { |hint| klass_name.include?(hint) }
+      return warn_split_connection(adapter)
+    end
 
     config.logger&.warn(
       "[dispatch_policy] active_job adapter is #{klass_name}; atomic admission requires " \
-      "a PG-backed adapter that shares ActiveRecord::Base's connection (good_job, solid_queue). " \
+      "a PG-backed adapter that shares the gem's connection (good_job, solid_queue). " \
       "If the worker process crashes between admission COMMIT and adapter enqueue, the job is lost. " \
-      "Set DispatchPolicy.config.database_role if you use a separate DB role for queueing."
+      "See config.database_connection_class if the adapter writes through its own record class."
     )
+  end
+
+  # The guarantee is that the adapter's INSERT joins the admission
+  # transaction, and that only holds while both are on ONE connection. A
+  # PG-backed adapter writing through its own record class — which is
+  # exactly the separate-queue-database install the README documents — is
+  # therefore only safe once `config.database_connection_class` names
+  # that class. Say so at boot rather than letting it look like it works.
+  def warn_split_connection(adapter)
+    adapter_class = adapter.class.const_defined?(:Record) ? adapter.class.const_get(:Record) : nil
+    adapter_class ||= defined?(::SolidQueue::Record) && klass_name_matches?(adapter, "SolidQueue") ? ::SolidQueue::Record : nil
+    return if adapter_class.nil?
+
+    ours = Repository.base_class
+    return if adapter_class == ours || adapter_class.connection_specification_name == ours.connection_specification_name
+
+    config.logger&.warn(
+      "[dispatch_policy] the adapter writes through #{adapter_class.name} but the gem opens its " \
+      "transaction on #{ours.name}: the adapter's INSERT will NOT join the admission transaction, " \
+      "so a crash between COMMIT and enqueue loses the job. " \
+      "Set config.database_connection_class = #{adapter_class.name.inspect}."
+    )
+  end
+
+  def klass_name_matches?(adapter, hint)
+    adapter.class.name.to_s.include?(hint)
   end
 end
 

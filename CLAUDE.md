@@ -202,6 +202,18 @@ dispatch_policy_policy_settings               one row per policy — pause flag
   If the host runs Sidekiq/Resque, a warning explains atomicity is
   lost. Deliberate: a custom PG-backed adapter (not detected) can
   still work, and we don't want to break its deploy.
+- **`config.database_connection_class` is the gem's connection
+  IDENTITY, and it must be the adapter's.** The at-least-once guarantee
+  is that the adapter's INSERT joins the admission TX, which holds only
+  while both are on one connection — so `Repository.base_class` is what
+  every DB entry point opens on, including the admission transaction, the
+  forwarder's savepoint and the heartbeat's release. Do NOT put
+  `ActiveRecord::Base` back in any of them.
+  `ActiveRecord::Base.connected_to(role:)` is worse than it looks: it
+  swaps the role for the whole hierarchy, host models included, and still
+  leaves an adapter that writes through its own record class on a
+  different connection. That is why the documented separate-queue-DB
+  install could not admit a job.
 - **`config.database_role`**: for Rails multi-DB (e.g. solid_queue
   with a separate DB), sets the role every Repository call is opened
   against. **All** public `Repository` methods are auto-wrapped in

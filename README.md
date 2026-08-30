@@ -520,20 +520,38 @@ at-least-once. The railtie warns at boot if the adapter doesn't
 look PG-shared (Sidekiq, Resque, async, …) but doesn't hard-fail —
 a custom PG-backed adapter we don't recognise can still work.
 
-For Rails multi-DB (e.g. solid_queue on a separate `:queue` role):
+For Rails multi-DB — solid_queue on its own database is the common
+case — name the class the **adapter** writes through, not just a role:
 
 ```ruby
 DispatchPolicy.configure do |c|
-  c.database_role = :queue
+  c.database_connection_class = "SolidQueue::Record"
+  # …and a role too, only if that class itself resolves one:
+  # c.database_role = :queue
 end
 ```
 
-When set, **every** DB access the gem makes runs inside
-`connected_to(role:)` — staging on `perform_later`, the admission TX,
-inflight tracking and its heartbeat thread, sweeps, and the admin UI
-(an `around_action` routes each dashboard request, so its reads and
-operator actions hit the same DB the tick writes). Staging tables and
-the adapter's table must live in the same DB for atomicity to hold.
+`database_connection_class` is what makes the guarantee hold. The gem's
+promise is that the adapter's INSERT joins the admission transaction,
+and that is only true while both are on one connection — so the gem has
+to open its transaction on the adapter's own class. Left at the default
+(`ActiveRecord::Base`) with the adapter writing through
+`SolidQueue::Record` on another database, the admission commits and the
+enqueue happens on a different connection entirely: a crash in between
+loses the job, which is the failure mode the whole design exists to
+prevent. The railtie warns at boot when it can see the two differ.
+
+`database_role` on its own is not enough, and on stock Rails is worse
+than nothing: `ActiveRecord::Base.connected_to(role: :queue)` swaps the
+role for every class in that hierarchy, including your own models. The
+gem now scopes the swap to `database_connection_class`.
+
+Whichever you set, **every** DB access the gem makes runs inside it —
+staging on `perform_later`, the admission TX, inflight tracking and its
+heartbeat thread, sweeps, and the admin UI (an `around_action` routes
+each dashboard request, so its reads and operator actions hit the same
+DB the tick writes). The gem's tables and the adapter's table must live
+in the same database for atomicity to hold.
 
 > **`enqueue_after_transaction_commit` does not apply to staged jobs.**
 > Staging happens in the `around_enqueue`, before ActiveJob's
@@ -632,6 +650,9 @@ DispatchPolicy.configure do |c|
   c.admission_batch_size      = 100      # max jobs admitted per partition per iteration
   c.idle_pause                = 0.5      # seconds slept when a tick admits nothing
   c.partition_inactive_after  = 86_400   # GC partitions idle this long
+  c.database_connection_class = nil      # the adapter's record class on a
+                                          # multi-DB install, e.g.
+                                          # "SolidQueue::Record"
   c.unknown_policy_retention  = 2_592_000 # ...unless this process doesn't
                                           # know the policy and the row
                                           # still holds a token bucket

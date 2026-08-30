@@ -236,7 +236,7 @@ module DispatchPolicy
       # same DB the Tick pre-inserted it into, which under multi-DB is the
       # queue DB, not the default writing role of the worker process.
       result = Repository.with_connection do
-        ActiveRecord::Base.connection.exec_query(
+        Repository.connection.exec_query(
           "SELECT admitted_at FROM dispatch_policy_inflight_jobs WHERE active_job_id = $1 LIMIT 1",
           "lookup_admitted_at",
           [active_job_id]
@@ -344,7 +344,7 @@ module DispatchPolicy
         # WRITING pool — while the lease to hand back belongs to the role's
         # pool, where the inflight row lives. Releasing the wrong pool is
         # the same leak with an extra step.
-        Repository.with_connection { ActiveRecord::Base.connection_pool.release_connection }
+        Repository.with_connection { Repository.base_class.connection_pool.release_connection }
       rescue StandardError
         # A pool that has gone away takes its connections with it.
       end

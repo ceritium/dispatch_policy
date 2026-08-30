@@ -237,7 +237,7 @@ module DispatchPolicy
       settled_patch = nil
 
       Repository.with_connection do
-        ActiveRecord::Base.transaction(requires_new: true) do
+        Repository.base_class.transaction(requires_new: true) do
           # The gate_state we persist depends on how many rows actually
           # got claimed: each gate settles its state against the real
           # admitted count via Pipeline.settle (the throttle deducts that

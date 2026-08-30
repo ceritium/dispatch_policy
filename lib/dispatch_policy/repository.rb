@@ -36,20 +36,44 @@ module DispatchPolicy
 
     module_function
 
-    def connection
-      ActiveRecord::Base.connection
+    # The class the gem opens its connection on — which must be the class
+    # the ADAPTER writes through, because the whole at-least-once
+    # guarantee is that the adapter's INSERT joins our transaction.
+    #
+    # `config.database_connection_class` is how you say so on a multi-DB
+    # install: "SolidQueue::Record", or good_job's
+    # `active_record_parent_class`. Default nil = ActiveRecord::Base,
+    # which is right for the single-database case and for good_job's
+    # default shape.
+    def base_class
+      klass = DispatchPolicy.config.database_connection_class
+      return ActiveRecord::Base if klass.nil?
+
+      klass.is_a?(String) ? klass.constantize : klass
     end
 
-    # Wraps `block` in `connected_to(role: …)` when DispatchPolicy.config
-    # .database_role is set. Used by Tick to ensure the admission TX is
-    # opened against the same DB role that good_job / solid_queue uses,
-    # critical for multi-DB Rails setups (e.g. solid_queue on a separate
-    # `:queue` DB) where atomicity only holds when the staging TX and the
-    # adapter INSERT share a connection.
+    def connection
+      base_class.connection
+    end
+
+    # Wraps `block` in `connected_to(role: …)` when
+    # DispatchPolicy.config.database_role is set.
+    #
+    # Scoped to `base_class`, NOT to ActiveRecord::Base.
+    # `ActiveRecord::Base.connected_to` swaps the role for every class in
+    # that connection hierarchy — the host's models included — so on the
+    # documented separate-queue-DB install it moved the whole process onto
+    # the queue database for the duration, and the adapter still wrote
+    # through its own class on its own connection. Naming the class keeps
+    # the swap to the gem's own frame and, once
+    # `database_connection_class` is the adapter's record class, the
+    # adapter's INSERT lands on the very connection the transaction was
+    # opened on — which is the point.
     def with_connection
-      role = DispatchPolicy.config.database_role
-      if role && ActiveRecord::Base.respond_to?(:connected_to)
-        ActiveRecord::Base.connected_to(role: role) { yield }
+      role  = DispatchPolicy.config.database_role
+      klass = base_class
+      if role && klass.respond_to?(:connected_to)
+        klass.connected_to(role: role) { yield }
       else
         yield
       end
@@ -1391,6 +1415,7 @@ module DispatchPolicy
       connection with_connection
       normalize_partition normalize_staged parse_jsonb
       sample_filter next_eligible_clause trend_direction clamp_backoff
+      base_class
     ].freeze
 
     (singleton_methods(false) - ROLE_ROUTING_EXCLUDED).each do |method_name|

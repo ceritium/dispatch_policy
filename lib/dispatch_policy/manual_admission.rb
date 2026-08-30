@@ -44,7 +44,7 @@ module DispatchPolicy
 
       forwarded = 0
       Repository.with_connection do
-        ActiveRecord::Base.transaction(requires_new: true) do
+        Repository.base_class.transaction(requires_new: true) do
           rows = Repository.claim_staged_jobs!(
             policy_name:      policy_name,
             partition_key:    partition_key,

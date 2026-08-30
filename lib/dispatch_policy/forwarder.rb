@@ -85,7 +85,7 @@ module DispatchPolicy
       # same exception reaches admit_partition's own transaction and
       # aborts the admission. Re-raise so the two paths agree.
       completed = false
-      ActiveRecord::Base.transaction(requires_new: true, joinable: false) do
+      Repository.base_class.transaction(requires_new: true, joinable: false) do
         block.call
         completed = true
       end

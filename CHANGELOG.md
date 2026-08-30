@@ -55,6 +55,33 @@
   after which the tick re-parks it in the new column.
 ### Fixed
 
+- **The documented separate-queue-database install can admit jobs.**
+  `Repository.with_connection` opened its role on `ActiveRecord::Base`,
+  which swaps the role for every class in that hierarchy — the host's own
+  models included — for the duration of the block. On the multi-database
+  setup the README describes (solid_queue on its own database, gem tables
+  migrated there, `config.database_role = :queue`) that moved the whole
+  process onto the queue database while the adapter still wrote through
+  its own record class on its own connection: the admission transaction
+  and the adapter's INSERT were never on one connection, so the
+  at-least-once guarantee the whole design exists for did not hold, and
+  on stock Rails the first `perform_later` raised outright.
+
+  The gem now has a connection identity of its own:
+  `config.database_connection_class` names the class it opens on — the
+  adapter's record class on a multi-DB install (`"SolidQueue::Record"`,
+  or good_job's `active_record_parent_class`), `ActiveRecord::Base` by
+  default. `with_connection` scopes the role swap to that class instead
+  of the global hierarchy, and the four remaining hard-coded
+  `ActiveRecord::Base` entry points — the admission transaction, the
+  forced-admission transaction, the forwarder's savepoint and the
+  heartbeat's connection release — go through it. Verified against two
+  real databases: staging lands in the queue database, the host's own
+  connection is untouched while the gem works, and an INSERT through the
+  adapter's class inside the admission transaction rolls back with it.
+  The railtie warns at boot when it can see the adapter's record class
+  differ from the one the gem opens on.
+
 - **One undeliverable staged row no longer wedges its whole partition
   forever.** `Forwarder.dispatch` deserializes every row of a batch
   before enqueuing any of them, inside the admission transaction, so a
