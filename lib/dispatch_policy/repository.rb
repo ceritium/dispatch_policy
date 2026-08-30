@@ -574,6 +574,15 @@ module DispatchPolicy
     # took the rows in between) leaves the partition immediately
     # eligible, which is correct.
     #
+    # The `failed_at IS NULL` in the MIN is defensive and, today,
+    # unreachable: quarantine happens in the Forwarder, which only ever
+    # sees rows the claim handed it, and the claim only takes rows that
+    # are already due — so a quarantined row can never satisfy
+    # `scheduled_at > now()`. It is kept because the day something else
+    # can quarantine a future row, a horizon pointing at one would wake
+    # the partition for work nothing will claim. No test pins it; nothing
+    # can, by construction.
+    #
     # The NOT EXISTS is what keeps this from hiding work it cannot see.
     # This runs after the claim's DELETE and after `record_partition_admit!`
     # takes the row lock, and its own subquery only looks at rows
@@ -1415,6 +1424,14 @@ module DispatchPolicy
     # `interval` stores microseconds in an int64, so the value still has
     # to stay under ~9.22e12 seconds, which is why `clamp_backoff` exists
     # rather than trusting the arithmetic.
+    #
+    # Be honest about which of the two is load-bearing NOW: the clamp is.
+    # At MAX_BACKOFF_SECONDS = 1e9, below INT_MAX, no value that reaches
+    # SQL could break the string form either, so the multiply is the
+    # second line rather than the first. It stays because the clamp is one
+    # constant away from being raised, and because a multiply cannot fail
+    # on a value the parser would reject. Only the SQL shape pins it —
+    # no input can tell the two apart.
     #
     # This is not cosmetic. The same expression in
     # `bulk_record_partition_denies!` builds ONE statement for the whole
