@@ -10,8 +10,21 @@
 
   ```sql
   ALTER TABLE dispatch_policy_partitions
-    ADD COLUMN scheduled_eligible_at timestamptz;
+    ADD COLUMN scheduled_eligible_at timestamp(6) without time zone;
+
+  CREATE INDEX CONCURRENTLY idx_dp_partitions_scheduled_order
+    ON dispatch_policy_partitions
+    (policy_name, shard, status, scheduled_eligible_at NULLS FIRST,
+     last_checked_at NULLS FIRST);
   ```
+
+  The type is what `t.datetime` emits under the supported Rails versions,
+  so an upgraded install matches a fresh one; using `timestamptz` instead
+  works at runtime but leaves this one column disagreeing with the eight
+  others on the table and with every fresh install's schema dump. The
+  index matters once the table is large and most of the work is
+  `set(wait:)`-scheduled: `claim_partitions` filters on both horizons, and
+  without it the parked rows are eliminated by a heap filter.
 
   No backfill is needed. NULL means "nothing is holding this partition
   back", which is the correct reading for every existing row; a
@@ -52,7 +65,9 @@
   `perform.active_job` and reaps when the payload carries an exception —
   idempotent, since the normal path has already deleted the row, and safe
   against a late delete because the Tick regenerates `active_job_id` on
-  every admission.
+  every admission. The rule lives in
+  `InflightTracker.handle_failed_perform` rather than in the initializer
+  block, because a subscription body is unreachable from the suite.
 
   Relatedly, a job whose arguments cannot be rebuilt no longer raises out
   of the *enqueue* callback. ActiveJob's own enqueue copes (`serialize`
@@ -118,7 +133,10 @@
   which is what makes `ActiveRecord.after_all_transactions_commit` run
   its block inline — the work happens inside the admission TX and inside
   Bypass, as the contract requires. Deployments with no such job class
-  are unaffected.
+  are unaffected. `transaction` swallows `ActiveRecord::Rollback` by
+  design, so the savepoint re-raises: absorbing one would let the
+  admission commit with the staged rows deleted and nothing in the
+  adapter, where the non-deferring path aborts.
 
 - **The periodic sweeper actually runs.** `TickLoop.run` counted
   iterations in a local, but the generated `DispatchTickLoopJob` calls
@@ -160,7 +178,10 @@
   concurrency gate under-counting and over-admitting. Verified against
   Rails 8.1: after `with_connection` returned inside a thread the pool
   still reported the connection busy, and it went to `dead` rather than
-  `idle` when the thread exited. The beat now releases explicitly.
+  `idle` when the thread exited. The beat now releases explicitly — and
+  from inside `Repository.with_connection`, since `connected_to` is
+  block-scoped and releasing after it returns aims at the writing pool
+  while the lease belongs to the role's.
 
 - **The throttle's token bucket is charged atomically** (throttle
   review). It was written back as a literal jsonb patch computed in Ruby
@@ -206,7 +227,11 @@
   that already has due work. Both enqueue paths maintain it — the bulk
   one (`perform_all_later` → `stage_many!`) upserts once per partition
   for a whole batch, and one job in that batch being due settles it for
-  the group.
+  the group. The park itself asks "is anything due?" in the same
+  statement and snapshot as the write, so a job that becomes due between
+  the claim and the park — an enqueue committing while the tick waits on
+  the partition row lock — cannot be hidden behind a horizon the park
+  never saw it beside.
 
   Side effect worth knowing: the horizon is set by the enqueue itself,
   so a partition holding only future work is no longer claimed even

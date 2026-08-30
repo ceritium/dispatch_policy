@@ -52,4 +52,56 @@ class InflightTrackerDiscardTest < Minitest::Test
       assert_empty calls
     end
   end
+  # `connected_to` is block-scoped, so once Repository.with_connection
+  # returns, `current_role` is back to :writing and
+  # ActiveRecord::Base.connection_pool resolves to the WRITING pool —
+  # while the lease to hand back belongs to the role's pool, where the
+  # inflight row lives. Releasing outside the block is the same leak with
+  # an extra step, and it only shows up on a multi-database install.
+  def test_a_beat_releases_its_connection_inside_the_configured_role
+    DispatchPolicy.config.database_role = :queue
+
+    depth       = 0
+    released_at = nil
+    connected_to = lambda do |role:, &blk|
+      depth += 1
+      blk.call
+    ensure
+      depth -= 1
+    end
+    pool = Object.new
+    pool.define_singleton_method(:release_connection) { released_at = depth }
+
+    DispatchPolicy::Repository.stub(:heartbeat_inflight!, nil) do
+      ActiveRecord::Base.stub(:connected_to, connected_to) do
+        ActiveRecord::Base.stub(:connection_pool, pool) do
+          DispatchPolicy::InflightTracker.beat!("ajid-role")
+        end
+      end
+    end
+
+    assert_equal 1, released_at,
+                 "released outside the role block, i.e. against the wrong pool"
+  ensure
+    DispatchPolicy.reset_config!
+  end
+
+  # The rule the railtie's perform.active_job subscription applies. It
+  # lives in a method rather than in the initializer block because a
+  # subscription body is unreachable from the suite: inverting it there
+  # left 252 runs green while completely undoing the fix.
+  def test_handle_failed_perform_only_reaps_when_the_perform_failed
+    reaped = []
+    event  = Struct.new(:payload)
+
+    DispatchPolicy::InflightTracker.stub(:handle_discard, ->(job) { reaped << job }) do
+      DispatchPolicy::InflightTracker.handle_failed_perform(event.new({ job: :ok }))
+      assert_empty reaped, "a successful perform has already been cleaned up by track's ensure"
+
+      DispatchPolicy::InflightTracker.handle_failed_perform(
+        event.new({ job: :dead, exception: ["StandardError", "boom"] })
+      )
+      assert_equal [:dead], reaped
+    end
+  end
 end

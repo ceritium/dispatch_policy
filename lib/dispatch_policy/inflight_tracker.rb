@@ -204,6 +204,16 @@ module DispatchPolicy
     # concurrency slot the whole time. Wired to the `discard.active_job`
     # notification by the railtie. Idempotent: a no-op when no row exists
     # (e.g. discard fired after track already deleted it).
+    # What the railtie's perform.active_job subscription does. A method
+    # rather than a block in the initializer so the rule — reap only when
+    # the perform actually failed — is reachable from a test; inverting it
+    # inside an initializer block is invisible to the suite.
+    def self.handle_failed_perform(event)
+      return unless event.payload[:exception]
+
+      handle_discard(event.payload[:job])
+    end
+
     def self.handle_discard(job)
       return unless job
       return unless job.class.respond_to?(:dispatch_policy_name) && job.class.dispatch_policy_name
@@ -327,7 +337,13 @@ module DispatchPolicy
       DispatchPolicy.config.logger&.warn("[dispatch_policy] heartbeat #{active_job_id} failed: #{e.class}: #{e.message}")
     ensure
       begin
-        ActiveRecord::Base.connection_pool.release_connection
+        # Through with_connection, not bare: `connected_to` is block-scoped,
+        # so by the time this ensure runs `current_role` is back to
+        # :writing and `ActiveRecord::Base.connection_pool` resolves to the
+        # WRITING pool — while the lease to hand back belongs to the role's
+        # pool, where the inflight row lives. Releasing the wrong pool is
+        # the same leak with an extra step.
+        Repository.with_connection { ActiveRecord::Base.connection_pool.release_connection }
       rescue StandardError
         # A pool that has gone away takes its connections with it.
       end

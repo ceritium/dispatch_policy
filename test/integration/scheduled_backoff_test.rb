@@ -191,4 +191,35 @@ class ScheduledBackoffTest < DispatchPolicy::IntegrationTest
 
     assert_equal 1, DispatchPolicy::StagedJob.count, "the due job left"
   end
+  # The park runs after the claim's DELETE and after record_partition_admit!
+  # takes the row lock, and its own subquery only looks at rows scheduled
+  # in the FUTURE. So a job that became due inside that gap — an enqueue
+  # whose transaction committed while the tick waited on the lock, or a
+  # row another tick released from SKIP LOCKED — gets hidden behind a
+  # horizon the park never saw it beside. Reproduced here with a second
+  # connection holding the due row, which needs no threads and no timing.
+  def test_the_park_does_not_hide_work_that_became_due_meanwhile
+    ScheduledJob.set(wait: 1.week).perform_later
+    ScheduledJob.perform_later # due now
+    due_id = DispatchPolicy::StagedJob.where(scheduled_at: nil).pick(:id)
+
+    other = ActiveRecord::Base.connection_pool.checkout
+    begin
+      other.begin_db_transaction
+      # The tick's claim skips it (FOR UPDATE SKIP LOCKED), so the tick
+      # sees nothing claimable and reaches the park.
+      other.exec_query("SELECT id FROM dispatch_policy_staged_jobs WHERE id = #{due_id} FOR UPDATE")
+
+      DispatchPolicy::Tick.run(policy_name: "scheduled_backoff")
+    ensure
+      other.rollback_db_transaction
+      ActiveRecord::Base.connection_pool.checkin(other)
+    end
+
+    assert_nil partition.scheduled_eligible_at,
+               "a due row exists; parking a week out strands it with nothing in the logs"
+
+    DispatchPolicy::Tick.run(policy_name: "scheduled_backoff")
+    assert_equal 1, DispatchPolicy::StagedJob.count, "the due job goes out on the next tick"
+  end
 end

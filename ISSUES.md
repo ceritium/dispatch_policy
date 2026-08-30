@@ -23,6 +23,18 @@ breaking the production line turns the suite red. Baseline going in:
 > `fix/throttle-atomicity-and-partition-lifecycle`. The narrative for
 > each — scenario, measurement, and what the fix does not promise —
 > is in CHANGELOG.md under Unreleased.
+>
+> A review of that branch itself then found six more, all fixed on it:
+> H10's release aimed at the writing pool rather than the role's, so the
+> leak survived on a multi-database install; H11's regression test was
+> vacuous (the job died inside `track`'s ensure, and the reaping rule was
+> unreachable in an initializer block — inverting it left the suite
+> green); M13's park could still hide a job that became due between the
+> claim and the park, and its comment still promised the guard the commit
+> removed; H8's savepoint swallowed `ActiveRecord::Rollback`, which would
+> have let an admission commit with nothing in the adapter; and M13's new
+> column was left out of the tick-order index while its upgrade note
+> prescribed a column type the migration does not produce.
 
 ## Blocker
 

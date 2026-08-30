@@ -48,6 +48,15 @@ class CreateDispatchPolicyTables < ActiveRecord::Migration[7.1]
               [:policy_name, :shard, :status, :next_eligible_at, :last_checked_at],
               name:  "idx_dp_partitions_tick_order",
               order: { next_eligible_at: "ASC NULLS FIRST", last_checked_at: "ASC NULLS FIRST" }
+    # claim_partitions filters on BOTH horizons. A partition parked on
+    # future work carries NULL in next_eligible_at (so the index above
+    # matches it) and its horizon here, leaving the elimination to a heap
+    # filter — which is a full scan of the pending rows once most of the
+    # table is scheduled work.
+    add_index :dispatch_policy_partitions,
+              [:policy_name, :shard, :status, :scheduled_eligible_at, :last_checked_at],
+              name:  "idx_dp_partitions_scheduled_order",
+              order: { scheduled_eligible_at: "ASC NULLS FIRST", last_checked_at: "ASC NULLS FIRST" }
 
     create_table :dispatch_policy_inflight_jobs do |t|
       t.string   :policy_name,    null: false

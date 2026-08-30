@@ -47,9 +47,7 @@ module DispatchPolicy
     # never reach the row of a re-staged job's NEXT admission.
     initializer "dispatch_policy.discard_cleanup" do
       ActiveSupport::Notifications.subscribe("perform.active_job") do |event|
-        next unless event.payload[:exception]
-
-        DispatchPolicy::InflightTracker.handle_discard(event.payload[:job])
+        DispatchPolicy::InflightTracker.handle_failed_perform(event)
       end
 
       ActiveSupport::Notifications.subscribe("discard.active_job") do |event|

@@ -79,7 +79,22 @@ module DispatchPolicy
     def enqueuing_inline(jobs, &block)
       return yield unless jobs.any? { |job| defers_its_own_enqueue?(job) }
 
-      ActiveRecord::Base.transaction(requires_new: true, joinable: false, &block)
+      # `transaction` swallows ActiveRecord::Rollback by design, so a
+      # savepoint here would absorb one raised anywhere in the forward:
+      # dispatch returns normally, the Tick counts the admission, and the
+      # TX commits with the staged rows deleted, the inflight rows
+      # inserted, and NOTHING in the adapter. Without the savepoint that
+      # same exception reaches admit_partition's own transaction and
+      # aborts the admission. Re-raise so the two paths agree.
+      completed = false
+      ActiveRecord::Base.transaction(requires_new: true, joinable: false) do
+        block.call
+        completed = true
+      end
+      return if completed
+
+      raise EnqueueFailed,
+            "the forward was rolled back inside its own savepoint; the admission must not commit"
     end
 
     def defers_its_own_enqueue?(job)

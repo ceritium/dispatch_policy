@@ -78,4 +78,26 @@ class DeferredEnqueueTest < DispatchPolicy::IntegrationTest
     assert_equal 1, DispatchPolicy::InflightJob.count,
                    "one admission, one inflight row — the re-stage loop leaks one per tick"
   end
+  # `transaction` swallows ActiveRecord::Rollback by design, so the
+  # savepoint the deferral fix introduces would absorb one raised anywhere
+  # in the forward: dispatch returns normally, the Tick counts the
+  # admission, and the transaction commits with the staged rows deleted,
+  # the inflight rows inserted, and nothing in the adapter. Without the
+  # savepoint that same exception reaches admit_partition's transaction
+  # and aborts the admission — the two paths have to agree.
+  def test_a_rollback_inside_the_savepoint_still_aborts_the_admission
+    DeferredJob.perform_later
+    adapter_jobs.clear
+
+    boom = ->(*) { raise ActiveRecord::Rollback }
+    DispatchPolicy::Bypass.stub(:with, boom) do
+      DispatchPolicy::Tick.run(policy_name: "deferred_enqueue")
+    end
+
+    assert_equal 1, DispatchPolicy::StagedJob.count,
+                 "the staged row must survive; committing here loses the job silently"
+    assert_equal 0, adapter_jobs.size
+    assert_equal 0, DispatchPolicy::InflightJob.count,
+                   "and the pre-inserted inflight row goes back with it"
+  end
 end

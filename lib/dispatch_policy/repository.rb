@@ -460,10 +460,20 @@ module DispatchPolicy
     # `partition_batch_size` slot burned every tick until the job is due,
     # with `no_rows_claimed` filling the denial breakdown meanwhile.
     #
-    # Only sets the value when there is no backoff already: a gate that
-    # just asked for one is asking about capacity, which outranks this.
-    # A NULL result (another tick took the rows in between) leaves the
-    # partition immediately eligible, which is correct.
+    # The horizon lives in its own column, so there is no backoff to
+    # protect from it any more — gates keep theirs in `next_eligible_at`
+    # and `claim_partitions` requires both. A NULL result (another tick
+    # took the rows in between) leaves the partition immediately
+    # eligible, which is correct.
+    #
+    # The NOT EXISTS is what keeps this from hiding work it cannot see.
+    # This runs after the claim's DELETE and after `record_partition_admit!`
+    # takes the row lock, and its own subquery only looks at rows
+    # scheduled in the FUTURE — so a job that became due in that gap (an
+    # enqueue whose transaction committed while we waited on the lock, or
+    # a row another tick released from SKIP LOCKED) would be parked behind
+    # the far horizon it never saw. Asking "is anything due?" in the same
+    # statement and the same snapshot as the write is what closes it.
     def defer_partition_to_next_scheduled!(policy_name:, partition_key:)
       connection.exec_query(
         <<~SQL.squish,
@@ -475,6 +485,11 @@ module DispatchPolicy
               ),
               updated_at = now()
           WHERE p.policy_name = $1 AND p.partition_key = $2
+            AND NOT EXISTS (
+              SELECT 1 FROM #{STAGED_TABLE} d
+              WHERE d.policy_name = $1 AND d.partition_key = $2
+                AND (d.scheduled_at IS NULL OR d.scheduled_at <= now())
+            )
         SQL
         "defer_partition_to_next_scheduled",
         [policy_name, partition_key]
