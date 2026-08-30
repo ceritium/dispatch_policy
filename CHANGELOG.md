@@ -36,6 +36,28 @@
   after which the tick re-parks it in the new column.
 ### Fixed
 
+- **Editing `partition_by` no longer silently removes the concurrency
+  cap.** Both concurrency gates counted in-flight rows under a key
+  recomputed from the context at evaluate time, while everything on the
+  admission path — the staged row, the pre-inserted inflight row, the
+  token bucket — is filed under the partition row's own key. The two
+  agree until somebody renames or coarsens the expression, which is an
+  ordinary deploy; from then on the gate counts zero for every partition
+  that predates the edit and hands out the full cap on top of whatever is
+  already running. The gates read the row now. CLAUDE.md described the
+  two values as identical "by construction", which is what kept this
+  invisible for three audits; corrected.
+
+- **A concurrency cap that came back through jsonb no longer wedges the
+  partition.** `Gates::Concurrency` resolved its `max:` with `Integer()`,
+  but the context a tick evaluates has been through a jsonb round trip,
+  which retypes anything that is not a JSON primitive. The README's own
+  example backs the cap with a host database column, and a `numeric`
+  column arrives as the String `"5.0"` — on which `Integer()` raises,
+  inside the admission transaction, so the partition backs off and
+  repeats forever. Resolved with `Float().floor`, mirroring what the
+  throttle already does with its rate.
+
 - **One poisoned staged row no longer kills the whole drain.** The UI's
   drain buttons called `ManualAdmission.force!` with no error isolation,
   so a staged row the Forwarder cannot deserialize — a job class renamed

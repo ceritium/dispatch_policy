@@ -67,14 +67,15 @@ module DispatchPolicy
     # half deliberately: the two must agree on when a row exists, and they
     # drifted once already (audit H3).
     #
-    # `partition_key` is the partition's canonical key, which is also the
-    # scope the concurrency gates count against: `partition_by` is
-    # policy-level, so both gates' `inflight_partition_key` is
-    # `policy.partition_for(ctx)` — the same value the staged row was
-    # filed under. Recomputing it per row cost a deep context copy, a
-    # registry lookup behind a mutex and a user proc call, inside the
-    # admission transaction, to arrive back at the value the caller
-    # already holds.
+    # `partition_key` is the partition row's own key, which is also what
+    # the concurrency gates count against — they read it off the same row
+    # rather than recomputing `policy.partition_for(ctx)`. The two agree
+    # until somebody edits `partition_by`, and then a recomputed key
+    # cannot see the rows written here, so the cap lapses for every
+    # partition that predates the edit. Recomputing per row also cost a
+    # deep context copy, a mutex-guarded registry lookup and a user proc
+    # call inside the admission transaction, to arrive back at the value
+    # the caller already holds.
     def self.pre_insert_admitted!(policy_name:, policy:, partition_key:, rows:)
       # Skip only when we KNOW the policy has no gate that reads these
       # rows. An unregistered policy — a web process whose registry never

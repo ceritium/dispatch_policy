@@ -76,7 +76,11 @@ module DispatchPolicy
 
       def evaluate(ctx, partition, admit_budget)
         policy_name = partition["policy_name"]
-        key         = inflight_partition_key(policy_name, ctx)
+        # The row's OWN key, not one recomputed from ctx — see the same
+        # change in Gates::Concurrency. Recomputing means the stats row and
+        # the inflight count are keyed differently from everything the
+        # admission path writes the moment anyone edits `partition_by`.
+        key         = partition["partition_key"]
 
         # Seed lazily so the very first admission has a row to read
         # (and so record_observation can UPDATE without a check).
@@ -114,15 +118,6 @@ module DispatchPolicy
         end
 
         Decision.new(allowed: [remaining, admit_budget].min)
-      end
-
-      # Same canonical scope as the staged_jobs partition_key — every
-      # gate in a policy uses `policy.partition_for(ctx)` so the
-      # inflight count and the adaptive stats line up exactly.
-      def inflight_partition_key(policy_name, ctx)
-        policy = DispatchPolicy.registry.fetch(policy_name)
-        raise InvalidPolicy, "unknown policy #{policy_name.inspect}" unless policy
-        policy.partition_for(ctx)
       end
 
       # Called from InflightTracker.track after each perform completes

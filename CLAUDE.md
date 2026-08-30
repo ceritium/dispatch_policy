@@ -258,10 +258,14 @@ dispatch_policy_policy_settings               one row per policy — pause flag
   and release macro-driven, and a class bound with
   `dispatch_policy_name = "x"` — public API, and the only way to share
   one policy across classes — got rows nothing ever deleted, wedging
-  the partition at `max` for an hour at a time. The key is always
-  `policy.partition_for(ctx)`, which is by construction the staged
-  `partition_key` the callers already hold, so don't recompute it per
-  row. `dispatch_policy_inflight_tracking` only sets a flag that ADDS
+  the partition at `max` for an hour at a time. The key is always the
+  partition ROW's `partition_key` — read it, never recompute it from
+  ctx. `policy.partition_for(ctx)` returns the same value only while
+  nobody edits `partition_by`; the moment somebody does, a gate counting
+  under the recomputed key stops seeing the rows the admission path
+  wrote under the stored one, and the cap silently lapses for every
+  partition that predates the edit. "By construction the same value" was
+  the wording here for three audits and it is what made that invisible. `dispatch_policy_inflight_tracking` only sets a flag that ADDS
   tracking for a policy WITHOUT such a gate (a live in-flight count on
   the dashboard); it installs nothing.
 - **`:adaptive_concurrency` updates `current_max` in a single SQL
