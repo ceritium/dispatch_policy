@@ -15,6 +15,7 @@ DispatchPolicy::Engine.routes.draw do
     member do
       post :drain
       post :admit
+      post :requeue
     end
   end
 

@@ -27,7 +27,9 @@ class DenyLockOrderTest < DispatchPolicy::IntegrationTest
 
   def setup
     super
-    %w[zeta alpha mike].each do |key|
+    # Keys chosen to discriminate: byte order and en_US.UTF-8 disagree on
+    # every pair here, so a bare ORDER BY produces a different order.
+    %w[acct:10 acct:1:eu Acme].each do |key|
       DispatchPolicy::Repository.upsert_partition!(
         policy_name: POLICY, partition_key: key, queue_name: nil,
         context: {}, delta_pending: 1
@@ -49,7 +51,7 @@ class DenyLockOrderTest < DispatchPolicy::IntegrationTest
   def test_the_partition_locks_are_taken_in_canonical_order_before_the_update
     seen = capture_sql do
       DispatchPolicy::Repository.bulk_record_partition_denies!(
-        %w[zeta alpha mike].map do |key|
+        %w[acct:10 acct:1:eu Acme].map do |key|
           { policy_name: POLICY, partition_key: key,
             gate_state_patch: {}, retry_after: 30 }
         end
@@ -63,27 +65,36 @@ class DenyLockOrderTest < DispatchPolicy::IntegrationTest
     refute_nil lock, "the deny must take its row locks explicitly, not leave the order to the planner"
     assert_operator lock, :<, upd, "locking after the UPDATE would be no ordering at all"
 
+    # The binds come from the Ruby `.uniq.sort`, so asserting them alone
+    # says nothing about the STATEMENT — deleting the ORDER BY entirely
+    # left this file green while the deadlock came back. Pin the SQL.
+    assert_match(/ORDER BY policy_name COLLATE "C", partition_key COLLATE "C"/,
+                 seen[lock][:sql],
+                 "without the ORDER BY the planner locks in heap order; without " \
+                 "COLLATE \"C\" it locks in the database's collation, which is not " \
+                 "the order stage_many! sorts by")
+
     keys = seen[lock][:binds].map { |b| b.respond_to?(:value) ? b.value : b }
                              .reject { |v| v == POLICY }
-    assert_equal %w[alpha mike zeta], keys,
+    assert_equal %w[Acme acct:10 acct:1:eu], keys,
                  "the order has to match what stage_many! sorts by, or the two still cross"
   end
 
   # The ordering must not have changed what the flush actually records.
   def test_the_deny_still_records_backoff_and_patch_for_every_entry
     DispatchPolicy::Repository.bulk_record_partition_denies!([
-      { policy_name: POLICY, partition_key: "alpha",
+      { policy_name: POLICY, partition_key: "Acme",
         gate_state_patch: { "throttle" => { "tokens" => 3.0 } }, retry_after: 30 },
-      { policy_name: POLICY, partition_key: "zeta",
+      { policy_name: POLICY, partition_key: "acct:10",
         gate_state_patch: {}, retry_after: 60 }
     ])
 
-    alpha = DispatchPolicy::Partition.find_by(partition_key: "alpha")
-    zeta  = DispatchPolicy::Partition.find_by(partition_key: "zeta")
+    first  = DispatchPolicy::Partition.find_by(partition_key: "Acme")
+    second = DispatchPolicy::Partition.find_by(partition_key: "acct:10")
 
-    assert_in_delta 3.0, alpha.gate_state.dig("throttle", "tokens").to_f, 0.01
-    refute_nil alpha.next_eligible_at
-    refute_nil zeta.next_eligible_at
-    assert_operator zeta.next_eligible_at, :>, alpha.next_eligible_at
+    assert_in_delta 3.0, first.gate_state.dig("throttle", "tokens").to_f, 0.01
+    refute_nil first.next_eligible_at
+    refute_nil second.next_eligible_at
+    assert_operator second.next_eligible_at, :>, first.next_eligible_at
   end
 end

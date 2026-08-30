@@ -80,9 +80,12 @@ inside the admission TX. Fixed with `Float().floor`.
 ### A7 — The staged claim orders by an unindexed column
 
 `priority` is in no index, so a deep single-partition backlog sorts
-itself on every admission: 118 ms and 13.7 MB of temp files per claim at
-500k rows, twice per tick. Fixed with `idx_dp_staged_claim_order`
-(0.078 ms after).
+itself on every admission, twice per tick. Re-measured on review at 500k
+rows: 35.8 ms to 87.4 ms per claim depending on plan, against 0.038 ms
+with `idx_dp_staged_claim_order`. (An earlier note here quoted "13.7 MB
+of temp files"; that could not be reproduced — with `LIMIT 200` Postgres
+picks a top-N heapsort and does not spill.) The index costs +0.08 ms per
+enqueue and 25 MB at that size.
 
 ## Low — recorded, not fixed
 

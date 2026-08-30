@@ -2,7 +2,7 @@
 
 module DispatchPolicy
   class PartitionsController < ApplicationController
-    before_action :find_partition, only: %i[show drain admit]
+    before_action :find_partition, only: %i[show drain admit requeue]
 
     DRAIN_MAX_PER_REQUEST = 10_000
     DRAIN_BATCH_SIZE      = 200
@@ -114,6 +114,21 @@ module DispatchPolicy
                            alert: "Could not forward: #{e.class} — see logs."
       end
       redirect_to partition_path(@partition), notice: "Forwarded #{forwarded} job(s)."
+    end
+
+    # Puts quarantined rows back in play. This is the only correct inverse
+    # of the quarantine: clearing `failed_at` by hand leaves pending_count
+    # where the quarantine left it, and `claim_partitions` requires
+    # `pending_count > 0`, so the rows come back deliverable and no tick
+    # ever claims them again.
+    def requeue
+      requeued = Repository.requeue_quarantined_jobs!(
+        policy_name:   @partition.policy_name,
+        partition_key: @partition.partition_key
+      )
+      redirect_to partition_path(@partition),
+                  notice: "Requeued #{requeued} undeliverable job(s); the next tick will " \
+                          "try them again."
     end
 
     # Empties the partition by force-admitting every staged job through the

@@ -101,4 +101,72 @@ class UndeliverableJobTest < DispatchPolicy::IntegrationTest
     assert_equal 1, forwarded
     assert_equal 1, DispatchPolicy::StagedJob.quarantined.count
   end
+  # The claim gained `failed_at IS NULL`; the scheduled park did not, and
+  # its "is anything due?" guard counts a quarantined row with a NULL
+  # scheduled_at as due work. So the park never fires and the partition is
+  # re-claimed, re-evaluated and denied on every single tick — the M10/M13
+  # busy loop, permanently, on a partition that will never admit anything.
+  def test_a_quarantined_row_does_not_keep_the_partition_from_parking
+    stage!("VanishedJob")
+    DispatchPolicy::Repository.stage!(
+      policy_name: "undeliverable", partition_key: "k", queue_name: nil,
+      job_class: LiveJob.name, job_data: LiveJob.new.serialize, context: {},
+      scheduled_at: 1.hour.from_now
+    )
+
+    DispatchPolicy::Tick.run(policy_name: "undeliverable")
+
+    assert_equal 1, DispatchPolicy::StagedJob.quarantined.count
+    refute_nil partition.scheduled_eligible_at,
+               "the only deliverable row is an hour out; leaving the horizon NULL " \
+               "re-claims this partition on every tick forever"
+  end
+
+  # The quarantine needs a working inverse. Clearing `failed_at` by hand —
+  # which the UI, the CHANGELOG and CLAUDE.md all used to prescribe — is
+  # not one: the quarantine decremented pending_count, `claim_partitions`
+  # requires `pending_count > 0`, so the row comes back deliverable and no
+  # tick ever claims it again.
+  def test_requeue_puts_a_quarantined_row_back_in_play
+    stage!("VanishedJob")
+    DispatchPolicy::Tick.run(policy_name: "undeliverable")
+    assert_equal 1, DispatchPolicy::StagedJob.quarantined.count
+    assert_equal 0, partition.pending_count
+
+    # The deploy that brings the class back.
+    Object.const_set(:VanishedJob, Class.new(LiveJob))
+    begin
+      requeued = DispatchPolicy::Repository.requeue_quarantined_jobs!(
+        policy_name: "undeliverable", partition_key: "k"
+      )
+      assert_equal 1, requeued
+      assert_equal 1, partition.pending_count,
+                   "without the counter the row is deliverable and unclaimable at once"
+
+      DispatchPolicy::Tick.run(policy_name: "undeliverable")
+      assert_equal 0, DispatchPolicy::StagedJob.count, "and now it actually goes out"
+    ensure
+      Object.send(:remove_const, :VanishedJob)
+    end
+  end
+
+  # The partition sweeper deletes on `pending_count = 0`, which before the
+  # quarantine could not happen while rows existed. Now it can — and
+  # collecting the partition would orphan the quarantined rows in the
+  # gem's most write-hot table, with nothing left pointing at them.
+  def test_the_sweeper_keeps_a_partition_that_still_holds_quarantined_rows
+    stage!("VanishedJob")
+    DispatchPolicy::Tick.run(policy_name: "undeliverable")
+    assert_equal 0, partition.pending_count
+
+    ActiveRecord::Base.connection.execute(<<~SQL)
+      UPDATE dispatch_policy_partitions
+      SET last_admit_at = now() - interval '48 hours',
+          created_at    = now() - interval '48 hours'
+    SQL
+    DispatchPolicy::TickLoop.sweep!
+
+    refute_nil partition,
+               "deleting it strands the quarantined rows with no route back to them"
+  end
 end

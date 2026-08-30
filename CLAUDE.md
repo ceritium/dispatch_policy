@@ -350,11 +350,26 @@ dispatch_policy_policy_settings               one row per policy — pause flag
   deletes from `staged_jobs` and there is no retention sweep for it.
   Marked rather than deleted on purpose: dropping a staged job silently
   is exactly the at-least-once violation the admission TX exists to
-  prevent, and clearing `failed_at` requeues it once the class is back.
+  prevent. The inverse is `Repository.requeue_quarantined_jobs!` (the
+  Requeue button), NOT clearing `failed_at` by hand — the quarantine
+  decremented `pending_count` and `claim_partitions` needs it above zero,
+  so a hand-cleared row is deliverable and unclaimable at the same time.
+  Everything that reads staged rows has to agree with the claim's
+  `failed_at IS NULL`: the scheduled park's due-work guard does, and the
+  partition sweeper anti-joins against `staged_jobs` so it cannot collect
+  a partition whose only remaining rows are quarantined.
   Anything else that can never succeed however often it is retried
   belongs in the same channel; do not add a second mechanism.
 - **Every multi-row writer of `partitions` takes its locks in
-  `(policy_name, partition_key)` order.** `stage_many!` sorts its groups
+  `(policy_name, partition_key)` BYTE order.** Which collation is not a
+  detail: `stage_many!` sorts in Ruby, i.e. `String#<=>`, i.e. bytes, so
+  the SQL side must say `COLLATE "C"` and not merely `ORDER BY`. A bare
+  `ORDER BY` inherits the database collation, and `en_US.UTF-8` — the
+  default on RDS, Heroku, the official postgres image and Debian/Ubuntu —
+  disagrees with byte order on ordinary keys (`acct:10` vs `acct:1:eu`,
+  `acme` vs `Acme`, `user1` vs `user_1`). Two writers ordering by
+  different collations is not ordering at all: measured at 18 deadlocks
+  in 20s with a bare ORDER BY, 0 with `COLLATE "C"`. `stage_many!` sorts its groups
   for this reason and says so; `bulk_record_partition_denies!` now takes
   an explicit ordered `SELECT … FOR UPDATE` before its
   `UPDATE … FROM (VALUES …)`, because a single statement locks in HEAP

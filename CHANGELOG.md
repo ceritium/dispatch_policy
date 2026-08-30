@@ -101,8 +101,13 @@
   `failed_at` / `failure_reason`, skipped by the claim, taken out of
   `pending_count`, and listed on the partition page under "Undeliverable"
   with its reason. Marked, not deleted — dropping a staged job silently
-  would break at-least-once — so clearing `failed_at` requeues it once
-  the class resolves again. The admission retries once after
+  would break at-least-once. Put them back with the Requeue button on the
+  partition page (`Repository.requeue_quarantined_jobs!`), which restores
+  `pending_count` in the same statement — clearing `failed_at` by hand
+  leaves the row deliverable and unclaimable at once, since the tick only
+  claims partitions with pending work. The scheduled park ignores
+  quarantined rows too, and the partition sweeper will not collect a
+  partition that still holds any, which would otherwise orphan them. The admission retries once after
   quarantining, so the healthy rows in the same batch go out on the same
   tick, and the denial reason is `undeliverable_job` rather than
   `forward_failed`, which pointed at the adapter.

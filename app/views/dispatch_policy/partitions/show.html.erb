@@ -104,8 +104,17 @@
       These rows could not be handed to the adapter and are held back so
       they stop blocking the rest of the partition — most often a job
       class a deploy renamed or removed. They are not counted as pending
-      and nothing will admit them until the class resolves again, at
-      which point clearing <code>failed_at</code> requeues them.
+      and nothing will admit them until the class resolves again — deploy
+      it, then press Requeue. (Clearing <code>failed_at</code> by hand is
+      not enough: the partition's pending count was decremented when they
+      were held back, and the tick only claims partitions with pending
+      work.)
+    </p>
+    <p>
+      <%= button_to "Requeue undeliverable", requeue_partition_path(@partition),
+                    class: "dp-btn",
+                    form: { data: { turbo: false },
+                            onsubmit: "return confirm('Put these back in the queue? They will be retried on the next tick, and held back again if they still cannot be delivered.');" } %>
     </p>
     <table class="dp-table">
       <thead><tr><th>id</th><th>Job class</th><th>Failed</th><th>Reason</th><th></th></tr></thead>

@@ -382,6 +382,37 @@ module DispatchPolicy
       marked
     end
 
+    # The inverse of the quarantine, and the only correct one: clearing
+    # `failed_at` by hand leaves `pending_count` where the quarantine left
+    # it, and `claim_partitions` requires `pending_count > 0`, so the row
+    # comes back deliverable and no tick ever claims it. One statement so
+    # a revive cannot commit without the counter.
+    #
+    # `scheduled_eligible_at` is cleared too: a partition parked behind a
+    # horizon computed while these rows were invisible would otherwise
+    # stay parked. `next_eligible_at` is left alone — a gate's backoff is
+    # still a legitimate reason to wait.
+    def requeue_quarantined_jobs!(policy_name:, partition_key:)
+      connection.exec_query(
+        <<~SQL.squish,
+          WITH requeued AS (
+            UPDATE #{STAGED_TABLE} SET failed_at = NULL, failure_reason = NULL
+            WHERE policy_name = $1 AND partition_key = $2 AND failed_at IS NOT NULL
+            RETURNING id
+          ), bumped AS (
+            UPDATE #{PARTITIONS_TABLE}
+            SET pending_count = pending_count + (SELECT count(*) FROM requeued),
+                scheduled_eligible_at = NULL,
+                updated_at = now()
+            WHERE policy_name = $1 AND partition_key = $2
+          )
+          SELECT count(*) AS requeued FROM requeued
+        SQL
+        "requeue_quarantined_jobs",
+        [policy_name, partition_key]
+      ).first["requeued"].to_i
+    end
+
     # Per-partition admit-state UPDATE. Runs inside the per-partition
     # admission TX alongside the DELETE, so pending_count / total_admitted
     # / gate_state changes commit atomically with the claim and the
@@ -558,6 +589,7 @@ module DispatchPolicy
           SET scheduled_eligible_at = (
                 SELECT MIN(s.scheduled_at) FROM #{STAGED_TABLE} s
                 WHERE s.policy_name = $1 AND s.partition_key = $2
+                  AND s.failed_at IS NULL
                   AND s.scheduled_at > now()
               ),
               updated_at = now()
@@ -565,6 +597,7 @@ module DispatchPolicy
             AND NOT EXISTS (
               SELECT 1 FROM #{STAGED_TABLE} d
               WHERE d.policy_name = $1 AND d.partition_key = $2
+                AND d.failed_at IS NULL
                 AND (d.scheduled_at IS NULL OR d.scheduled_at <= now())
             )
         SQL
@@ -606,7 +639,15 @@ module DispatchPolicy
       end
 
       # Take the row locks up front, in the same canonical order
-      # `stage_many!` uses. This UPDATE is one statement, and one statement
+      # `stage_many!` uses — which is Ruby's, i.e. BYTE order, so the SQL
+      # has to say COLLATE "C" and not just ORDER BY. A bare ORDER BY
+      # inherits the database's collation, and en_US.UTF-8 — the default
+      # on RDS, Heroku, the official postgres image and Debian/Ubuntu —
+      # disagrees with byte order on ordinary keys: acct:10 vs acct:1:eu,
+      # acme vs Acme, user1 vs user_1. Two writers ordering by different
+      # collations is not ordering at all, and the deadlock comes
+      # straight back (measured: 18 in 20s with a bare ORDER BY on an
+      # en_US.UTF-8 database, 0 with COLLATE "C"). This UPDATE is one statement, and one statement
       # gives no ordering guarantee: the planner joins VALUES against a
       # seq scan, so it locks in heap order — unrelated to
       # (policy_name, partition_key) and unrelated to the order of the
@@ -634,7 +675,7 @@ module DispatchPolicy
           <<~SQL.squish,
             SELECT 1 FROM #{PARTITIONS_TABLE}
             WHERE (policy_name, partition_key) IN (VALUES #{lock_values.join(", ")})
-            ORDER BY policy_name, partition_key
+            ORDER BY policy_name COLLATE "C", partition_key COLLATE "C"
             FOR UPDATE
           SQL
           "lock_partitions_for_deny",
@@ -1240,13 +1281,13 @@ module DispatchPolicy
       filter = ""
       if policy_name
         params << policy_name
-        filter = "AND policy_name = $#{params.size}"
+        filter = "AND p.policy_name = $#{params.size}"
       elsif except_policies.any?
         placeholders = except_policies.map do |name|
           params << name
           "$#{params.size}"
         end
-        filter = "AND policy_name NOT IN (#{placeholders.join(', ')})"
+        filter = "AND p.policy_name NOT IN (#{placeholders.join(', ')})"
       end
 
       if refilled_bucket
@@ -1256,14 +1297,14 @@ module DispatchPolicy
         params << refilled_bucket.fetch(:capacity).to_f
         params << refilled_bucket.fetch(:refill_rate).to_f
         params << refilled_bucket.fetch(:now).to_f
-        stored_refilled_at = "(gate_state -> 'throttle' ->> 'refilled_at')::double precision"
+        stored_refilled_at = "(p.gate_state -> 'throttle' ->> 'refilled_at')::double precision"
         # Same expression the admission UPDATE settles with, on the same
         # clock (config.now, not the database's). A row with no bucket
         # recorded at all has nothing to lose, hence the COALESCE to
         # capacity.
         refilled_bucket_sql = <<~SQL.squish
           AND LEAST(
-                COALESCE((gate_state -> 'throttle' ->> 'tokens')::double precision, $#{cap_idx}::double precision)
+                COALESCE((p.gate_state -> 'throttle' ->> 'tokens')::double precision, $#{cap_idx}::double precision)
                 + GREATEST(
                     $#{now_idx}::double precision
                     - COALESCE(#{stored_refilled_at}, $#{now_idx}::double precision),
@@ -1279,21 +1320,26 @@ module DispatchPolicy
       if throttled_cutoff_seconds
         params << throttled_cutoff_seconds.to_i
         age_sql = <<~SQL.squish
-          COALESCE(last_admit_at, created_at) < now() - (
-            CASE WHEN gate_state ? 'throttle' THEN $#{params.size} ELSE $1 END || ' seconds'
+          COALESCE(p.last_admit_at, p.created_at) < now() - (
+            CASE WHEN p.gate_state ? 'throttle' THEN $#{params.size} ELSE $1 END || ' seconds'
           )::interval
         SQL
       else
-        age_sql = "COALESCE(last_admit_at, created_at) < now() - ($1 || ' seconds')::interval"
+        age_sql = "COALESCE(p.last_admit_at, p.created_at) < now() - ($1 || ' seconds')::interval"
       end
 
       connection.exec_query(
         <<~SQL.squish,
-          DELETE FROM #{PARTITIONS_TABLE}
-          WHERE pending_count = 0
+          DELETE FROM #{PARTITIONS_TABLE} p
+          WHERE p.pending_count = 0
             #{filter}
             AND #{age_sql}
             #{refilled_bucket_sql}
+            AND NOT EXISTS (
+              SELECT 1 FROM #{STAGED_TABLE} s
+              WHERE s.policy_name = p.policy_name
+                AND s.partition_key = p.partition_key
+            )
         SQL
         "sweep_inactive_partitions",
         params
