@@ -28,38 +28,49 @@ forever).
 
 > **Status:** A1-A7 fixed. A8-A12 recorded, not fixed.
 
-## Four review rounds on the fix branch
+## Five review rounds on the fix branch
 
-The fixes themselves were reviewed four times, and the first three each
+The fixes themselves were reviewed five times, and the first three each
 found them defective — worth recording, because the pattern is specific:
-every defect was in a *fix*, none in the original audit.
+every defect was in a *fix*, none in the original audit. (Numbered
+Round N, not RN — the R IDs are taken by the 2026-08-13 review.)
 
-- **R1** — four of seven fixes broken; two did not work at all. A bare
+- **Round 1** — four of seven fixes broken; two did not work at all. A bare
   `ORDER BY` inherits the database collation, so the deadlock the
   `COLLATE "C"` sort exists to prevent survived it (18 in 20s); and
   narrowing `Repository`'s role routing to `with_connection` dropped the
   engine's own models out of it.
-- **R2** — a test that pinned the bind order instead of the SQL stayed
+- **Round 2** — a test that pinned the bind order instead of the SQL stayed
   green with the `ORDER BY` deleted; another installed its own
   subscription, so the railtie it claimed to cover was invisible to it;
   a third turned red when the *correct* fix was applied.
-- **R3** — the operator hint added for held-back rows pushed a bare Hash
+- **Round 3** — the operator hint added for held-back rows pushed a bare Hash
   where the template calls `hint.level` / `hint.message`, so
   `GET /dispatch_policy` 500'd whenever anything was held: the page the
   same commit added a tile to, failing in exactly the state the hint
   exists to surface. No request-level test existed to see it.
-- **R4** — nothing shipped broken. Two gaps: the `deserialize!` rescue
-  stopped at `NameError`, so a `scheduled_at` stored as a Float (what
-  Rails <= 7.1 wrote) still wedged a partition permanently via
-  `TypeError`; and CLAUDE.md still instructed the next maintainer, as a
-  prohibition, to re-narrow the rescue that had just been widened. Both
-  fixed here.
+- **Round 4** — nothing shipped broken. Two gaps: the `deserialize!` rescue
+  stopped at `NameError`, so anything else out of `klass.deserialize` —
+  a `KeyError` from an override reading a field a pre-upgrade payload
+  lacks, a `TypeError` from a `scheduled_at` this gem did not write —
+  still wedged a partition permanently; and CLAUDE.md still instructed
+  the next maintainer, as a prohibition, to re-narrow the rescue that had
+  just been widened. Both fixed.
+- **Round 5** — nothing broken again, and every new test verified red against
+  its parent commit. But the justification written for the widest rescue
+  in the gem did not survive being checked: it cited a Float
+  `scheduled_at` as what "Rails <= 7.1 wrote", and ActiveJob has written
+  iso8601 since 7.1 — the gemspec floor. The rule was right and the wedge
+  reproducible; the reason was checkable and wrong, in the one file whose
+  job is to stop the next narrowing. Corrected to name the mechanism
+  instead of enumerating classes.
 
 The recurring lesson is one thing: **a test must fail against the code as
 it was before the fix.** Four of the five defective tests above passed
-against the bug they were written for. The mutation battery
-(27 mutations, 26 caught) exists because that check cannot be made by
-reading.
+against the bug they were written for. The mutation battery exists
+because that check cannot be made by reading, and round 5 made it
+routine: every production file a fix touches gets reverted to its parent
+in a scratch copy, and the new test has to go red.
 
 ## High
 

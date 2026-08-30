@@ -101,12 +101,14 @@
   <section class="dp-section">
     <h2>Undeliverable (max 50)</h2>
     <p class="dp-empty">
-      These rows could not be handed to the adapter and are held back so
-      they stop blocking the rest of the partition — most often a job
-      class a deploy renamed or removed. They are not counted as pending
-      and nothing will admit them until the class resolves again — deploy
-      it, then press Requeue. (Clearing <code>failed_at</code> by hand is
-      not enough: the partition's pending count was decremented when they
+      These rows could not be deserialized by the tick process and are
+      held back so they stop blocking the rest of the partition — most
+      often a job class a deploy renamed or removed, but any error out of
+      the job's own <code>deserialize</code> does it. See the Reason
+      column. They are not counted as pending and nothing will admit them
+      until that error stops happening — deploy the missing class, or fix
+      the payload, then press Requeue. (Clearing <code>failed_at</code> by
+      hand is not enough: the partition's pending count was decremented when they
       were held back, and the tick only claims partitions with pending
       work.)
     </p>

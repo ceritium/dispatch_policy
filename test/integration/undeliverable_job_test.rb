@@ -270,12 +270,20 @@ class UndeliverableJobTest < DispatchPolicy::IntegrationTest
     assert_match(/staged:\s+StagedJob\.deliverable\.count/, source,
                  "counting held rows as staged is what made the tile lie")
     assert_match(/quarantined:\s+StagedJob\.quarantined\.count/, source)
+    # The hint can only tell the truth about the hold expiring if the
+    # controller hands it both knobs: either one at 0 means nothing ever
+    # releases, so this is an AND, and dropping the key entirely is
+    # invisible (OperatorHints defaults it to true).
+    assert_match(/quarantine_auto_release:\s*cfg\.quarantine_retry_after\.to_i\.positive\? &&\s*\n\s*cfg\.sweep_every_ticks\.to_i\.positive\?/,
+                 source,
+                 "an OR, or no key at all, promises an automatic retry that never comes")
   end
   # `String.deserialize` raises NoMethodError, which IS a NameError — so a
   # rescue listing NameError catches it and the test above passes either
   # way. Most of what `klass.deserialize` can raise is not a NameError at
-  # all, and stock ActiveJob supplies the cheapest example: a
-  # `scheduled_at` stored as a Float (what Rails <= 7.1 wrote) makes
+  # all. The cheapest case to stage needs no job class of its own: a
+  # `scheduled_at` that is not an iso8601 string — what a data migration,
+  # an import or a hand-edited `job_data` produces — makes stock
   # `deserialize_time` raise TypeError. Uncaught, that escapes to the
   # Tick's generic rescue, which queues a backoff and writes no
   # `failed_at` — so nothing releases the row and it heads every claim of

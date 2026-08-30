@@ -379,11 +379,15 @@ dispatch_policy_policy_settings               one row per policy — pause flag
   just an unresolvable constant: narrowing the rescue lets everything else
   escape to `Tick`'s generic rescue, which queues a backoff but writes no
   `failed_at`, so nothing ever releases the row and it heads every
-  subsequent claim of that partition forever. Two triggers need no custom
-  code at all — a `scheduled_at` stored as a Float by an older Rails makes
-  stock `deserialize_time` raise `TypeError`, and a `deserialize` override
-  reading a field a pre-upgrade payload lacks raises `KeyError`; neither
-  is a `NameError`. Now that the hold expires, holding a transient failure
+  subsequent claim of that partition forever. The trigger is not exotic
+  and is usually not a `NameError`: ANY error out of `klass.deserialize`
+  does it — a `deserialize` override reading a field a pre-upgrade payload
+  lacks (`KeyError`), one that touches the database (`RecordNotFound`), or
+  a staged row whose `job_data` this gem did not write (a data migration,
+  an import, a hand-edited row) whose `scheduled_at` is not an iso8601
+  string (`TypeError` out of stock `deserialize_time`). Do not try to
+  enumerate the classes — enumerating is what got this rescue narrowed
+  twice. The invariant is "this process could not deserialize the row". Now that the hold expires, holding a transient failure
   for one `quarantine_retry_after` window beats wedging a partition
   permanently. `UnresolvableJobClass` stays a distinct class only so the
   log names the ordinary case — it is not a narrower rescue. Pinned by

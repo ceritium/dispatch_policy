@@ -111,10 +111,13 @@ module DispatchPolicy
     # `klass.deserialize` escapes to Tick's generic rescue, which only
     # queues a backoff — no `failed_at`, so nothing releases it, and the
     # row heads every subsequent claim of that partition forever, healthy
-    # neighbours included. Two reachable examples with no custom code: a
-    # `scheduled_at` stored as a Float by an older Rails makes stock
-    # `deserialize_time` raise TypeError, and an override reading a field
-    # a pre-upgrade payload lacks raises KeyError. Neither is a NameError.
+    # neighbours included. The trigger is not exotic and is usually not a
+    # NameError: an override reading a field a pre-upgrade payload lacks
+    # raises KeyError, one that touches the database raises
+    # RecordNotFound, and a `job_data` this gem did not write (a data
+    # migration, an import) whose `scheduled_at` is not iso8601 raises
+    # TypeError out of stock `deserialize_time`. Enumerating the classes
+    # is what got this rescue narrowed twice.
     # Now that the hold EXPIRES, holding a transient failure for one
     # `quarantine_retry_after` window is strictly better than wedging the
     # partition permanently. `UnresolvableJobClass` stays listed first

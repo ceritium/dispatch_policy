@@ -426,10 +426,11 @@ module DispatchPolicy
       # transaction over every key holds FOR UPDATE on all of them for the
       # whole loop — measured at ~0.5s on 2,500 partitions, with a
       # concurrent perform_later blocked 453ms behind it. The lock order
-      # that matters is WITHIN a slice's statement, since each slice
-      # commits before the next one locks; the `.sort` above is what makes
-      # each slice's own ORDER BY agree with `stage_many!`. Partial
-      # progress is harmless: the next sweep re-selects whatever is left.
+      # that matters is WITHIN a slice's statement, and each slice's own
+      # `ORDER BY … COLLATE "C"` supplies it; since a slice commits before
+      # the next one locks, the `.sort` above buys determinism and stable
+      # slice boundaries, not lock ordering. Partial progress is harmless:
+      # the next sweep re-selects whatever is left.
       released = 0
       keys.each_slice(QUARANTINE_RELEASE_BATCH) do |slice|
         connection.transaction(requires_new: true) do
