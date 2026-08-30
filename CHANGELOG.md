@@ -50,6 +50,28 @@
   after which the tick re-parks it in the new column.
 ### Fixed
 
+- **The deny flush no longer deadlocks against bulk enqueues.**
+  `bulk_record_partition_denies!` is one `UPDATE … FROM (VALUES …)`, and
+  one statement gives no lock-ordering guarantee: the planner joins the
+  VALUES list against a sequential scan, so it takes row locks in heap
+  order — unrelated to `(policy_name, partition_key)` and unrelated to
+  the order of the list, so sorting the Ruby array does not help.
+  `stage_many!` sorts its per-partition upserts precisely so concurrent
+  bulk enqueues agree on an order; against that, the deny crossed.
+  Measured with no misconfiguration at all — one tick loop for a policy,
+  default config, plus one process calling `perform_all_later` over the
+  same partitions: **16 Postgres deadlocks in 20 seconds**. Seven aborted
+  the caller's bulk enqueue, leaving the staged half rolled back while
+  the non-policy half had already reached the adapter — a batch that is
+  not whole-retryable. The other nine killed `Tick#flush_denies!`, which
+  rescues and only logs, so every denied partition in that tick lost both
+  its backoff and its `gate_state` patch and was immediately
+  re-claimable: the M4 busy-loop, tick-wide. The flush now takes its row
+  locks up front in the same canonical order `stage_many!` uses. A
+  deadlock-retry wrapper would not have done — it leaves the lock convoy
+  (bulk enqueue throughput measured ~4× lower) and still surfaces partial
+  batches once the retry budget is spent.
+
 - **Introducing or changing `shard_by` no longer strands every existing
   partition.** The shard was pinned on first write and never rewritten,
   so the day a policy gained a `shard_by` — the documented way to

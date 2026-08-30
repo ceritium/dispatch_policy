@@ -545,22 +545,59 @@ module DispatchPolicy
         )
       end
 
-      connection.exec_query(
-        <<~SQL.squish,
-          UPDATE #{PARTITIONS_TABLE} p
-          SET gate_state       = p.gate_state || v.gate_state_patch,
-              next_eligible_at = CASE
-                WHEN v.retry_after_secs IS NULL THEN p.next_eligible_at
-                ELSE now() + (v.retry_after_secs * interval '1 second')
-              END,
-              updated_at       = now()
-          FROM (VALUES #{values_sql.join(", ")})
-            AS v(policy_name, partition_key, gate_state_patch, retry_after_secs)
-          WHERE p.policy_name = v.policy_name AND p.partition_key = v.partition_key
-        SQL
-        "bulk_record_partition_denies",
-        params
-      )
+      # Take the row locks up front, in the same canonical order
+      # `stage_many!` uses. This UPDATE is one statement, and one statement
+      # gives no ordering guarantee: the planner joins VALUES against a
+      # seq scan, so it locks in heap order — unrelated to
+      # (policy_name, partition_key) and unrelated to the order of the
+      # VALUES list, which is why sorting the Ruby array does not help.
+      # Against `upsert_partition!`'s ON CONFLICT, which does take its
+      # locks in key order, that deadlocks: measured at 16 deadlocks in
+      # 20s from ONE tick loop plus ONE process calling perform_all_later,
+      # with no misconfiguration. Half of them aborted the caller's bulk
+      # enqueue mid-batch; the other half killed `Tick#flush_denies!`,
+      # which only logs — so every denied partition in that tick lost its
+      # backoff AND its gate_state patch and was immediately re-claimable.
+      # A retry wrapper would not do: it leaves the lock convoy (bulk
+      # enqueue throughput was ~4x lower) and still surfaces partial
+      # batches once the retry budget is spent.
+      lock_values = []
+      lock_params = []
+      entries.map { |e| [e[:policy_name], e[:partition_key]] }.uniq.sort.each_with_index do |pair, idx|
+        base = idx * 2
+        lock_values << "($#{base + 1}::text, $#{base + 2}::text)"
+        lock_params.concat(pair)
+      end
+
+      connection.transaction(requires_new: true) do
+        connection.exec_query(
+          <<~SQL.squish,
+            SELECT 1 FROM #{PARTITIONS_TABLE}
+            WHERE (policy_name, partition_key) IN (VALUES #{lock_values.join(", ")})
+            ORDER BY policy_name, partition_key
+            FOR UPDATE
+          SQL
+          "lock_partitions_for_deny",
+          lock_params
+        )
+
+        connection.exec_query(
+          <<~SQL.squish,
+            UPDATE #{PARTITIONS_TABLE} p
+            SET gate_state       = p.gate_state || v.gate_state_patch,
+                next_eligible_at = CASE
+                  WHEN v.retry_after_secs IS NULL THEN p.next_eligible_at
+                  ELSE now() + (v.retry_after_secs * interval '1 second')
+                END,
+                updated_at       = now()
+            FROM (VALUES #{values_sql.join(", ")})
+              AS v(policy_name, partition_key, gate_state_patch, retry_after_secs)
+            WHERE p.policy_name = v.policy_name AND p.partition_key = v.partition_key
+          SQL
+          "bulk_record_partition_denies",
+          params
+        )
+      end
     end
 
     # ----- policy settings ------------------------------------------------------

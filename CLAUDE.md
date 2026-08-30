@@ -328,6 +328,18 @@ dispatch_policy_policy_settings               one row per policy — pause flag
   admitted` and `decayed_admits_at = now()`. Same row lock we already
   hold. `bulk_record_partition_denies!` does NOT touch the decay
   (no admission means no increment).
+- **Every multi-row writer of `partitions` takes its locks in
+  `(policy_name, partition_key)` order.** `stage_many!` sorts its groups
+  for this reason and says so; `bulk_record_partition_denies!` now takes
+  an explicit ordered `SELECT … FOR UPDATE` before its
+  `UPDATE … FROM (VALUES …)`, because a single statement locks in HEAP
+  order — not the order of its VALUES list, so sorting the Ruby array
+  fixes nothing. Without it the two deadlock under an ordinary tick loop
+  plus one `perform_all_later` process, and losing the flush loses every
+  denied partition's backoff for that tick. If you add another statement
+  that writes several partition rows, give it the same order —
+  `sweep_inactive_partitions!`'s DELETE has the same unordered shape and
+  is only safe because it runs every `sweep_every_ticks`.
 - **`claim_staged_jobs!` requires `limit > 0`** (it's now the
   admit-only path). The pure-deny path goes through
   `Repository.bulk_record_partition_denies!`: the Tick accumulates
