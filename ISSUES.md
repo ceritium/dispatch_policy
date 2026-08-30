@@ -35,6 +35,13 @@ breaking the production line turns the suite red. Baseline going in:
 > have let an admission commit with nothing in the adapter; and M13's new
 > column was left out of the tick-order index while its upgrade note
 > prescribed a column type the migration does not produce.
+>
+> A second review pass then found one more, in M18's own consequences:
+> a forced admission drives the bucket arbitrarily negative, and the
+> resulting backoff overflowed the Postgres interval parser — which
+> discarded the whole tick's deny flush, restoring M4's busy-loop for
+> every partition of that policy. Fixed by multiplying an interval
+> instead of parsing one from text.
 
 ## Blocker
 

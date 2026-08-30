@@ -90,6 +90,11 @@ class FailedPerformCleanupTest < DispatchPolicy::IntegrationTest
       raise ActiveJob::DeserializationError
     end
 
+    # The railtie installs this prepend in a real app.
+    unless ActiveJob.singleton_class.include?(DispatchPolicy::JobExtension::BulkEnqueue)
+      ActiveJob.singleton_class.prepend(DispatchPolicy::JobExtension::BulkEnqueue)
+    end
+
     before = ActiveJob::Base.queue_adapter.enqueued_jobs.size
     DispatchPolicy::JobExtension.stub(:ensure_arguments_materialized!, raiser) do
       ExplodingJob.perform_later
@@ -99,5 +104,38 @@ class FailedPerformCleanupTest < DispatchPolicy::IntegrationTest
                  "we could not compute a partition, so the gem steps aside"
     assert_equal before + 1, ActiveJob::Base.queue_adapter.enqueued_jobs.size,
                  "the adapter gets it and it fails at perform — the un-gemmed behaviour"
+  end
+  # The single path steps aside for a job whose arguments cannot be
+  # rebuilt; the bulk path used to raise from inside the row builder,
+  # which aborts the map and loses every OTHER stageable job in the batch
+  # — after `super(to_adapter)` has already handed the non-policy half to
+  # the adapter, so a caller that rescues and re-drives duplicates those.
+  def test_one_unrebuildable_job_does_not_take_the_bulk_batch_with_it
+    good  = ExplodingJob.new
+    bad   = ExplodingJob.new
+    raiser = lambda do |job|
+      return unless job.equal?(bad)
+
+      begin
+        raise StandardError, "record gone"
+      rescue StandardError
+        raise ActiveJob::DeserializationError
+      end
+    end
+
+    # The railtie installs this prepend in a real app.
+    unless ActiveJob.singleton_class.include?(DispatchPolicy::JobExtension::BulkEnqueue)
+      ActiveJob.singleton_class.prepend(DispatchPolicy::JobExtension::BulkEnqueue)
+    end
+
+    before = ActiveJob::Base.queue_adapter.enqueued_jobs.size
+    DispatchPolicy::JobExtension.stub(:ensure_arguments_materialized!, raiser) do
+      ActiveJob.perform_all_later(good, bad)
+    end
+
+    assert_equal 1, DispatchPolicy::StagedJob.count,
+                 "the healthy job still stages"
+    assert_equal before + 1, ActiveJob::Base.queue_adapter.enqueued_jobs.size,
+                 "and the one we cannot partition goes to the adapter, as the single path does"
   end
 end

@@ -534,7 +534,7 @@ module DispatchPolicy
           SET gate_state       = p.gate_state || v.gate_state_patch,
               next_eligible_at = CASE
                 WHEN v.retry_after_secs IS NULL THEN p.next_eligible_at
-                ELSE now() + (v.retry_after_secs || ' seconds')::interval
+                ELSE now() + (v.retry_after_secs * interval '1 second')
               END,
               updated_at       = now()
           FROM (VALUES #{values_sql.join(", ")})
@@ -1227,12 +1227,28 @@ module DispatchPolicy
       end
     end
 
+    # Multiplication, not `(n || ' seconds')::interval`. Postgres' interval
+    # INPUT PARSER rejects a seconds field above INT_MAX, and a backoff is
+    # derived from a token debt, which has no such bound: a forced
+    # admission charges the bucket for everything it forwarded, so
+    # `retry_after = (1 - tokens) / refill_rate` crosses INT_MAX after
+    # roughly `2.147e9 * rate/per` jobs — about 7,100 for a
+    # `rate: 2, per: 7.days` policy, well inside one drain click. The
+    # multiply accepts the full double range instead.
+    #
+    # This is not cosmetic. The same expression in
+    # `bulk_record_partition_denies!` builds ONE statement for the whole
+    # tick, and `Tick#flush_denies!` only logs on failure — so a single
+    # unparseable interval discards every denied partition's backoff AND
+    # gate_state patch in that batch. Those partitions are then re-claimed
+    # every tick with nothing recorded: the M4 busy-loop, for a whole
+    # policy, from one UI click.
     def next_eligible_clause(retry_after)
       if retry_after.nil?
         ["NULL", []]
       else
         # 5th param ($5) — caller appends params to those of the parent UPDATE
-        ["now() + ($5 || ' seconds')::interval", [retry_after.to_f.round(3)]]
+        ["now() + ($5 * interval '1 second')", [retry_after.to_f.round(3)]]
       end
     end
 

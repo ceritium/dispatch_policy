@@ -24,7 +24,10 @@
   others on the table and with every fresh install's schema dump. The
   index matters once the table is large and most of the work is
   `set(wait:)`-scheduled: `claim_partitions` filters on both horizons, and
-  without it the parked rows are eliminated by a heap filter.
+  without it the parked rows are eliminated by a heap filter. It is not
+  free — the claim rewrites `last_checked_at` on every pass, so the table
+  now maintains two indexes on that hot path; an install whose work is
+  mostly due-now can skip it.
 
   No backfill is needed. NULL means "nothing is holding this partition
   back", which is the correct reading for every existing row; a
@@ -49,6 +52,23 @@
   `Forwarder`/`ManualAdmission` is untouched — it is what rolls the claim
   transaction back and saves the staged rows.
 
+- **A backoff is no longer parsed out of a string, so a large drain
+  cannot take a whole policy's deny bookkeeping with it.** Both backoff
+  clauses built `now() + (n || ' seconds')::interval`, and Postgres'
+  interval input parser rejects a seconds field above `INT_MAX`. A
+  backoff is derived from a token debt, which has no such bound now that
+  a forced admission charges the bucket: `retry_after = (1 - tokens) /
+  refill_rate` crosses `INT_MAX` after roughly `2.147e9 × rate/per`
+  jobs — about 7,100 for a `rate: 2, per: 7.days` policy, inside a
+  single drain click. `bulk_record_partition_denies!` builds ONE
+  statement for the whole tick and `Tick#flush_denies!` only logs on
+  failure, so one unparseable interval discarded every denied
+  partition's `next_eligible_at` **and** `gate_state` patch in that
+  batch. Those partitions were then re-claimed on every tick with
+  nothing recorded — the M4 busy-loop, for a whole policy, from one UI
+  click, silent but for a single log line. Both clauses multiply an
+  interval instead, which takes the full double range.
+
 - **A job that dies before `around_perform` releases its slot even
   without `discard_on`.** The railtie reaped the Tick's pre-inserted
   inflight row on `discard.active_job`, and CLAUDE.md claimed that
@@ -70,7 +90,12 @@
   block, because a subscription body is unreachable from the suite.
 
   Relatedly, a job whose arguments cannot be rebuilt no longer raises out
-  of the *enqueue* callback. ActiveJob's own enqueue copes (`serialize`
+  of the *enqueue* callback, on either path — the bulk one materializes
+  before it splits the batch, so one such job is routed to the adapter
+  rather than aborting the row builder and losing every other stageable
+  job with it (after the non-policy half has already gone to the
+  adapter, where a caller that rescues and re-drives would duplicate
+  them). ActiveJob's own enqueue copes (`serialize`
   reuses the serialized arguments), so raising there destroyed the retry
   that `retry_on ActiveJob::DeserializationError` had just scheduled —
   turning a recoverable job into a hard failure the gem itself caused.
