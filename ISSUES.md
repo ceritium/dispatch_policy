@@ -6,6 +6,119 @@ are as of the commit named in the audit heading.
 
 ---
 
+# Audit 2026-08-30 — whole-gem hunt, fourth pass (`c4c6475`)
+
+Six hunters over the ground the first three passes did not cover, each
+finding attacked by an independent verifier that accepted it only after
+reproducing the failure itself. Twelve defects confirmed; the seven at
+medium and above are fixed here, the five low ones are listed below for
+a later pass.
+
+The shape is worth recording, because it is what three passes of
+subsystem-by-subsystem auditing structurally could not see: **the core is
+sound and the edges are not.** Four tick loops racing one shard produced
+1000 distinct jobs at the adapter with 0 duplicates and 0 losses; a 25s
+chaos run of 23,850 enqueues against aggressive sweeps and 1,998 drains
+left no orphaned rows and no `pending_count` drift; a backend killed
+mid-admission rolled back cleanly. What broke was change (editing
+`partition_by` or `shard_by` on a live install), deployment (the
+documented multi-database install), interaction (two ordinary
+participants deadlocking), and failure (one bad row wedging a partition
+forever).
+
+> **Status:** A1-A7 fixed. A8-A12 recorded, not fixed.
+
+## High
+
+### A1 — The deny flush deadlocks against bulk enqueues
+
+`bulk_record_partition_denies!` is one statement, so it locks in heap
+order while `stage_many!` deliberately sorts. One tick loop plus one
+`perform_all_later` process: 16 deadlocks in 20s. Half aborted the
+caller's batch mid-flight, half killed `flush_denies!` — which only logs
+— so every denied partition in that tick lost its backoff and its
+gate_state patch. Fixed with an ordered `FOR UPDATE` before the UPDATE.
+
+### A2 — One undeliverable staged row wedges its partition forever
+
+A `job_class` that no longer resolves rolls the batch back (correctly),
+but the claim orders it to the head of the partition every time, so the
+healthy rows behind it are never admitted again. No exit existed in the
+product. Fixed by quarantining the row (`failed_at`), retrying the
+admission once, and surfacing it in the UI.
+
+### A3 — Introducing or changing `shard_by` strands every existing partition
+
+The shard was pinned on first write and never rewritten, so partitions
+that predate the change keep a shard no loop is started for. New
+partitions drain normally, so the dashboard looks healthy. Fixed by
+recomputing the shard while the partition is drained.
+
+### A4 — `config.database_role` flips the role process-wide
+
+`ActiveRecord::Base.connected_to` swaps the role for the whole hierarchy
+and still leaves an adapter that writes through its own record class on
+another connection — so the documented separate-queue-database install
+could not admit a job, and its atomicity guarantee never held. Fixed
+with `config.database_connection_class`, verified against two real
+databases.
+
+## Medium
+
+### A5 — Editing `partition_by` silently removes the concurrency cap
+
+Both concurrency gates counted in-flight rows under a key recomputed from
+ctx, while the admission path files everything under the partition row's
+key. Fixed by reading the row. CLAUDE.md's "by construction the same
+value" is what hid this for three audits.
+
+### A6 — A jsonb-retyped cap wedges the partition
+
+`Integer()` on a `max:` that came back from jsonb as `"5.0"` raises
+inside the admission TX. Fixed with `Float().floor`.
+
+### A7 — The staged claim orders by an unindexed column
+
+`priority` is in no index, so a deep single-partition backlog sorts
+itself on every admission: 118 ms and 13.7 MB of temp files per claim at
+500k rows, twice per tick. Fixed with `idx_dp_staged_claim_order`
+(0.078 ms after).
+
+## Low — recorded, not fixed
+
+- **A8** Round-trip stats count schedule-parked partitions as "never
+  checked", so a normal `set(wait:)` workload shows a red dashboard.
+- **A9** The pending sparkline averages across policies and drops empty
+  periods, so a dead tick loop reads as a falling backlog.
+- **A10** The adaptive gate's `queue_lag` subtracts the worker's clock
+  from the database's, so host skew above `target_lag_ms` shrinks the cap
+  permanently.
+- **A11** Scheduled-work comparisons mix an app-written timestamp with
+  Postgres `now()`, so a non-UTC session TimeZone runs `set(wait:)` jobs
+  early (or never).
+- **A12** The heartbeat thread contends for the same pool the worker
+  holds for the whole perform; at the Rails-default pool size a beat that
+  lands early and then starves can get a still-running job swept as stale.
+
+## Verified against the real adapter
+
+The previous three passes never ran good_job or solid_queue — the whole
+atomicity contract rested on reading the adapter source. Closed here
+against a live good_job install:
+
+```
+perform_later x5   -> staged=5, good_jobs=0
+tick               -> admitted=3 (throttle rate: 3), staged=2, good_jobs=3
+bucket after       -> 0
+failure after the adapter enqueue, inside the admission TX
+                   -> good_jobs 3 => 3, the 2 staged rows returned
+```
+
+The last line is the at-least-once guarantee itself: the adapter's INSERT
+rolled back with the gem's transaction.
+
+---
+
 # Audit 2026-08-29 — throttle review + subsystem hunt (`749274a`)
 
 Third full review. Two halves: a line-by-line review of the throttle
