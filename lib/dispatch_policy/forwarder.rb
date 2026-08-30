@@ -100,11 +100,23 @@ module DispatchPolicy
         job.class.enqueue_after_transaction_commit
     end
 
-    # A row whose job_class this process cannot resolve. That is NOT the
-    # same as "can never be delivered": the ordinary case is a rolling
-    # deploy where the web pods already stage jobs for a class the tick
-    # pod's image does not have yet. So the row is held back rather than
-    # failed, and `TickLoop.sweep!` releases the hold on a cadence. Raising a plain NameError here rolls the batch back
+    # A row this process cannot deserialize. That is NOT the same as "can
+    # never be delivered": the ordinary case is a rolling deploy where the
+    # web pods already stage jobs for a class the tick pod's image does
+    # not have yet. So the row is held back rather than failed, and
+    # `TickLoop.sweep!` releases the hold on a cadence.
+    #
+    # `NameError` broadly, not just `UnresolvableJobClass`. Narrowing it
+    # reopens the wedge this exists to prevent: anything else out of
+    # `klass.deserialize` escapes to Tick's generic rescue, which only
+    # queues a backoff — no `failed_at`, so nothing releases it, and the
+    # row heads every subsequent claim of that partition forever. Now
+    # that the hold EXPIRES, holding a transient failure for an hour is
+    # strictly better than wedging the partition permanently. The
+    # narrowing was argued from custom argument serializers, which do not
+    # run here at all: `Base.deserialize` only stores
+    # @serialized_arguments. `UnresolvableJobClass` stays first because it
+    # is the case worth naming in the log. Raising a plain NameError here rolls the batch back
     # (correct — that rollback is the at-least-once guarantee) and leaves
     # the row at the head of the claim, where it poisons every subsequent
     # admission of that partition forever, healthy neighbours included.
@@ -112,7 +124,7 @@ module DispatchPolicy
     # quarantine exactly those and admit the rest.
     def deserialize!(row)
       Serializer.deserialize(row["job_data"])
-    rescue UnresolvableJobClass, InvalidPolicy => e
+    rescue UnresolvableJobClass, NameError, InvalidPolicy => e
       raise UndeliverableJob.new(
         "staged row #{row['id']} (#{row['job_class']}): #{e.class}: #{e.message}",
         staged_ids: [row["id"]]

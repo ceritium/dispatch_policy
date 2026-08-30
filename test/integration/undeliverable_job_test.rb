@@ -229,4 +229,46 @@ class UndeliverableJobTest < DispatchPolicy::IntegrationTest
     end
     refute_kind_of DispatchPolicy::UnresolvableJobClass, err
   end
+  # The hold has to cover any deserialize failure, not just the
+  # constantize. Anything else escapes to the Tick's generic rescue,
+  # which only queues a backoff — no `failed_at`, so nothing ever
+  # releases it, and the row heads every claim of that partition forever.
+  # That is the wedge the hold exists to prevent, reopened from the other
+  # side.
+  def test_a_deserialize_failure_that_is_not_a_missing_constant_is_also_held
+    DispatchPolicy::Repository.stage!(
+      policy_name: "undeliverable", partition_key: "k", queue_name: nil,
+      job_class: "String", # resolves fine; String.deserialize does not exist
+      job_data: { "job_class" => "String" }, context: {}
+    )
+    stage!(LiveJob.name)
+
+    DispatchPolicy::Tick.run(policy_name: "undeliverable")
+
+    assert_equal 1, DispatchPolicy::StagedJob.quarantined.count,
+                 "not held means not released either — it wedges the partition forever"
+    assert_equal 0, DispatchPolicy::StagedJob.deliverable.count,
+                 "and the healthy row behind it still goes out"
+  end
+  # The dashboard's "Staged" tile is what an operator reads as backlog.
+  # Counting held rows there says work is in motion when nothing is
+  # trying to admit them, and feeds a drain-time estimate that can never
+  # come true — so they get their own tile instead.
+  def test_held_rows_are_not_counted_as_staged_backlog
+    stage!("VanishedJob")
+    stage!(LiveJob.name)
+    DispatchPolicy::Tick.run(policy_name: "undeliverable")
+    stage!(LiveJob.name)
+
+    assert_equal 1, DispatchPolicy::StagedJob.quarantined.count
+    assert_equal 1, DispatchPolicy::StagedJob.deliverable.count
+
+    source = File.read(File.expand_path(
+      "../../app/controllers/dispatch_policy/dashboard_controller.rb", __dir__
+    ))
+    assert_match(/staged:\s+StagedJob\.deliverable\.count/, source,
+                 "counting held rows as staged is what made the tile lie")
+    assert_match(/quarantined:\s+StagedJob\.quarantined\.count/, source)
+
+  end
 end

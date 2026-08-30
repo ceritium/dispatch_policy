@@ -140,4 +140,25 @@ class OperatorHintsTest < Minitest::Test
     hints = call(admitted_per_minute: 200_000, adapter_target_jps: nil)
     refute(hints.any? { |h| h.message.include?("adapter ceiling") })
   end
+  # Every hint is a Hint struct and the view calls `hint.level` /
+  # `hint.message`. This one shipped as a bare Hash with a `:text` key, so
+  # the dashboard 500'd whenever anything was held back — the exact state
+  # the hint exists to surface. Asserting on hash contents would have
+  # passed against the broken code, so call the readers the view calls.
+  def test_the_held_back_hint_is_renderable
+    hints = DispatchPolicy::OperatorHints.for(quarantined: 2)
+    hint  = hints.find { |h| h.message.include?("held back") }
+
+    refute_nil hint
+    assert_equal :warn, hint.level
+    assert_match(/2 staged job\(s\) are held back/, hint.message)
+    assert_match(/retried automatically/, hint.message,
+                 "telling the operator to Requeue by hand what the sweeper releases " \
+                 "on its own sends them chasing a non-problem")
+  end
+
+  def test_no_held_back_hint_when_nothing_is_held
+    hints = DispatchPolicy::OperatorHints.for(quarantined: 0)
+    assert_empty hints.select { |h| h.message.include?("held back") }
+  end
 end

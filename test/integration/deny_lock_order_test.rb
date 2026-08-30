@@ -122,4 +122,37 @@ class DenyLockOrderTest < DispatchPolicy::IntegrationTest
     refute_nil lock, "without an explicit ordered lock this deadlocks against stage_many!"
     assert_match(/ORDER BY policy_name COLLATE "C", partition_key COLLATE "C"/, lock[:sql])
   end
+  # One bind per held partition and one transaction over all of them:
+  # Postgres caps parameters at 65,535, and holding FOR UPDATE on every
+  # row for the whole loop was measured at ~0.5s on 2,500 partitions with
+  # a concurrent perform_later blocked behind it. Sliced, byte order is
+  # preserved across slices so the stage_many! lock-order invariant still
+  # holds.
+  def test_the_quarantine_release_is_sliced
+    batch = DispatchPolicy::Repository::QUARANTINE_RELEASE_BATCH
+    keys  = (1..(batch + 5)).map { |i| format("k%05d", i) }
+    keys.each do |key|
+      DispatchPolicy::Repository.stage!(
+        policy_name: POLICY, partition_key: key, queue_name: nil,
+        job_class: "X", job_data: {}, context: {}
+      )
+      id = DispatchPolicy::StagedJob.where(partition_key: key).pick(:id)
+      DispatchPolicy::Repository.quarantine_staged_jobs!(
+        policy_name: POLICY, partition_key: key, ids: [id], reason: "t"
+      )
+    end
+    ActiveRecord::Base.connection.execute(
+      "UPDATE dispatch_policy_staged_jobs SET failed_at = now() - interval '2 hours'"
+    )
+
+    seen = capture_sql do
+      DispatchPolicy::Repository.release_aged_quarantines!(policy_name: POLICY, older_than: 60)
+    end
+
+    locks = seen.select { |p| p[:name] == "lock_partitions_for_quarantine_release" }
+    assert_equal 2, locks.size,
+                 "one statement for #{keys.size} keys hits the bind ceiling and holds " \
+                 "every lock for the whole loop"
+    assert_equal keys.size, DispatchPolicy::StagedJob.deliverable.count
+  end
 end

@@ -61,12 +61,14 @@ module DispatchPolicy
 
       # ---- backlog drain time ----------------------------------------
       if m[:quarantined].to_i.positive?
-        hints << {
-          level: :warn,
-          text:  "#{m[:quarantined]} staged job(s) are held back: this process could not " \
-                 "resolve their job class. A rolling deploy clears itself; a class that is " \
-                 "really gone stays here. Open the partition to see which, and Requeue."
-        }
+        hints << Hint.new(
+          level:   :warn,
+          message: "#{m[:quarantined]} staged job(s) are held back: this process could not " \
+                   "resolve their job class. A rolling deploy clears itself — the hold is " \
+                   "retried automatically after quarantine_retry_after. A class that is " \
+                   "really gone stays here; open the partition to see which, and Requeue " \
+                   "to retry sooner."
+        )
       end
 
       if m[:admitted_per_minute].to_i.positive? && m[:pending_total].to_i.positive?
