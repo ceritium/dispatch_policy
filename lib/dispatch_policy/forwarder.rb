@@ -100,9 +100,11 @@ module DispatchPolicy
         job.class.enqueue_after_transaction_commit
     end
 
-    # A row whose job_class no longer resolves can never be delivered: the
-    # deploy that renamed or dropped the constant is not coming back on
-    # the next tick. Raising a plain NameError here rolls the batch back
+    # A row whose job_class this process cannot resolve. That is NOT the
+    # same as "can never be delivered": the ordinary case is a rolling
+    # deploy where the web pods already stage jobs for a class the tick
+    # pod's image does not have yet. So the row is held back rather than
+    # failed, and `TickLoop.sweep!` releases the hold on a cadence. Raising a plain NameError here rolls the batch back
     # (correct — that rollback is the at-least-once guarantee) and leaves
     # the row at the head of the claim, where it poisons every subsequent
     # admission of that partition forever, healthy neighbours included.
@@ -110,7 +112,7 @@ module DispatchPolicy
     # quarantine exactly those and admit the rest.
     def deserialize!(row)
       Serializer.deserialize(row["job_data"])
-    rescue NameError, InvalidPolicy => e
+    rescue UnresolvableJobClass, InvalidPolicy => e
       raise UndeliverableJob.new(
         "staged row #{row['id']} (#{row['job_class']}): #{e.class}: #{e.message}",
         staged_ids: [row["id"]]

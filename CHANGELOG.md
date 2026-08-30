@@ -101,7 +101,19 @@
   `failed_at` / `failure_reason`, skipped by the claim, taken out of
   `pending_count`, and listed on the partition page under "Undeliverable"
   with its reason. Marked, not deleted — dropping a staged job silently
-  would break at-least-once. Put them back with the Requeue button on the
+  would break at-least-once — and the hold EXPIRES: `TickLoop.sweep!`
+  releases anything older than `config.quarantine_retry_after` (1 hour by
+  default), because the ordinary trigger is a rolling deploy whose tick
+  pod cannot yet resolve a class the web pods already stage for. A
+  terminal hold would turn that deploy into a silent, permanent drop of
+  that class's whole backlog — worse than the visible, self-healing stall
+  it replaced. A class that really is gone simply re-quarantines. Only an
+  unresolvable `job_class` triggers it (`NoMethodError` is a `NameError`,
+  so a custom argument serializer touching a nil used to land in the same
+  bucket), the dashboard counts held-back rows in their own tile rather
+  than as backlog, and an operator hint names them.
+
+  Put them back sooner with the Requeue button on the
   partition page (`Repository.requeue_quarantined_jobs!`), which restores
   `pending_count` in the same statement — clearing `failed_at` by hand
   leaves the row deliverable and unclaimable at once, since the tick only

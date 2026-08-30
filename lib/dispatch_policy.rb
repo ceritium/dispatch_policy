@@ -36,10 +36,17 @@ module DispatchPolicy
   class InvalidPolicy < Error; end
   class EnqueueFailed < Error; end
 
-  # A staged row that can never be delivered, however many times it is
-  # retried — today, a job_class this process cannot resolve. Carries the
-  # staged ids so the caller can quarantine exactly those rows and admit
-  # the rest, instead of the whole partition wedging behind them.
+  # This process cannot resolve the job class. Distinct from any other
+  # NameError so the Forwarder holds a row back for the one reason that
+  # actually justifies it.
+  class UnresolvableJobClass < Error; end
+
+  # A staged row this process cannot deliver. It may become deliverable —
+  # a rolling deploy where the tick pod is still on the old image is the
+  # ordinary case — so quarantine is a HOLD, retried on a cadence, not a
+  # verdict. It carries the staged ids so the caller can hold back exactly
+  # those rows and admit the rest, instead of the whole partition wedging
+  # behind them.
   class UndeliverableJob < Error
     attr_reader :staged_ids
 
@@ -119,6 +126,15 @@ module DispatchPolicy
     adapter = ::ActiveJob::Base.queue_adapter
     return unless adapter
 
+    warn_unsupported_adapter_for(adapter)
+  end
+
+  # Split out so it is reachable from a test without swapping the
+  # process's queue adapter — these two warnings are the only thing
+  # standing between a split connection and a silent at-least-once loss,
+  # and they had no coverage at all.
+  def warn_unsupported_adapter_for(adapter)
+
     klass_name = adapter.class.name.to_s
     if (PG_BACKED_ADAPTER_HINTS + EXEMPT_ADAPTER_HINTS).any? { |hint| klass_name.include?(hint) }
       return warn_split_connection(adapter)
@@ -165,6 +181,12 @@ module DispatchPolicy
   def adapter_record_class(adapter)
     name = adapter.class.name.to_s
     return ::SolidQueue::Record if name.include?("SolidQueue") && defined?(::SolidQueue::Record)
+    # good_job writes through GoodJob::BaseRecord and defines no :Record
+    # anywhere on its adapter, so without this the warning could never
+    # fire for it — on the adapter this project defaults to, and whose
+    # hint also suppresses the generic one, leaving boot completely
+    # silent on a split that loses jobs.
+    return ::GoodJob::BaseRecord if name.include?("GoodJob") && defined?(::GoodJob::BaseRecord)
 
     klass = adapter.class
     klass.const_get(:Record, false) if klass.const_defined?(:Record, false)

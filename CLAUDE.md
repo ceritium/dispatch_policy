@@ -284,10 +284,15 @@ dispatch_policy_policy_settings               one row per policy — pause flag
   one policy across classes — got rows nothing ever deleted, wedging
   the partition at `max` for an hour at a time. The key is always the
   partition ROW's `partition_key` — read it, never recompute it from ctx.
-  At perform time there is no partition row in hand, so the key comes
-  from the inflight row the Tick pre-inserted
-  (`InflightTracker.lookup_admission`), which is the admission's own
-  record of what it decided. An adaptive observation keyed on a
+  That is a GATE-side rule: gates always have the partition row. At
+  perform time there is none, so the key comes from the inflight row the
+  Tick pre-inserted (`InflightTracker.lookup_admission`), which is the
+  admission's own record of what it decided. One caller still recomputes
+  — `InflightTracker.track`'s own `insert_inflight!` — and that is inert
+  by `ON CONFLICT DO NOTHING` while the Tick's row exists. Closing it for
+  real means stamping the admitted key into the forwarded payload, a
+  format change larger than the exposure (a >1h queue wait plus an edit
+  to `partition_by`) justifies. An adaptive observation keyed on a
   recomputed value files the AIMD state where `evaluate` will never look. `policy.partition_for(ctx)` returns the same value only while
   nobody edits `partition_by`; the moment somebody does, a gate counting
   under the recomputed key stops seeing the rows the admission path
@@ -347,8 +352,7 @@ dispatch_policy_policy_settings               one row per policy — pause flag
   admitted` and `decayed_admits_at = now()`. Same row lock we already
   hold. `bulk_record_partition_denies!` does NOT touch the decay
   (no admission means no increment).
-- **A staged row that can never be delivered is quarantined, not
-  retried.** `Forwarder.dispatch` raises `UndeliverableJob` (carrying the
+- **A staged row this process cannot deliver is HELD, not failed.** `Forwarder.dispatch` raises `UndeliverableJob` (carrying the
   staged ids) when `job_class.constantize` fails, and both admission
   paths mark those rows `failed_at` outside the rolled-back transaction,
   decrement `pending_count`, and retry the admission ONCE. Without it the
@@ -365,8 +369,15 @@ dispatch_policy_policy_settings               one row per policy — pause flag
   `failed_at IS NULL`: the scheduled park's due-work guard does, and the
   partition sweeper anti-joins against `staged_jobs` so it cannot collect
   a partition whose only remaining rows are quarantined.
-  Anything else that can never succeed however often it is retried
-  belongs in the same channel; do not add a second mechanism.
+  The hold EXPIRES — `TickLoop.sweep!` releases anything older than
+  `config.quarantine_retry_after`. Do not make it terminal: the trigger
+  is "this process cannot resolve the class", and the ordinary cause is a
+  rolling deploy whose tick pod is a release behind the web pods, which
+  fixes itself minutes later. A terminal hold drops that class's whole
+  backlog silently and for good, which is the at-least-once violation the
+  admission TX exists to prevent. Only an unresolvable job_class triggers
+  it; `NoMethodError` is a `NameError`, so anything a custom serializer
+  does downstream must NOT be caught here.
 - **Every multi-row writer of `partitions` takes its locks in
   `(policy_name, partition_key)` BYTE order.** Which collation is not a
   detail: `stage_many!` sorts in Ruby, i.e. `String#<=>`, i.e. bytes, so

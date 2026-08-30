@@ -102,12 +102,21 @@ class ConnectionIdentityTest < Minitest::Test
   # environment does not boot Rails — so pin the wiring separately, or
   # deleting the railtie's call leaves the suite green while the models go
   # back to the wrong database.
-  def test_the_railtie_routes_the_models_after_initialization
+  # Pinned to `to_prepare` specifically, and asserted that way. The
+  # engine's models are in the host's RELOADABLE autoloader, so a hook
+  # that fires once — after_initialize — is undone by the first code
+  # reload in development and the models go back to the host's primary.
+  # An earlier version of this test asserted the call was inside the
+  # after_initialize block, which meant the correct fix turned the suite
+  # red: a test can pin the wrong half in either direction.
+  def test_the_railtie_routes_the_models_on_every_reload
     source = File.read(File.expand_path("../../lib/dispatch_policy/railtie.rb", __dir__))
-    block  = source[/config\.after_initialize do.*?\n    end/m]
 
-    refute_nil block
-    assert_includes block, "route_models_to_configured_connection!"
-    assert_includes block, "warn_unsupported_adapter"
+    prepare = source[/config\.to_prepare do.*?\n    end/m]
+    refute_nil prepare, "after_initialize fires once; the models are reloadable"
+    assert_includes prepare, "route_models_to_configured_connection!"
+
+    boot = source[/config\.after_initialize do.*?\n    end/m]
+    assert_includes boot, "warn_unsupported_adapter"
   end
 end

@@ -1,5 +1,10 @@
   <section class="dp-stats">
     <div class="dp-stat"><span class="dp-stat-label">Staged</span><span class="dp-stat-value"><%= format_count(@totals[:staged]) %></span></div>
+    <% if @totals[:quarantined].to_i.positive? %>
+      <%# Its own tile, not folded into Staged: nothing is trying to admit
+          these, so counting them as backlog reads as work in motion. %>
+      <div class="dp-stat"><span class="dp-stat-label">Held back</span><span class="dp-stat-value dp-warn"><%= format_count(@totals[:quarantined]) %></span></div>
+    <% end %>
     <div class="dp-stat"><span class="dp-stat-label">Partitions</span><span class="dp-stat-value"><%= format_count(@totals[:partitions]) %></span></div>
     <div class="dp-stat"><span class="dp-stat-label">Active</span><span class="dp-stat-value"><%= format_count(@totals[:active_parts]) %></span></div>
     <div class="dp-stat"><span class="dp-stat-label">Paused</span><span class="dp-stat-value <%= "dp-warn" if @totals[:paused_parts].positive? %>"><%= format_count(@totals[:paused_parts]) %></span></div>

@@ -60,6 +60,15 @@ module DispatchPolicy
       end
 
       # ---- backlog drain time ----------------------------------------
+      if m[:quarantined].to_i.positive?
+        hints << {
+          level: :warn,
+          text:  "#{m[:quarantined]} staged job(s) are held back: this process could not " \
+                 "resolve their job class. A rolling deploy clears itself; a class that is " \
+                 "really gone stays here. Open the partition to see which, and Requeue."
+        }
+      end
+
       if m[:admitted_per_minute].to_i.positive? && m[:pending_total].to_i.positive?
         drain_minutes = m[:pending_total].to_f / m[:admitted_per_minute]
         if drain_minutes >= 30

@@ -3,6 +3,7 @@
 require_relative "../test_helper"
 require_relative "../../app/models/dispatch_policy/application_record"
 require_relative "../../app/models/dispatch_policy/partition"
+require_relative "../../app/models/dispatch_policy/staged_job"
 
 # `bulk_record_partition_denies!` is ONE statement, and one statement
 # gives no lock-ordering guarantee: the planner joins its VALUES list
@@ -96,5 +97,29 @@ class DenyLockOrderTest < DispatchPolicy::IntegrationTest
     refute_nil first.next_eligible_at
     refute_nil second.next_eligible_at
     assert_operator second.next_eligible_at, :>, first.next_eligible_at
+  end
+  # The quarantine release writes many partition rows in one pass too, so
+  # it takes the same lock order — a second statement crossing
+  # stage_many! would reintroduce A1 exactly as the deny flush did.
+  def test_the_quarantine_release_takes_its_locks_in_the_same_order
+    DispatchPolicy::Repository.stage!(
+      policy_name: POLICY, partition_key: "acct:10", queue_name: nil,
+      job_class: "X", job_data: {}, context: {}
+    )
+    id = DispatchPolicy::StagedJob.first.id
+    DispatchPolicy::Repository.quarantine_staged_jobs!(
+      policy_name: POLICY, partition_key: "acct:10", ids: [id], reason: "test"
+    )
+    ActiveRecord::Base.connection.execute(
+      "UPDATE dispatch_policy_staged_jobs SET failed_at = now() - interval '2 hours'"
+    )
+
+    seen = capture_sql do
+      DispatchPolicy::Repository.release_aged_quarantines!(policy_name: POLICY, older_than: 60)
+    end
+
+    lock = seen.find { |p| p[:name] == "lock_partitions_for_quarantine_release" }
+    refute_nil lock, "without an explicit ordered lock this deadlocks against stage_many!"
+    assert_match(/ORDER BY policy_name COLLATE "C", partition_key COLLATE "C"/, lock[:sql])
   end
 end

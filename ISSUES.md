@@ -80,12 +80,18 @@ inside the admission TX. Fixed with `Float().floor`.
 ### A7 — The staged claim orders by an unindexed column
 
 `priority` is in no index, so a deep single-partition backlog sorts
-itself on every admission, twice per tick. Re-measured on review at 500k
-rows: 35.8 ms to 87.4 ms per claim depending on plan, against 0.038 ms
-with `idx_dp_staged_claim_order`. (An earlier note here quoted "13.7 MB
-of temp files"; that could not be reproduced — with `LIMIT 200` Postgres
-picks a top-N heapsort and does not spill.) The index costs +0.08 ms per
-enqueue and 25 MB at that size.
+itself on every admission, twice per tick: measured at 500k rows,
+~291 ms and 13.7 MB of temp files per claim, against 0.038 ms with
+`idx_dp_staged_claim_order`. The index costs +0.08 ms per enqueue and
+25 MB at that size.
+
+A note here briefly retracted the temp-file figure as unreproducible.
+That retraction was wrong and is withdrawn: it was measured with the
+`FOR UPDATE SKIP LOCKED` stripped off, and nothing issues the statement
+that way. `LockRows` sits between `Limit` and `Sort`, so the limit is
+never pushed into the sort and it spills at ANY limit — 13.7 MB even at
+`LIMIT 1`. Remove the locking clause and the same query becomes a 40 kB
+top-N heapsort, which is where the "could not reproduce" came from.
 
 ## Low — recorded, not fixed
 

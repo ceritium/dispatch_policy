@@ -18,7 +18,16 @@ module DispatchPolicy
       job_class = payload["job_class"] || payload[:job_class]
       raise InvalidPolicy, "missing job_class in stored payload" unless job_class
 
-      klass = job_class.constantize
+      # Split so the caller can tell "this process cannot resolve the class"
+      # from anything that goes wrong afterwards. NoMethodError is a
+      # NameError, so a custom argument serializer touching a nil would
+      # otherwise be indistinguishable from a missing constant — and one
+      # of those is worth holding a row back for, the other is not.
+      klass = begin
+        job_class.constantize
+      rescue NameError => e
+        raise UnresolvableJobClass, "#{job_class}: #{e.class}: #{e.message}"
+      end
       klass.deserialize(payload)
     end
 

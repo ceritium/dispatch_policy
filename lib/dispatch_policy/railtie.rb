@@ -66,6 +66,16 @@ module DispatchPolicy
 
     config.after_initialize do
       DispatchPolicy.warn_unsupported_adapter
+    end
+
+    # to_prepare, not after_initialize: the engine's models live in the
+    # host's RELOADABLE autoloader, so the first code reload in
+    # development discards the pinned class and re-autoloads it on
+    # ActiveRecord::Base — the host's primary, where the gem's tables are
+    # not. after_initialize fires once and the pin dies with that first
+    # reload. to_prepare runs at boot AND on every reload, so the pin
+    # survives; in production with eager_load it is simply the boot call.
+    config.to_prepare do
       DispatchPolicy.route_models_to_configured_connection!
     end
   end

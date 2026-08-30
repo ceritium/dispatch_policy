@@ -169,4 +169,64 @@ class UndeliverableJobTest < DispatchPolicy::IntegrationTest
     refute_nil partition,
                "deleting it strands the quarantined rows with no route back to them"
   end
+  # The premise "a class that will not resolve is never coming back" is
+  # false for the most ordinary deploy there is: ADDING a job class. Web
+  # pods roll first and stage jobs the tick pod's image cannot resolve
+  # yet, so it holds them back — and if the hold is terminal, finishing
+  # the rollout does not release them. That turns a visible, self-healing
+  # stall into a silent permanent drop, which is the at-least-once
+  # failure the admission TX exists to prevent.
+  def test_a_hold_expires_so_a_finished_rollout_releases_the_rows
+    stage!("NotYetDeployedJob")
+    stage!("NotYetDeployedJob")
+    DispatchPolicy::Tick.run(policy_name: "undeliverable")
+    assert_equal 2, DispatchPolicy::StagedJob.quarantined.count
+
+    # The rollout finishes: the class resolves everywhere now.
+    Object.const_set(:NotYetDeployedJob, Class.new(LiveJob))
+    begin
+      # Age the hold past the retry window and let the sweeper run.
+      ActiveRecord::Base.connection.execute(
+        "UPDATE dispatch_policy_staged_jobs SET failed_at = now() - interval '2 hours'"
+      )
+      DispatchPolicy::TickLoop.sweep!
+
+      assert_equal 0, DispatchPolicy::StagedJob.quarantined.count,
+                   "a hold that never expires drops the class's whole backlog"
+      assert_equal 2, partition.pending_count
+
+      DispatchPolicy::Tick.run(policy_name: "undeliverable")
+      assert_equal 0, DispatchPolicy::StagedJob.count, "and they actually go out"
+    ensure
+      Object.send(:remove_const, :NotYetDeployedJob)
+    end
+  end
+
+  def test_a_class_that_is_really_gone_is_simply_held_again
+    stage!("VanishedJob")
+    DispatchPolicy::Tick.run(policy_name: "undeliverable")
+    ActiveRecord::Base.connection.execute(
+      "UPDATE dispatch_policy_staged_jobs SET failed_at = now() - interval '2 hours'"
+    )
+
+    DispatchPolicy::TickLoop.sweep!
+    DispatchPolicy::Tick.run(policy_name: "undeliverable")
+
+    assert_equal 1, DispatchPolicy::StagedJob.quarantined.count,
+                 "releasing the hold must not lose the row either"
+  end
+
+  # NoMethodError is a NameError, so anything a custom argument serializer
+  # does downstream would otherwise land in the same permanent-looking
+  # bucket as a missing constant. Only the job_class lookup counts.
+  def test_only_an_unresolvable_job_class_is_held_back
+    err = assert_raises(NoMethodError) do
+      DispatchPolicy::Serializer.deserialize(
+        { "job_class" => LiveJob.name, "arguments" => nil, "boom" => true }.tap do |p|
+          def p.[](k) = k == "job_class" ? "UndeliverableJobTest::LiveJob" : nil.no_such_method
+        end
+      )
+    end
+    refute_kind_of DispatchPolicy::UnresolvableJobClass, err
+  end
 end

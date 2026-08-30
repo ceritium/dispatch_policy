@@ -392,12 +392,58 @@ module DispatchPolicy
     # horizon computed while these rows were invisible would otherwise
     # stay parked. `next_eligible_at` is left alone — a gate's backoff is
     # still a legitimate reason to wait.
-    def requeue_quarantined_jobs!(policy_name:, partition_key:)
+    # Release every hold in a policy that has aged past `older_than`.
+    # Quarantine is a HOLD, not a verdict: the ordinary trigger is a
+    # rolling deploy whose tick pod cannot resolve a class the web pods
+    # already stage for, and that resolves itself minutes later. Without a
+    # cadence those rows are dropped silently and permanently, which is
+    # the at-least-once failure the admission TX exists to prevent — worse
+    # than the visible, self-healing stall this replaced. A class that is
+    # genuinely gone simply re-quarantines on the next tick.
+    #
+    # Locks byte-ordered first, like `bulk_record_partition_denies!`: this
+    # writes many partition rows in one statement, and one statement locks
+    # in heap order, which deadlocks against `stage_many!`.
+    def release_aged_quarantines!(policy_name:, older_than:)
+      keys = connection.exec_query(
+        <<~SQL.squish,
+          SELECT DISTINCT partition_key FROM #{STAGED_TABLE}
+          WHERE policy_name = $1 AND failed_at IS NOT NULL
+            AND failed_at < now() - ($2 || ' seconds')::interval
+        SQL
+        "aged_quarantine_partitions",
+        [policy_name, older_than.to_i]
+      ).rows.flatten.sort
+      return 0 if keys.empty?
+
+      released = 0
+      connection.transaction(requires_new: true) do
+        placeholders = keys.each_index.map { |i| "$#{i + 2}" }
+        connection.exec_query(
+          <<~SQL.squish,
+            SELECT 1 FROM #{PARTITIONS_TABLE}
+            WHERE policy_name = $1 AND partition_key IN (#{placeholders.join(', ')})
+            ORDER BY policy_name COLLATE "C", partition_key COLLATE "C"
+            FOR UPDATE
+          SQL
+          "lock_partitions_for_quarantine_release",
+          [policy_name, *keys]
+        )
+        keys.each do |key|
+          released += requeue_quarantined_jobs!(policy_name: policy_name, partition_key: key,
+                                                older_than: older_than)
+        end
+      end
+      released
+    end
+
+    def requeue_quarantined_jobs!(policy_name:, partition_key:, older_than: nil)
       connection.exec_query(
         <<~SQL.squish,
           WITH requeued AS (
             UPDATE #{STAGED_TABLE} SET failed_at = NULL, failure_reason = NULL
             WHERE policy_name = $1 AND partition_key = $2 AND failed_at IS NOT NULL
+              AND ($3::bigint IS NULL OR failed_at < now() - ($3 || ' seconds')::interval)
             RETURNING id
           ), bumped AS (
             UPDATE #{PARTITIONS_TABLE}
@@ -409,7 +455,7 @@ module DispatchPolicy
           SELECT count(*) AS requeued FROM requeued
         SQL
         "requeue_quarantined_jobs",
-        [policy_name, partition_key]
+        [policy_name, partition_key, older_than&.to_i]
       ).first["requeued"].to_i
     end
 

@@ -150,6 +150,15 @@ module DispatchPolicy
 
       DispatchPolicy.registry.each do |policy|
         registered << policy.name
+
+        # Release aged holds before anything else: a quarantined row is a
+        # row we could not deliver YET, and the ordinary reason is a
+        # rolling deploy that has since finished.
+        if cfg.quarantine_retry_after.to_i.positive?
+          Repository.release_aged_quarantines!(
+            policy_name: policy.name, older_than: cfg.quarantine_retry_after
+          )
+        end
         window = policy.static_throttle_window
         warn_unbounded_sweep(policy) if window.nil? && throttled?(policy)
 
