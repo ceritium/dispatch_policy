@@ -19,7 +19,7 @@ See `README.md` for the API and examples.
 v0.1 (on master). The whole main flow is implemented and tested.
 What's pending lives in `IDEAS.md` with the rationale.
 
-124 tests / 284 assertions. `bundle exec rake test` from the root.
+262 runs / 621 assertions. `bundle exec rake test` from the root.
 
 ## Architecture — 6 tables
 
@@ -349,7 +349,7 @@ http://localhost:3000/                       # forms to enqueue
 http://localhost:3000/dispatch_policy        # dashboard
 
 # Tests
-bundle exec rake test                        # 101 runs / 225 asserts
+bundle exec rake test                        # 262 runs / 621 assertions
 
 # When you add a column or table:
 #   1. Edit db/migrate/20260501000001_create_dispatch_policy_tables.rb

@@ -708,7 +708,7 @@ end
 ## Testing
 
 ```bash
-bundle exec rake test         # 124 runs / 284 assertions
+bundle exec rake test         # 262 runs / 621 assertions
 bundle exec rake bench        # manual benchmark suite (creates dispatch_policy_bench DB)
 bundle exec rake bench:real   # end-to-end against good_job on the dummy DB
 bundle exec rake bench:limits # stretches every path to its breaking point

@@ -17,7 +17,7 @@ fairness and metrics, and the dashboard/config/generator surface.
 Everything below was reproduced against real Postgres before being
 fixed, and every fix carries a regression test verified by mutation:
 breaking the production line turns the suite red. Baseline going in:
-218 runs / 517 assertions. Coming out: 252 runs / 600 assertions.
+218 runs / 517 assertions. Coming out: 262 runs / 621 assertions.
 
 > **Status:** every finding is fixed on
 > `fix/throttle-atomicity-and-partition-lifecycle`. The narrative for
