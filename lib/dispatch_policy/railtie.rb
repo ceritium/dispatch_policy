@@ -66,6 +66,7 @@ module DispatchPolicy
 
     config.after_initialize do
       DispatchPolicy.warn_unsupported_adapter
+      DispatchPolicy.route_models_to_configured_connection!
     end
   end
 end

@@ -121,8 +121,9 @@ module DispatchPolicy
       partition_key = policy.partition_key_for(ctx)
 
       adaptive_gates = policy.gates.select { |g| g.name == :adaptive_concurrency }
-      admitted_at    = nil
-      perform_start  = nil
+      admitted_at     = nil
+      observation_key = nil
+      perform_start   = nil
       heartbeat      = nil
       started        = false
       succeeded      = false
@@ -137,7 +138,11 @@ module DispatchPolicy
           active_job_id:  job.job_id
         }])
 
-        admitted_at   = adaptive_gates.any? ? lookup_admitted_at(job.job_id) : nil
+        if adaptive_gates.any?
+          admitted_at, admitted_key = lookup_admission(job.job_id)
+          # Fall back to the recomputed key only when the row is gone.
+          observation_key = admitted_key || partition_key
+        end
         perform_start = Time.current
         heartbeat     = start_heartbeat(job.job_id)
 
@@ -153,7 +158,7 @@ module DispatchPolicy
           record_adaptive_observations(
             policy:        policy,
             gates:         adaptive_gates,
-            partition_key: partition_key,
+            partition_key: observation_key || partition_key,
             admitted_at:   admitted_at,
             perform_start: perform_start,
             succeeded:     succeeded
@@ -231,23 +236,35 @@ module DispatchPolicy
     # adaptive_concurrency feedback signal (queue_lag = perform_start
     # - admitted_at). nil if the row vanished or the lookup fails —
     # the observation is then skipped.
-    def self.lookup_admitted_at(active_job_id)
+    # Returns [admitted_at, partition_key] from the row the Tick
+    # pre-inserted — the admission's own record of both facts.
+    #
+    # The key matters as much as the timestamp. The gate READS the
+    # partition row's key, so an observation written under a key
+    # recomputed from ctx files the AIMD state where the gate will never
+    # look: after an edit to `partition_by`, observations accumulate on
+    # the new key while `evaluate` keeps reading the old row. The
+    # inflight row is the one place that already carries what the
+    # admission decided.
+    def self.lookup_admission(active_job_id)
       # Route through config.database_role: the inflight row lives in the
       # same DB the Tick pre-inserted it into, which under multi-DB is the
       # queue DB, not the default writing role of the worker process.
       result = Repository.with_connection do
         Repository.connection.exec_query(
-          "SELECT admitted_at FROM dispatch_policy_inflight_jobs WHERE active_job_id = $1 LIMIT 1",
-          "lookup_admitted_at",
+          "SELECT admitted_at, partition_key FROM dispatch_policy_inflight_jobs " \
+          "WHERE active_job_id = $1 LIMIT 1",
+          "lookup_admission",
           [active_job_id]
         )
       end
       row = result.first
-      return nil unless row
+      return [nil, nil] unless row
+
       ts = row["admitted_at"]
-      ts.is_a?(Time) ? ts : Time.parse(ts.to_s)
+      [ts.is_a?(Time) ? ts : Time.parse(ts.to_s), row["partition_key"]]
     rescue StandardError
-      nil
+      [nil, nil]
     end
 
     def self.record_adaptive_observations(policy:, gates:, partition_key:, admitted_at:, perform_start:, succeeded:)

@@ -83,6 +83,37 @@ module DispatchPolicy
   # raise: a host may use a custom PG-backed adapter we don't recognize,
   # or may have accepted the trade-off knowingly. The warning is enough
   # to surface the issue at boot.
+  # The gem's own AR models — Partition, StagedJob, TickSample and the
+  # rest — hang off ActiveRecord::Base, so they follow whatever
+  # connection the host's models follow. That is right on one database
+  # and wrong on the install `database_connection_class` exists for: the
+  # gem's tables are on the adapter's database, and `Repository`'s raw
+  # SQL goes there, but the models would still look for them on the
+  # primary. `Tick#record_sample!` then raises PG::UndefinedTable into
+  # its own rescue and tick_samples stay empty forever, and every
+  # dashboard page 500s inside the around_action that is supposed to
+  # route it.
+  #
+  # Pinning the connection SPECIFICATION rather than calling
+  # `connects_to` keeps this a no-op on a single database and avoids
+  # taking over a configuration the host may have set on that class.
+  # Note it follows `database_connection_class`, not `database_role`: a
+  # deployment needing both should point the models at the same
+  # configuration itself.
+  def route_models_to_configured_connection!
+    base = Repository.base_class
+    return if base == ActiveRecord::Base
+    return unless defined?(DispatchPolicy::ApplicationRecord)
+
+    DispatchPolicy::ApplicationRecord.connection_specification_name =
+      base.connection_specification_name
+  rescue StandardError => e
+    config.logger&.warn(
+      "[dispatch_policy] could not route the engine's models to " \
+      "#{config.database_connection_class.inspect}: #{e.class}: #{e.message}"
+    )
+  end
+
   def warn_unsupported_adapter
     return unless defined?(::ActiveJob::Base)
     adapter = ::ActiveJob::Base.queue_adapter
@@ -108,12 +139,12 @@ module DispatchPolicy
   # therefore only safe once `config.database_connection_class` names
   # that class. Say so at boot rather than letting it look like it works.
   def warn_split_connection(adapter)
-    adapter_class = adapter.class.const_defined?(:Record) ? adapter.class.const_get(:Record) : nil
-    adapter_class ||= defined?(::SolidQueue::Record) && klass_name_matches?(adapter, "SolidQueue") ? ::SolidQueue::Record : nil
-    return if adapter_class.nil?
+    adapter_class = adapter_record_class(adapter)
+    return unless adapter_class.respond_to?(:connection_specification_name)
 
     ours = Repository.base_class
-    return if adapter_class == ours || adapter_class.connection_specification_name == ours.connection_specification_name
+    return if adapter_class == ours ||
+              adapter_class.connection_specification_name == ours.connection_specification_name
 
     config.logger&.warn(
       "[dispatch_policy] the adapter writes through #{adapter_class.name} but the gem opens its " \
@@ -123,8 +154,20 @@ module DispatchPolicy
     )
   end
 
-  def klass_name_matches?(adapter, hint)
-    adapter.class.name.to_s.include?(hint)
+  # The explicit check first, and `inherit: false` on the lookup: a plain
+  # `const_defined?(:Record)` walks up to Object, so an ordinary host
+  # model named `Record` is found instead. That is not cosmetic — an AR
+  # `::Record` on the primary makes the specification names match and
+  # silences this warning on exactly the misconfiguration it exists to
+  # catch, and a non-AR `::Record` (a Struct, a PORO) makes
+  # `connection_specification_name` raise out of after_initialize and
+  # abort boot.
+  def adapter_record_class(adapter)
+    name = adapter.class.name.to_s
+    return ::SolidQueue::Record if name.include?("SolidQueue") && defined?(::SolidQueue::Record)
+
+    klass = adapter.class
+    klass.const_get(:Record, false) if klass.const_defined?(:Record, false)
   end
 end
 

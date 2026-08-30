@@ -45,8 +45,17 @@ module DispatchPolicy
     # this when a migration adds a column, per the "Adding a table?"
     # workflow in CLAUDE.md — that's what makes the suite rebuild a
     # stale local database instead of failing on a missing column.
-    SCHEMA_COLUMNS = %w[total_admitted shard decayed_admits decayed_admits_at
-                        scheduled_eligible_at failed_at].freeze
+    # Per TABLE. A flat list was checked only against
+    # dispatch_policy_partitions, so `failed_at` — which lives on
+    # staged_jobs — could never be satisfied and every integration test
+    # paid a full DROP CASCADE + re-migrate. Over-detecting drift is the
+    # safe direction, but it is ~45% of the suite's wall time and the
+    # entry an unwary reader trusts is a no-op.
+    SCHEMA_COLUMNS = {
+      "dispatch_policy_partitions"  => %w[total_admitted shard decayed_admits
+                                          decayed_admits_at scheduled_eligible_at],
+      "dispatch_policy_staged_jobs" => %w[failed_at failure_reason]
+    }.freeze
 
     module_function
 
@@ -102,9 +111,13 @@ module DispatchPolicy
       conn = ActiveRecord::Base.connection
       return false unless TABLES.all? { |t| conn.table_exists?(t) }
 
-      # Detect schema drift (e.g. new column added in a migration update).
-      cols = conn.columns("dispatch_policy_partitions").map(&:name)
-      SCHEMA_COLUMNS.all? { |c| cols.include?(c) }
+      # Detect schema drift (e.g. new column added in a migration update),
+      # per table — a column checked against the wrong table can never be
+      # satisfied, which rebuilds the whole schema before every case.
+      SCHEMA_COLUMNS.all? do |table, required|
+        cols = conn.columns(table).map(&:name)
+        required.all? { |c| cols.include?(c) }
+      end
     end
 
     def drop_partial_schema!

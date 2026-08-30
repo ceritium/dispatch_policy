@@ -262,7 +262,10 @@ dispatch_policy_policy_settings               one row per policy — pause flag
   it silently breaks schema rebuilds and leaks state between tests —
   AND update both the migration and the generator template, per the
   workflow below. Column added? Add it to
-  `PostgresTest::SCHEMA_COLUMNS` too; that's the drift check that
+  `PostgresTest::SCHEMA_COLUMNS` too, UNDER ITS OWN TABLE KEY (the hash is
+  keyed by table; a column filed under the wrong one can never be
+  satisfied, so every integration test pays a full re-migrate); that's
+  the drift check that
   rebuilds a stale local database.
 - **Inflight tracking is decided from the POLICY at runtime, never
   from where the class was declared.** `Policy#inflight_tracked_gate`
@@ -280,8 +283,12 @@ dispatch_policy_policy_settings               one row per policy — pause flag
   `dispatch_policy_name = "x"` — public API, and the only way to share
   one policy across classes — got rows nothing ever deleted, wedging
   the partition at `max` for an hour at a time. The key is always the
-  partition ROW's `partition_key` — read it, never recompute it from
-  ctx. `policy.partition_for(ctx)` returns the same value only while
+  partition ROW's `partition_key` — read it, never recompute it from ctx.
+  At perform time there is no partition row in hand, so the key comes
+  from the inflight row the Tick pre-inserted
+  (`InflightTracker.lookup_admission`), which is the admission's own
+  record of what it decided. An adaptive observation keyed on a
+  recomputed value files the AIMD state where `evaluate` will never look. `policy.partition_for(ctx)` returns the same value only while
   nobody edits `partition_by`; the moment somebody does, a gate counting
   under the recomputed key stops seeing the rows the admission path
   wrote under the stored one, and the cap silently lapses for every
@@ -432,7 +439,8 @@ bundle exec rake test                        # 262 runs / 621 assertions
 #      migrations because v0.1 ships a single migration)
 #   4. Add the table to Repository::ALL_TABLES (the test bootstrap and
 #      the benchmark harness both build their DDL from it); for a new
-#      COLUMN, add it to PostgresTest::SCHEMA_COLUMNS in
+#      COLUMN, add it under its own TABLE KEY in
+#      PostgresTest::SCHEMA_COLUMNS in
 #      test/test_helper.rb, which is the drift check that rebuilds a
 #      stale local database.
 #   5. CHANGELOG: add/extend an "Upgrade notes" subsection under

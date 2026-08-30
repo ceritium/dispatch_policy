@@ -81,4 +81,67 @@ class LivePolicyEditTest < DispatchPolicy::IntegrationTest
 
     assert_equal 5, decision.allowed
   end
+  # The same edit, against the adaptive gate. It counts in-flight rows too,
+  # so recomputing the key there hides them exactly the way it did for
+  # :concurrency — and the AIMD safety valve makes it worse: with
+  # in_flight read as 0 the valve floors `remaining` at `initial_max`, so
+  # the gate hands out a full fresh cap on top of what is already running.
+  def test_the_adaptive_cap_also_survives_a_partition_by_edit
+    DispatchPolicy.reset_registry!
+    policy = DispatchPolicy::PolicyDSL.build(POLICY) do
+      context ->(args) { { account: args.first } }
+      partition_by ->(c) { "tenant:#{c[:account]}" } # edited; rows say acct:1
+      gate :adaptive_concurrency, initial_max: 2, target_lag_ms: 1000
+    end
+    DispatchPolicy.registry.register(policy)
+
+    DispatchPolicy::Repository.upsert_partition!(
+      policy_name: POLICY, partition_key: "acct:1", queue_name: nil,
+      context: {}, delta_pending: 5
+    )
+    DispatchPolicy::Repository.insert_inflight!([
+      { policy_name: POLICY, partition_key: "acct:1", active_job_id: "a1" },
+      { policy_name: POLICY, partition_key: "acct:1", active_job_id: "b1" }
+    ])
+
+    partition = DispatchPolicy::Repository.normalize_partition(
+      ActiveRecord::Base.connection.exec_query(
+        "SELECT * FROM dispatch_policy_partitions WHERE partition_key = 'acct:1'"
+      ).first
+    )
+    decision = policy.gates.first.evaluate(policy.build_context([1]), partition, 100)
+
+    assert_equal 0, decision.allowed,
+                 "both slots are in flight under the stored key; counting under the " \
+                 "recomputed one finds zero and the safety valve then grants initial_max"
+    assert_equal "adaptive_concurrency_full", decision.reason
+  end
+
+  # The gate READS the partition row's key. An observation written under a
+  # key recomputed from ctx at perform time therefore files the AIMD state
+  # where the gate will never look: after a `partition_by` edit the stats
+  # accumulate on the new key while `evaluate` keeps reading the old row,
+  # and the cap fossilises at `initial_max` for the whole drain. The
+  # inflight row the Tick pre-inserted already carries what the admission
+  # decided, so that is what the observation is keyed on.
+  def test_an_observation_is_keyed_on_what_the_admission_recorded
+    DispatchPolicy.reset_registry!
+    policy = DispatchPolicy::PolicyDSL.build("adaptive_edit") do
+      context ->(args) { { account: args.first } }
+      partition_by ->(c) { "tenant:#{c[:account]}" } # the edited expression
+      gate :adaptive_concurrency, initial_max: 4, target_lag_ms: 1000
+    end
+    DispatchPolicy.registry.register(policy)
+
+    # The admission happened under the OLD key and said so in its row.
+    DispatchPolicy::Repository.insert_inflight!([{
+      policy_name: "adaptive_edit", partition_key: "acct:1", active_job_id: "aj-1"
+    }])
+
+    admitted_at, key = DispatchPolicy::InflightTracker.lookup_admission("aj-1")
+
+    refute_nil admitted_at
+    assert_equal "acct:1", key,
+                 "recomputing gives tenant:1, which is not where the gate reads"
+  end
 end

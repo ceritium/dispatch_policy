@@ -158,9 +158,12 @@
   agree until somebody renames or coarsens the expression, which is an
   ordinary deploy; from then on the gate counts zero for every partition
   that predates the edit and hands out the full cap on top of whatever is
-  already running. The gates read the row now. CLAUDE.md described the
-  two values as identical "by construction", which is what kept this
-  invisible for three audits; corrected.
+  already running. The gates read the row now — and the adaptive gate's
+  observations, written at perform time where there is no partition row
+  in hand, take their key from the inflight row the Tick pre-inserted, so
+  the state it writes and the state it reads cannot drift apart either.
+  CLAUDE.md described the two values as identical "by construction",
+  which is what kept this invisible for three audits; corrected.
 
 - **A concurrency cap that came back through jsonb no longer wedges the
   partition.** `Gates::Concurrency` resolved its `max:` with `Integer()`,
