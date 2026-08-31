@@ -19,7 +19,10 @@ See `README.md` for the API and examples.
 v0.1 (on master). The whole main flow is implemented and tested.
 What's pending lives in `IDEAS.md` with the rationale.
 
-262 runs / 621 assertions. `bundle exec rake test` from the root.
+305 runs / 749 assertions. `bundle exec rake test` from the root.
+A mutation battery guards the tests themselves: `bundle exec rake
+mutations:all` (see `test/mutations/README.md`, and "Fixing a defect"
+below).
 
 ## Architecture — 6 tables
 
@@ -463,7 +466,13 @@ http://localhost:3000/                       # forms to enqueue
 http://localhost:3000/dispatch_policy        # dashboard
 
 # Tests
-bundle exec rake test                        # 262 runs / 621 assertions
+bundle exec rake test                        # 305 runs / 749 assertions
+
+# Mutation battery — breaks each load-bearing line and checks a test
+# notices. Slow (one full suite per mutation). See test/mutations/README.md.
+bundle exec rake mutations:list              # the catalogue, no work done
+bundle exec rake mutations:all               # 33 mutations, 32 must be caught
+FILTER=19 bundle exec rake mutations:all     # one of them
 
 # When you add a column or table:
 #   1. Edit db/migrate/20260501000001_create_dispatch_policy_tables.rb
@@ -528,6 +537,25 @@ Currently:
 - More aggressive sweeper for orphan partitions with `pending=0`
 - Revisit the coupling between `inflight_heartbeat_interval`,
   `inflight_stale_after` and `sweep_every_ticks`
+
+## Fixing a defect
+
+The fourth audit's fix branch needed FIVE review rounds, and the first
+three each found the fixes defective — never the audit. Every one was the
+same shape: **a test that passes against the bug it was written for.**
+Four of five did. You cannot see this by reading, least of all in your own
+test, written minutes after you understood the bug.
+
+So, when you fix something:
+
+1. Add the mutation that puts the bug back (`test/mutations/catalogue.rb`)
+   and run `FILTER=<id> bundle exec rake mutations:all`. It must say
+   `CAUGHT`. If it survives, the test is decorative — fix the test.
+2. Or, equivalently, revert the production file to its parent in a scratch
+   copy and confirm the new test goes red there.
+
+Skipping this is what cost this project four rounds. The README in
+`test/mutations/` has the three worst examples.
 
 ## Repo conventions
 

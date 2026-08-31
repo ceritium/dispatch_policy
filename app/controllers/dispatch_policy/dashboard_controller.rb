@@ -5,18 +5,10 @@ module DispatchPolicy
     WINDOWS = { "1m" => 60, "5m" => 5 * 60, "15m" => 15 * 60 }.freeze
 
     def index
-      @totals = {
-        # Deliverable only. A held-back row is not backlog — nothing is
-        # trying to admit it — so counting it as "staged" told the
-        # operator there was work moving when there was not, and fed a
-        # drain-time estimate that could never come true.
-        staged:        StagedJob.deliverable.count,
-        quarantined:   StagedJob.quarantined.count,
-        partitions:    Partition.count,
-        active_parts:  Partition.active.count,
-        paused_parts:  Partition.paused.count,
-        in_flight:     InflightJob.count
-      }
+      # Computed in DispatchPolicy::Overview so a test can execute them —
+      # Rails does not boot in the test environment, so an expression that
+      # lives only here can be pinned only by reading this file's source.
+      @totals = Overview.totals
 
       now = Time.current
       @windows = WINDOWS.transform_values { |secs| Repository.tick_summary(since: now - secs) }
@@ -46,10 +38,10 @@ module DispatchPolicy
         max_tick_ms:          @capacity[:max_tick_ms],
         pending_total:        @totals[:staged],
         quarantined:          @totals[:quarantined],
-        # Both are documented as "off" values, and either one stops the
-        # hold from ever expiring — so the hint must not promise a retry.
-        quarantine_auto_release: cfg.quarantine_retry_after.to_i.positive? &&
-                                 cfg.sweep_every_ticks.to_i.positive?,
+        # Either knob at 0 stops the hold from ever expiring, so the hint
+        # must not promise a retry. The predicate itself lives in Overview
+        # so it is executable from a test; this line is the wiring.
+        quarantine_auto_release: Overview.quarantine_auto_release?(cfg),
         admitted_per_minute:  @capacity[:admitted_per_minute],
         forward_failures:     @windows["1m"][:forward_failures],
         jobs_admitted:        @windows["1m"][:jobs_admitted],

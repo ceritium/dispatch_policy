@@ -44,3 +44,25 @@ end
 
 desc "Alias for bench:all"
 task bench: "bench:all"
+
+namespace :mutations do
+  desc "Break each load-bearing line in turn and check a test notices. " \
+       "Slow (one full suite per mutation; talks to Postgres). " \
+       "Pass FILTER=19, FILTER=forwarder or FILTER='rescue' to limit."
+  task :all do
+    require_relative "test/mutations/run"
+    DispatchPolicy::Mutations::Runner.run
+  end
+
+  desc "List the catalogue without running anything"
+  task :list do
+    require_relative "test/mutations/catalogue"
+    DispatchPolicy::Mutations::ALL.each do |m|
+      expected = DispatchPolicy::Mutations::EXPECTED_SURVIVORS.key?(m[:id]) ? "  [expected survivor]" : ""
+      puts format("  %-4s %-58s %s%s", m[:id], m[:label], m[:file], expected)
+    end
+  end
+end
+
+desc "Alias for mutations:all"
+task mutations: "mutations:all"
