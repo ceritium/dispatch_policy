@@ -13,20 +13,25 @@ module DispatchPolicy
     # Four outcomes, and the distinction between the last two is the whole
     # point of the runner:
     #
-    #   CAUGHT     the suite failed. The line is guarded.
-    #   SURVIVED   the suite passed on broken code. Nothing guards it.
+    #   CAUGHT     the suite RAN and failed. The line is guarded.
+    #   SURVIVED   the suite ran and passed on broken code. Nothing guards it.
     #   NO TARGET  the `find` string is not in the file any more. The
     #              mutation is stale and proves NOTHING — the code moved
     #              under it.
-    #   INVALID    the mutation produced a file that does not parse. Also
-    #              proves nothing: the suite never ran.
+    #   INVALID    the mutation produced a file that does not parse. Proves
+    #              nothing: the suite never ran.
+    #   NO RESULT  the suite produced no summary line at all — it could not
+    #              boot, bundler failed, the database was gone. Also proves
+    #              nothing, and this is the one that hides: a non-green
+    #              exit looks exactly like a catch from the outside.
     #
-    # NO TARGET and INVALID fail the run, and they exist because this
-    # project shipped the opposite three times. A mutation of the hint
-    # struct was mis-typed into a syntax error; the suite could not boot,
-    # the runner read "not green" as "caught", and a line everyone
-    # believed was covered was not. Never let a mutation that did not
-    # actually run count as a pass.
+    # The last three fail the run, and they exist because this project
+    # shipped the opposite three times. A mutation of the hint struct was
+    # mis-typed into a syntax error; the suite could not boot, the runner
+    # read "not green" as "caught", and a line everyone believed was
+    # covered was not — the same line that later 500'd the dashboard.
+    # CAUGHT therefore requires a parsed summary line saying what failed.
+    # Never let a mutation that did not actually run count as a pass.
     module Runner
       module_function
 
@@ -48,8 +53,8 @@ module DispatchPolicy
 
           say "control run (#{selected.size} mutation(s) selected)"
           control = suite(tree)
-          unless control[:green]
-            abort "the control run is not green (#{control[:summary]}). " \
+          unless control[:ran] && control[:green]
+            abort "the control run is not usable (#{control[:summary]}). " \
                   "Fix the suite before reading anything into a mutation."
           end
           say "control: #{control[:summary]}"
@@ -81,7 +86,9 @@ module DispatchPolicy
           end
 
           result = suite(tree)
-          if result[:green]
+          if !result[:ran]
+            { outcome: :no_result, detail: result[:summary] }
+          elsif result[:green]
             { outcome: :survived }
           else
             { outcome: :caught, detail: result[:summary] }
@@ -103,10 +110,16 @@ module DispatchPolicy
           )
         end
         line = out[/^\d+ runs, \d+ assertions, \d+ failures, \d+ errors.*$/]
-        return { green: false, summary: "the suite did not run to completion" } unless line
+        unless line
+          # No summary line means minitest never finished, so there is no
+          # evidence either way. Carry the tail out so the operator can
+          # see WHY without re-running by hand.
+          return { ran: false, green: false,
+                   summary: "no summary line: #{out.lines.last(2).join(' ').strip[0, 120]}" }
+        end
 
         failures, errors = line.scan(/(\d+) failures, (\d+) errors/).flatten.map(&:to_i)
-        { green: failures.zero? && errors.zero?, summary: line }
+        { ran: true, green: failures.zero? && errors.zero?, summary: line }
       end
 
       def copy_tree(tree)
@@ -140,7 +153,7 @@ module DispatchPolicy
         unexpected = results.select do |mutation, result|
           case result[:outcome]
           when :survived then !EXPECTED_SURVIVORS.key?(mutation[:id])
-          when :no_target, :invalid then true
+          when :no_target, :invalid, :no_result then true
           else false
           end
         end
@@ -175,8 +188,8 @@ module DispatchPolicy
       end
 
       def banner(outcome)
-        { caught: "CAUGHT", survived: "SURVIVED", no_target: "NO TARGET", invalid: "INVALID" }
-        .fetch(outcome)
+        { caught: "CAUGHT", survived: "SURVIVED", no_target: "NO TARGET",
+          invalid: "INVALID", no_result: "NO RESULT" }.fetch(outcome)
       end
     end
   end

@@ -33,21 +33,28 @@ Each looked right. Each was written by someone who had just fixed the bug
 and knew exactly what the code should do. That is precisely the state in
 which you cannot judge your own test, and it is why this exists.
 
-## The four outcomes
+## The five outcomes
 
 | Outcome | Meaning |
 | --- | --- |
 | `CAUGHT` | The suite failed. The line is guarded. |
 | `SURVIVED` | The suite passed on broken code. Nothing guards it. |
 | `NO TARGET` | The `find` string is gone from the file. The mutation is stale and proves **nothing**. |
-| `INVALID` | The mutation produced a file that does not parse. Also proves nothing — the suite never ran. |
+| `INVALID` | The mutation produced a file that does not parse. Proves nothing — the suite never ran. |
+| `NO RESULT` | The suite produced no summary line: it could not boot, bundler failed, the database was gone. Proves nothing either, and this is the one that hides — from the outside a non-green exit looks exactly like a catch. |
 
-The last two fail the run, and they are not pedantry. The battery's own
+`CAUGHT` therefore requires a parsed summary line saying what failed, not
+merely a non-zero exit.
+
+The last three fail the run, and they are not pedantry. The battery's own
 mutation of the operator hint was mis-typed into a syntax error three
 times running. The suite could not boot, the runner read "not green" as
 "caught", and a line everybody believed was covered was not — the same
 line that later 500'd the dashboard in production code. **A mutation that
-did not actually run must never count as a pass.**
+did not actually run must never count as a pass** — which is also why
+`NO RESULT` exists: the first version of this runner scored a suite that
+never booted as `CAUGHT`, reproducing in the tool the exact defect the
+tool is for.
 
 `SURVIVED` is allowed only for entries in `EXPECTED_SURVIVORS`, each
 carrying the argument for why it is unreachable. If one of those is ever
