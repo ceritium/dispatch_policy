@@ -255,28 +255,50 @@ class UndeliverableJobTest < DispatchPolicy::IntegrationTest
   # Counting held rows there says work is in motion when nothing is
   # trying to admit them, and feeds a drain-time estimate that can never
   # come true — so they get their own tile instead.
+  #
+  # This EXECUTES the counts. It used to assert that the controller's
+  # source matched a regex, which passes for any change that leaves those
+  # characters somewhere in the file: with the real expression swapped for
+  # `StagedJob.count` and the old text kept in a heredoc, the suite stayed
+  # green while the mutation battery reported the line as guarded.
   def test_held_rows_are_not_counted_as_staged_backlog
     stage!("VanishedJob")
     stage!(LiveJob.name)
     DispatchPolicy::Tick.run(policy_name: "undeliverable")
     stage!(LiveJob.name)
 
-    assert_equal 1, DispatchPolicy::StagedJob.quarantined.count
-    assert_equal 1, DispatchPolicy::StagedJob.deliverable.count
+    totals = DispatchPolicy::Overview.totals
 
+    assert_equal 1, totals[:staged],
+                 "a held row is not backlog: nothing is trying to admit it"
+    assert_equal 1, totals[:quarantined],
+                 "and it still has to be visible somewhere, or it is a silent loss"
+  end
+  # Either knob at 0 means the hold never expires, so the hint can only
+  # promise an automatic retry when BOTH are on — an OR promises one that
+  # never comes, exactly when held rows are the operator's problem.
+  def test_the_hint_is_told_whether_the_hold_can_actually_expire
+    settings = Struct.new(:quarantine_retry_after, :sweep_every_ticks)
+
+    assert DispatchPolicy::Overview.quarantine_auto_release?(settings.new(3600, 50))
+    refute DispatchPolicy::Overview.quarantine_auto_release?(settings.new(0, 50)),
+           "quarantine_retry_after = 0 is documented as \"hold forever\""
+    refute DispatchPolicy::Overview.quarantine_auto_release?(settings.new(3600, 0)),
+           "sweep_every_ticks = 0 is documented as \"never sweep\""
+  end
+  # The predicate above is executable; the controller CALL that feeds it to
+  # the hint is not, because Rails never boots here. Deleting the argument
+  # is invisible — OperatorHints defaults it to true — so pin the wiring
+  # separately, the way connection_identity_test pins the railtie's.
+  def test_the_dashboard_actually_passes_that_answer_to_the_hint
     source = File.read(File.expand_path(
       "../../app/controllers/dispatch_policy/dashboard_controller.rb", __dir__
     ))
-    assert_match(/staged:\s+StagedJob\.deliverable\.count/, source,
-                 "counting held rows as staged is what made the tile lie")
-    assert_match(/quarantined:\s+StagedJob\.quarantined\.count/, source)
-    # The hint can only tell the truth about the hold expiring if the
-    # controller hands it both knobs: either one at 0 means nothing ever
-    # releases, so this is an AND, and dropping the key entirely is
-    # invisible (OperatorHints defaults it to true).
-    assert_match(/quarantine_auto_release:\s*cfg\.quarantine_retry_after\.to_i\.positive\? &&\s*\n\s*cfg\.sweep_every_ticks\.to_i\.positive\?/,
+
+    assert_match(/quarantine_auto_release:\s*Overview\.quarantine_auto_release\?\(cfg\)/,
                  source,
-                 "an OR, or no key at all, promises an automatic retry that never comes")
+                 "without the argument the hint falls back to its default and promises " \
+                 "a retry that this configuration will never perform")
   end
   # `String.deserialize` raises NoMethodError, which IS a NameError — so a
   # rescue listing NameError catches it and the test above passes either

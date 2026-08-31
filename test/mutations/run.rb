@@ -21,21 +21,34 @@ module DispatchPolicy
     #   INVALID    the mutation produced a file that does not parse. Proves
     #              nothing: the suite never ran.
     #   NO RESULT  the suite produced no summary line at all — it could not
-    #              boot, bundler failed, the database was gone. Also proves
-    #              nothing, and this is the one that hides: a non-green
-    #              exit looks exactly like a catch from the outside.
+    #              boot, bundler failed, the database was gone, it hung.
+    #              Also proves nothing, and this is the one that hides: a
+    #              non-green exit looks exactly like a catch from outside.
+    #   UNATTRIBUTED
+    #              the suite failed, but not in the test the entry names.
+    #              Something failed; we cannot say this mutation is why.
     #
     # The last three fail the run, and they exist because this project
     # shipped the opposite three times. A mutation of the hint struct was
     # mis-typed into a syntax error; the suite could not boot, the runner
     # read "not green" as "caught", and a line everyone believed was
     # covered was not — the same line that later 500'd the dashboard.
-    # CAUGHT therefore requires a parsed summary line saying what failed.
+    # CAUGHT therefore requires a parsed summary line saying what failed,
+    # AND that the failure be in the test the entry says should notice.
+    # Without that last check a CAUGHT means only "something was red":
+    # a leaked `idle in transaction` backend on a shared database once
+    # made an unrelated mutation fail 25 tests and score CAUGHT, and a
+    # stale `caught_by` can point at a test that has not run in months
+    # while the line it names is actually unguarded.
     # Never let a mutation that did not actually run count as a pass.
     module Runner
       module_function
 
       DB = ENV.fetch("MUTATION_DB", "dispatch_policy_mutations")
+
+      # A mutation can deadlock the suite instead of failing it. Without a
+      # bound the whole run hangs with no output and no result.
+      TIMEOUT = Integer(ENV.fetch("MUTATION_TIMEOUT", "600"))
 
       # Copied rather than mutated in place: an interrupt mid-run would
       # otherwise leave the working tree broken in a way `git status`
@@ -90,25 +103,60 @@ module DispatchPolicy
             { outcome: :no_result, detail: result[:summary] }
           elsif result[:green]
             { outcome: :survived }
+          elsif attributed?(mutation, result[:failed])
+            { outcome: :caught, detail: "#{result[:failed].join(', ')} — #{result[:summary]}" }
           else
-            { outcome: :caught, detail: result[:summary] }
+            { outcome: :unattributed,
+              detail: "failed in #{result[:failed].join(', ')}, not in #{mutation[:caught_by]}" }
           end
         ensure
           File.write(path, original)
         end
       end
 
+      # A CAUGHT has to be caught by the test the entry NAMES. Minitest
+      # prints the class; `caught_by` names files, so compare on the
+      # snake_cased class.
+      def attributed?(mutation, failed_classes)
+        named = mutation[:caught_by].to_s.split(",").map(&:strip).reject(&:empty?)
+        return false if named.empty? || named.first.start_with?("none")
+
+        failed_classes.any? { |klass| named.any? { |n| snake(klass).include?(n) } }
+      end
+
+      def snake(class_name)
+        class_name.split("::").last.to_s
+                  .gsub(/([a-z\d])([A-Z])/, '\1_\2')
+                  .gsub(/([A-Z]+)([A-Z][a-z])/, '\1_\2')
+                  .downcase
+      end
+
       # `Bundler.with_unbundled_env` matters: without it BUNDLE_GEMFILE
       # still points at the real checkout, so the copy runs the ORIGINAL
       # code and every mutation "survives".
       def suite(tree)
-        out = nil
+        out = +""
+        timed_out = false
         Bundler.with_unbundled_env do
-          out, = Open3.capture2e(
-            { "DB_NAME" => DB, "DISPATCH_POLICY_REQUIRE_DB" => "1" },
-            "bundle", "exec", "rake", "test", chdir: tree
-          )
+          Open3.popen2e({ "DB_NAME" => DB, "DISPATCH_POLICY_REQUIRE_DB" => "1" },
+                        "bundle", "exec", "rake", "test", chdir: tree) do |stdin, oe, wait|
+            stdin.close
+            reader = Thread.new { out << oe.read }
+            if wait.join(TIMEOUT)
+              reader.join
+            else
+              timed_out = true
+              begin
+                Process.kill("KILL", wait.pid)
+              rescue StandardError
+                nil
+              end
+              reader.kill
+            end
+          end
         end
+        return { ran: false, green: false, summary: "timed out after #{TIMEOUT}s" } if timed_out
+
         line = out[/^\d+ runs, \d+ assertions, \d+ failures, \d+ errors.*$/]
         unless line
           # No summary line means minitest never finished, so there is no
@@ -119,7 +167,8 @@ module DispatchPolicy
         end
 
         failures, errors = line.scan(/(\d+) failures, (\d+) errors/).flatten.map(&:to_i)
-        { ran: true, green: failures.zero? && errors.zero?, summary: line }
+        failed = out.scan(/^(?:Failure|Error):\n\s*([A-Za-z0-9_:]+)#test_/).flatten.uniq
+        { ran: true, green: failures.zero? && errors.zero?, summary: line, failed: failed }
       end
 
       def copy_tree(tree)
@@ -153,7 +202,7 @@ module DispatchPolicy
         unexpected = results.select do |mutation, result|
           case result[:outcome]
           when :survived then !EXPECTED_SURVIVORS.key?(mutation[:id])
-          when :no_target, :invalid, :no_result then true
+          when :no_target, :invalid, :no_result, :unattributed then true
           else false
           end
         end
@@ -189,7 +238,8 @@ module DispatchPolicy
 
       def banner(outcome)
         { caught: "CAUGHT", survived: "SURVIVED", no_target: "NO TARGET",
-          invalid: "INVALID", no_result: "NO RESULT" }.fetch(outcome)
+          invalid: "INVALID", no_result: "NO RESULT",
+          unattributed: "UNATTRIB" }.fetch(outcome)
       end
     end
   end

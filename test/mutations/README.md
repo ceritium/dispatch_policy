@@ -2,12 +2,15 @@
 
 ```bash
 bundle exec rake mutations:list          # the catalogue, no work done
-bundle exec rake mutations:all           # break each line in turn (slow: one suite per mutation)
+bundle exec rake mutations:all           # 33 mutations, 32 must be caught (slow: one suite each)
 FILTER=19 bundle exec rake mutations:all # one mutation
 FILTER=forwarder bundle exec rake mutations:all
 ```
 
-Needs Postgres, like the integration suite. It copies the tree to a
+Needs Postgres, like the integration suite. `MUTATION_DB` overrides the
+database (do it if two people run at once — a shared one produces
+failures that belong to neither run) and `MUTATION_TIMEOUT` the per-suite
+bound. It copies the tree to a
 temporary directory and works there, so an interrupted run cannot leave
 your checkout broken; the database (`dispatch_policy_mutations`, override
 with `MUTATION_DB`) is created if missing.
@@ -33,7 +36,7 @@ Each looked right. Each was written by someone who had just fixed the bug
 and knew exactly what the code should do. That is precisely the state in
 which you cannot judge your own test, and it is why this exists.
 
-## The five outcomes
+## The six outcomes
 
 | Outcome | Meaning |
 | --- | --- |
@@ -41,10 +44,17 @@ which you cannot judge your own test, and it is why this exists.
 | `SURVIVED` | The suite passed on broken code. Nothing guards it. |
 | `NO TARGET` | The `find` string is gone from the file. The mutation is stale and proves **nothing**. |
 | `INVALID` | The mutation produced a file that does not parse. Proves nothing — the suite never ran. |
-| `NO RESULT` | The suite produced no summary line: it could not boot, bundler failed, the database was gone. Proves nothing either, and this is the one that hides — from the outside a non-green exit looks exactly like a catch. |
+| `NO RESULT` | The suite produced no summary line: it could not boot, bundler failed, the database was gone, it hung past `MUTATION_TIMEOUT`. Proves nothing either, and this is the one that hides — from the outside a non-green exit looks exactly like a catch. |
+| `UNATTRIB` | The suite failed, but not in the test the entry names. Something is red; we cannot say this mutation is why. |
 
-`CAUGHT` therefore requires a parsed summary line saying what failed, not
-merely a non-zero exit.
+`CAUGHT` therefore requires two things: a parsed summary line saying what
+failed, **and** the failure being in the test the entry claims should
+notice. Without the second, a `CAUGHT` means only "something was red" —
+a leaked `idle in transaction` backend on a shared database once made an
+unrelated mutation fail 25 tests and score `CAUGHT`, and a stale
+`caught_by` can point at a test that has not guarded that line in months.
+The report prints the classes that actually failed, so the label is
+checkable at a glance.
 
 The last three fail the run, and they are not pedantry. The battery's own
 mutation of the operator hint was mis-typed into a syntax error three
@@ -59,6 +69,22 @@ tool is for.
 `SURVIVED` is allowed only for entries in `EXPECTED_SURVIVORS`, each
 carrying the argument for why it is unreachable. If one of those is ever
 `CAUGHT`, the run says so: the note has gone stale and should be deleted.
+Write that argument from the property that actually makes the mutation
+inert — the first one written here named the wrong mechanism and was
+plausible enough to survive a review.
+
+## Source pins
+
+Three entries (07, 22, 29) assert on a file's *source text* rather than
+running it, because Rails does not boot in the test environment and the
+lines are a railtie hook and a controller argument. Each says so in its
+comment. A source pin passes for any change that leaves the asserted
+characters somewhere in the file, so use one only when execution is
+genuinely impossible, and pin the executable half separately — 28 runs
+the predicate that 29 only checks is wired up. Two entries were source
+pins with no such excuse: the dashboard tile and the hint's AND. Both are
+now executed, via `DispatchPolicy::Overview`, which exists precisely so a
+test can call them.
 
 ## Adding one
 

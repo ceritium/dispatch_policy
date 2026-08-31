@@ -26,10 +26,14 @@ module DispatchPolicy
     # NOT listed here fails the run; an entry here that gets caught is
     # reported too, because it means the note is stale.
     EXPECTED_SURVIVORS = {
-      "04" => "Unreachable by construction: the horizon MIN only runs for a " \
-              "partition the claim already accepted, and the claim requires " \
-              "pending_count > 0, which the quarantine decrements to zero. " \
-              "No caller can reach it with a held row in scope."
+      "04" => "Unreachable by construction, though NOT for the reason first " \
+              "written here (that the quarantine zeroes pending_count: it " \
+              "subtracts with a GREATEST floor, so a partition with other " \
+              "pending rows is still claimed). The real property is that the " \
+              "MIN only counts rows with `scheduled_at > now()`, and the claim " \
+              "only ever returns rows that are already due — so a row cannot be " \
+              "both held and still scheduled in the future. If any new path can " \
+              "hold a future-scheduled row, delete this entry and write the test."
     }.freeze
 
     ALL = [
@@ -163,7 +167,7 @@ module DispatchPolicy
     label: 'concurrency gate: Integer() instead of Float().floor',
     # A jsonb count comes back as a String; `Integer()` raises on "3.0" where
     # `Float().floor` does not.
-    caught_by: 'interval_overflow_test',
+    caught_by: 'live_policy_edit_test',
     file:  'lib/dispatch_policy/gates/concurrency.rb',
     find:  'value.nil? ? 0 : Float(value).floor',
     replace: 'value.nil? ? 0 : Integer(value)'
@@ -303,9 +307,11 @@ module DispatchPolicy
     id:    '23',
     label: 'dashboard tile: counts held rows as backlog',
     # Held rows are not backlog. Counting them as staged feeds a drain-time estimate
-    # that can never come true.
+    # that can never come true. Executed by the test, not read from the source:
+    # this entry used to point at the controller, where a heredoc holding the old
+    # text kept the suite green while the battery printed CAUGHT.
     caught_by: 'undeliverable_job_test',
-    file:  'app/controllers/dispatch_policy/dashboard_controller.rb',
+    file:  'lib/dispatch_policy/overview.rb',
     find:  'staged:        StagedJob.deliverable.count,',
     replace: 'staged:        StagedJob.count,'
   },
@@ -364,22 +370,22 @@ module DispatchPolicy
   {
     id:    '28',
     label: 'hint wiring: && weakened to ||',
-    # Either knob at 0 means the hold never expires, so the wiring is an AND.
+    # Either knob at 0 means the hold never expires, so the predicate is an AND.
     caught_by: 'undeliverable_job_test',
-    file:  'app/controllers/dispatch_policy/dashboard_controller.rb',
-    find:  'quarantine_auto_release: cfg.quarantine_retry_after.to_i.positive? &&',
-    replace: 'quarantine_auto_release: cfg.quarantine_retry_after.to_i.positive? ||'
+    file:  'lib/dispatch_policy/overview.rb',
+    find:  'config.quarantine_retry_after.to_i.positive? &&',
+    replace: 'config.quarantine_retry_after.to_i.positive? ||'
   },
   {
     id:    '29',
     label: 'hint wiring: key deleted',
-    # Deleting the key is invisible: OperatorHints defaults it to true.
+    # Deleting the key is invisible: OperatorHints defaults it to true. A SOURCE
+    # pin, deliberately and unlike 23 and 28: Rails does not boot in the test
+    # environment, so the controller CALL cannot be executed. The predicate it
+    # calls is executable and is pinned that way — see 28.
     caught_by: 'undeliverable_job_test',
     file:  'app/controllers/dispatch_policy/dashboard_controller.rb',
-    find:  [
-      '        quarantine_auto_release: cfg.quarantine_retry_after.to_i.positive? &&',
-      '                                 cfg.sweep_every_ticks.to_i.positive?,'
-    ].join("\n") + "\n",
+    find:  '        quarantine_auto_release: Overview.quarantine_auto_release?(cfg),' + "\n",
     replace: ''
   },
   {
@@ -391,6 +397,30 @@ module DispatchPolicy
     file:  'lib/dispatch_policy/forwarder.rb',
     find:  'rescue UnresolvableJobClass, StandardError => e',
     replace: 'rescue UnresolvableJobClass, NameError, TypeError, InvalidPolicy => e'
+  },
+  {
+    id:    '31',
+    label: 'claim_partitions: fairness folded into the ORDER BY',
+    # In-tick fairness is ordering PLUS a cap, kept apart on purpose. The claim
+    # orders by last_checked_at so every pending partition is claimed within
+    # ceil(N/batch) ticks; `decayed_admits` only grows when a partition ADMITS, so
+    # ordering the claim by it sorts a partition that has done work behind every
+    # partition that has not — permanently, above partition_batch_size candidates.
+    # CLAUDE.md forbids this edit by name, and until now nothing enforced it.
+    caught_by: 'claim_rotation_test',
+    file:  'lib/dispatch_policy/repository.rb',
+    find:  'ORDER BY last_checked_at NULLS FIRST, id',
+    replace: 'ORDER BY decayed_admits ASC, last_checked_at NULLS FIRST, id'
+  },
+  {
+    id:    '32',
+    label: 'claim_partitions: last_checked_at not bumped on claim',
+    # Without the bump the claim returns the same head every tick and everything
+    # behind it starves — the same outcome as 31, reached from the other side.
+    caught_by: 'claim_rotation_test',
+    file:  'lib/dispatch_policy/repository.rb',
+    find:  'SET last_checked_at = now()' + "\n",
+    replace: 'SET last_checked_at = p.last_checked_at' + "\n"
   },
   {
     id:    '34',
