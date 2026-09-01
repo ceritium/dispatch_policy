@@ -76,7 +76,9 @@ class InflightTrackerHeartbeatTest < DispatchPolicy::IntegrationTest
 
     beats = []
     sub = ActiveSupport::Notifications.subscribe("sql.active_record") do |*, payload|
-      beats << payload[:sql] if payload[:name] == "heartbeat_inflight"
+      next unless payload[:name] == "heartbeat_inflight"
+
+      beats << payload[:binds].map { |b| b.respond_to?(:value) ? b.value : b }
     end
 
     tokens = ids.map { |id| DispatchPolicy::InflightTracker.start_heartbeat(id) }
@@ -87,7 +89,14 @@ class InflightTrackerHeartbeatTest < DispatchPolicy::IntegrationTest
     sleep 0.05 while beats.empty? && Time.now < deadline
     tokens.each { |t| DispatchPolicy::InflightTracker.stop_heartbeat(t) }
 
-    assert_equal 1, beats.size, "all three rows in one statement, not one statement each"
+    # The FIRST statement, not a count of them: counting races the loop —
+    # a per-id implementation emits its second and third statements after
+    # this thread has already been woken by the first, and the test then
+    # passes against the bug. What the fix claims is that one statement
+    # carries every running job, and the first one either does or does not.
+    refute_empty beats, "the shared thread never beat"
+    assert_equal ids.sort, beats.first.sort,
+                 "all three rows in one statement, not one statement each"
     ids.each do |id|
       assert_operator heartbeats_for(ids)[id], :>, before[id], "#{id} was not beaten"
     end
