@@ -55,7 +55,8 @@
   after which the tick re-parks it in the new column.
 ### Fixed
 
-- **Pausing a policy no longer deadlocks against ordinary enqueues.**
+- **Pausing a policy no longer deadlocks against ordinary enqueues, and
+  two overlapping clicks can no longer wedge it.**
   `PoliciesController#pause` / `#resume` wrote every partition row of the
   policy with one `update_all` inside a transaction, which has no lock
   order of its own — a seq scan locks in heap order, an index scan in the
@@ -68,7 +69,30 @@
   now takes its row locks in the canonical `COLLATE "C"` order, sliced so
   a large policy never holds every lock at once, and the controller writes
   the policy-level flag first on pause and last on resume so any partial
-  state fails closed.
+  state fails closed. Because the flip no longer shares a transaction with
+  the flag, the two actions are serialized against each OTHER by a
+  `pg_try_advisory_lock` per policy — without it a resume overlapping a
+  pause left `paused = false` with every partition still marked paused,
+  which admits nothing, says so nowhere, and never heals (measured at 5
+  corrupt runs in 6). A second click while one is running is refused with
+  "try again in a moment" rather than queued behind it.
+
+- **The partition sweeper takes its row locks in the same order as
+  everything else.** `sweep_inactive_partitions!` was the last multi-row
+  writer of `dispatch_policy_partitions` with no lock order of its own —
+  its `DELETE` planned as an index scan that tie-breaks by ctid, i.e. heap
+  order. Against one bulk-enqueuing process that deadlocked 4-10 times per
+  20-second run; Postgres usually killed the sweep, whose blanket rescue
+  then silently skipped the rest of that pass (partition GC, tick-sample
+  GC and adaptive-stat GC), and in one run it killed the operator's pause
+  click instead. Now an ordered `FOR UPDATE … SKIP LOCKED` picks the
+  victims: 0 deadlocks in four 20-second runs.
+
+- **`StagedJob.due` reads the same clock as the claim.** It is the scope
+  the drain button counts what is left with, and on a session whose
+  TimeZone is not what Rails wrote with, it counted rows the claim will
+  not take — so the flash said "N still pending — click drain again"
+  forever.
 
 - **Scheduled work is compared on the clock it was written with.**
   `scheduled_at` and the `scheduled_eligible_at` horizon are
@@ -79,8 +103,11 @@
   why it hid — but a host that sets `variables: { timezone: … }` in
   `database.yml` got every `set(wait:)` job off by the offset: early on a
   zone east of UTC, never on one west of it, with no trace in any metric.
-  Those comparisons now bind `config.now`, so both sides go through the
-  same serialization the write did. `next_eligible_at`, which Postgres
+  Those comparisons now bind the application clock, so both sides go
+  through the same serialization the write did (via
+  `Repository.app_clock`, which coerces — `config.clock` is public API and
+  may return an epoch Float, which every other reader accepts and Postgres
+  rejects as a timestamp). `next_eligible_at`, which Postgres
   writes, stays on `now()` for the same reason.
 
 - **The adaptive gate's feedback signal is measured on one clock.**
@@ -107,7 +134,20 @@
   constant 1 rather than proportional to concurrency — it fits the spare
   connection the adapters already ask for. The interval is re-read every
   cycle, so changing `inflight_heartbeat_interval` (0 to disable) takes
-  effect without restarting the process.
+  effect without restarting the process, and the registry is dropped when
+  the process id changes so a forked child does not keep the inflight rows
+  of its parent's jobs alive.
+
+  **This needs one connection in the pool above the worker's thread
+  count**, and that is now stated as a requirement rather than as
+  headroom: with the Rails default sizing (pool and threads both from
+  `RAILS_MAX_THREADS`) a saturated worker leaves nothing for the beat, and
+  the same end-to-end failure still reproduces — measured with pool=3 and
+  3 running jobs, every beat raised `ConnectionTimeoutError` and the
+  sweeper deleted all three inflight rows while the jobs ran on. With
+  pool=4 the same run kept every row. That one timeout is now logged at
+  error level naming the sizing, instead of a warning indistinguishable
+  from any other.
 
 - **The dashboard stops calling a scheduled workload a stuck tick.**
   Partitions parked behind a future `scheduled_eligible_at` counted as

@@ -6,6 +6,8 @@ module DispatchPolicy
 
     DRAIN_MAX_PER_REQUEST = 10_000
 
+    BUSY_NOTICE = "Another pause or resume for this policy is still running — try again in a moment."
+
     def index
       registry_names = DispatchPolicy.registry.names
       db_names       = Partition.distinct.pluck(:policy_name)
@@ -113,8 +115,19 @@ module DispatchPolicy
       # safe: every partial state is "paused, and some rows not yet marked"
       # — admission is already stopped. The reverse order could leave
       # admission running with a UI that says paused.
-      Repository.set_policy_paused!(policy_name: @policy_name, paused: true)
-      Repository.set_partitions_status!(policy_name: @policy_name, status: "paused")
+      #
+      # The two writes are serialized against a CONCURRENT click by an
+      # advisory lock, not by a transaction — see
+      # `Repository.with_policy_pause_lock`. Without it, a resume
+      # overlapping this pause leaves the policy with the flag cleared and
+      # every partition still marked paused, which admits nothing and says
+      # so nowhere.
+      ran = Repository.with_policy_pause_lock(policy_name: @policy_name) do
+        Repository.set_policy_paused!(policy_name: @policy_name, paused: true)
+        Repository.set_partitions_status!(policy_name: @policy_name, status: "paused")
+      end
+      return redirect_to policy_path(@policy_name), alert: BUSY_NOTICE unless ran
+
       redirect_to policy_path(@policy_name), notice: "Policy paused."
     end
 
@@ -123,8 +136,12 @@ module DispatchPolicy
       # partial resume then leaves the policy paused (the flag still holds
       # admission), never partitions marked active under a flag nobody
       # cleared. Both directions fail closed.
-      Repository.set_partitions_status!(policy_name: @policy_name, status: "active")
-      Repository.set_policy_paused!(policy_name: @policy_name, paused: false)
+      ran = Repository.with_policy_pause_lock(policy_name: @policy_name) do
+        Repository.set_partitions_status!(policy_name: @policy_name, status: "active")
+        Repository.set_policy_paused!(policy_name: @policy_name, paused: false)
+      end
+      return redirect_to policy_path(@policy_name), alert: BUSY_NOTICE unless ran
+
       redirect_to policy_path(@policy_name), notice: "Policy resumed."
     end
 

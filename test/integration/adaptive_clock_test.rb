@@ -89,6 +89,34 @@ class AdaptiveClockTest < DispatchPolicy::IntegrationTest
                     "perform duration must not leak into the queue-wait signal"
   end
 
+  # `clock_timestamp()`, not `now()`: `now()` is the TRANSACTION timestamp
+  # and stops advancing inside an open transaction, so a host that wraps
+  # the perform in one — Rails transactional tests, among others — would
+  # report the queue wait as "time since that transaction opened" and the
+  # AIMD controller would never see a job as late.
+  def test_the_lag_is_wall_clock_not_the_enclosing_transactions_timestamp
+    job = AdaptiveJob.new
+    admit!(job.job_id) # 5s ago
+
+    observed = []
+    gate = AdaptiveJob::POLICY.gates.find { |g| g.name == :adaptive_concurrency }
+
+    DispatchPolicy::Repository.connection.transaction do
+      # Rails opens transactions lazily, so BEGIN is not issued until a
+      # statement needs it. Without this the BEGIN lands AFTER the sleep,
+      # now() and clock_timestamp() agree, and the test passes on both.
+      DispatchPolicy::Repository.connection.select_value("SELECT 1")
+      sleep 1.5 # inside the transaction now() no longer moves; the wall clock does
+      gate.stub(:record_observation, ->(**kwargs) { observed << kwargs }) do
+        DispatchPolicy::InflightTracker.track(job) { nil }
+      end
+    end
+
+    assert_in_delta 6_500, observed.first[:queue_lag_ms], 900,
+                    "on now() this reads 5000 — the transaction's own timestamp minus " \
+                    "admitted_at — however long the job actually waited"
+  end
+
   # No row (swept, or a policy the Tick never pre-inserted for) means the
   # wait is unknown, not zero-length work: the observation is still
   # recorded so sample_count advances and the cap can grow.

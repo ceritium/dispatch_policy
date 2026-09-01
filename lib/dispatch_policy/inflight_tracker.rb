@@ -350,10 +350,28 @@ module DispatchPolicy
       return nil if interval <= 0
 
       heartbeat_mutex.synchronize do
+        forget_inherited_registrations!
         heartbeat_ids[active_job_id] = true
         ensure_heartbeat_thread
       end
       active_job_id
+    end
+
+    # Caller holds heartbeat_mutex.
+    #
+    # A fork copies the registry but NOT the thread. Every id in the copy
+    # belongs to a job running in the PARENT, and beating them from the
+    # child is worse than not beating them at all: it keeps the inflight
+    # row of a job that is not running here fresh, so the stale sweeper
+    # never reclaims it and the concurrency slot is lost for as long as the
+    # child lives. Reproduced with a real fork — the child beat the
+    # parent's job 2.6s after the parent had stopped.
+    def self.forget_inherited_registrations!
+      return if @heartbeat_pid.nil? || @heartbeat_pid == Process.pid
+
+      heartbeat_ids.clear
+      @heartbeat_thread = nil
+      @heartbeat_pid    = nil
     end
 
     def self.stop_heartbeat(token)
@@ -491,6 +509,19 @@ module DispatchPolicy
       Repository.with_connection do
         Repository.heartbeat_inflight!(active_job_ids: ids)
       end
+    rescue ActiveRecord::ConnectionTimeoutError => e
+      # Named separately because it is the one failure with a fix, and a
+      # `warn` indistinguishable from any other made it invisible. One
+      # thread needs ONE connection; if it cannot get that, the pool has no
+      # spare above the worker's concurrency, every beat is lost, and the
+      # stale sweeper starts deleting the inflight rows of jobs that are
+      # still running — the concurrency cap then admits over them.
+      DispatchPolicy.config.logger&.error(
+        "[dispatch_policy] heartbeat could not get a connection (#{e.class}): #{ids.size} " \
+        "running job(s) are not being heartbeated and will be swept as stale. The pool must " \
+        "have at least one connection above the worker's thread count."
+      )
+      nil
     rescue StandardError => e
       DispatchPolicy.config.logger&.warn("[dispatch_policy] heartbeat #{ids.size} row(s) failed: #{e.class}: #{e.message}")
       nil

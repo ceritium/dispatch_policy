@@ -122,6 +122,39 @@ class DenyLockOrderTest < DispatchPolicy::IntegrationTest
     refute_nil lock, "without an explicit ordered lock this deadlocks against stage_many!"
     assert_match(/ORDER BY policy_name COLLATE "C", partition_key COLLATE "C"/, lock[:sql])
   end
+  # The partition sweeper's DELETE writes many partition rows too. A bare
+  # `DELETE … WHERE` locks in whatever order the plan produces — an index
+  # scan on idx_dp_partitions_scheduled_order tie-breaks equal keys by
+  # ctid, i.e. heap order — so it deadlocks against `stage_many!` and
+  # against the pause button: 4-10 per 20s run against one bulk-enqueuing
+  # process, and in one run the operator's CLICK was the victim. Postgres
+  # usually kills the sweep instead, and `TickLoop.sweep!`'s blanket rescue
+  # then silently skips the rest of that pass.
+  def test_the_partition_sweep_takes_its_locks_in_the_same_order
+    seen = capture_sql do
+      DispatchPolicy::Repository.sweep_inactive_partitions!(cutoff_seconds: 0, policy_name: POLICY)
+    end
+
+    sweep = seen.find { |p| p[:name] == "sweep_inactive_partitions" }
+    refute_nil sweep
+    assert_match(/ORDER BY p.policy_name COLLATE "C", p.partition_key COLLATE "C"/, sweep[:sql],
+                 "without it the DELETE locks in heap order and crosses stage_many!")
+    assert_match(/FOR UPDATE OF p SKIP LOCKED/, sweep[:sql],
+                 "a periodic best-effort sweep must skip rows somebody is writing, not wait on them")
+  end
+
+  # …and still deletes what it is supposed to.
+  def test_the_partition_sweep_still_collects_a_drained_partition
+    DispatchPolicy::Repository.connection.execute(
+      "UPDATE dispatch_policy_partitions SET pending_count = 0, " \
+      "created_at = now() - interval '2 hours', last_admit_at = NULL"
+    )
+
+    DispatchPolicy::Repository.sweep_inactive_partitions!(cutoff_seconds: 60, policy_name: POLICY)
+
+    assert_equal 0, DispatchPolicy::Partition.for_policy(POLICY).count
+  end
+
   # One bind per held partition and one transaction over all of them:
   # Postgres caps parameters at 65,535, and holding FOR UPDATE on every
   # row for the whole loop was measured at ~0.5s on 2,500 partitions with

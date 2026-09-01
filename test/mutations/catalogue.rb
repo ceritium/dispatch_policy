@@ -481,8 +481,11 @@ module DispatchPolicy
     caught_by: 'pause_lock_order_test',
     file:  'app/controllers/dispatch_policy/policies_controller.rb',
     find:  [
-      '      Repository.set_policy_paused!(policy_name: @policy_name, paused: true)',
-      '      Repository.set_partitions_status!(policy_name: @policy_name, status: "paused")'
+      '      ran = Repository.with_policy_pause_lock(policy_name: @policy_name) do',
+      '        Repository.set_policy_paused!(policy_name: @policy_name, paused: true)',
+      '        Repository.set_partitions_status!(policy_name: @policy_name, status: "paused")',
+      '      end',
+      '      return redirect_to policy_path(@policy_name), alert: BUSY_NOTICE unless ran'
     ].join("\n"),
     replace: [
       '      Partition.transaction do',
@@ -577,6 +580,110 @@ module DispatchPolicy
     file:  'lib/dispatch_policy/inflight_tracker.rb',
     find:  '        alive = beat!(ids)',
     replace: '        alive = ids.flat_map { |id| beat!([id]) || [] }'
+  },
+  {
+    id:    '45',
+    label: 'pause action: the advisory lock dropped',
+    # Two overlapping clicks then interleave: a resume clears the flag while a
+    # pause is still walking its slices, and the policy ends up with
+    # paused=false and every partition status='paused'. Nothing admits, the
+    # dashboard says the policy is running, and nothing heals it.
+    caught_by: 'pause_lock_order_test',
+    file:  'app/controllers/dispatch_policy/policies_controller.rb',
+    find:  [
+      '      ran = Repository.with_policy_pause_lock(policy_name: @policy_name) do',
+      '        Repository.set_partitions_status!(policy_name: @policy_name, status: "active")',
+      '        Repository.set_policy_paused!(policy_name: @policy_name, paused: false)',
+      '      end',
+      '      return redirect_to policy_path(@policy_name), alert: BUSY_NOTICE unless ran',
+      ''
+    ].join("\n"),
+    replace: [
+      '      Repository.set_partitions_status!(policy_name: @policy_name, status: "active")',
+      '      Repository.set_policy_paused!(policy_name: @policy_name, paused: false)'
+    ].join("\n")
+  },
+  {
+    id:    '46',
+    label: 'pause lock: never released',
+    # A session advisory lock outlives the request on that connection. A click
+    # that forgets to release it refuses every later click handled by the same
+    # connection, for the life of the process — the button silently stops
+    # working and says "try again in a moment" forever.
+    caught_by: 'pause_lock_order_test',
+    file:  'lib/dispatch_policy/repository.rb',
+    find:  [
+      '      begin',
+      '        yield',
+      '      ensure',
+      '        connection.select_value(',
+      '          "SELECT pg_advisory_unlock(#{Integer(PAUSE_LOCK_CLASS)}, #{Integer(objid)})"',
+      '        )',
+      '      end',
+      '      true'
+    ].join("\n"),
+    replace: [
+      '      yield',
+      '      true'
+    ].join("\n")
+  },
+  {
+    id:    '47',
+    label: 'partition sweep: back to an unordered DELETE',
+    # The last multi-row writer of `partitions` without a lock order. Postgres
+    # usually kills the sweep, whose blanket rescue then silently skips the rest
+    # of that pass, but it can pick the operator's pause click instead.
+    caught_by: 'deny_lock_order_test',
+    file:  'lib/dispatch_policy/repository.rb',
+    find:  [
+      '            ORDER BY p.policy_name COLLATE "C", p.partition_key COLLATE "C"',
+      '            FOR UPDATE OF p SKIP LOCKED'
+    ].join("\n"),
+    replace: '            ORDER BY p.id'
+  },
+  {
+    id:    '48',
+    label: 'heartbeat: a forked child keeps the parent registry',
+    # The child then beats the inflight rows of jobs running in the PARENT,
+    # keeping them fresh so the stale sweeper never reclaims them — the
+    # concurrency slot is lost for as long as the child lives.
+    caught_by: 'inflight_tracker_heartbeat_test',
+    file:  'lib/dispatch_policy/inflight_tracker.rb',
+    find:  '        forget_inherited_registrations!' + "\n",
+    replace: ''
+  },
+  {
+    id:    '49',
+    label: 'StagedJob.due back on the session clock',
+    # The half of A11 that lives outside Repository. The drain button counts what
+    # is left with this scope, so on a skewed session it flashes "N still pending
+    # — click drain again" about rows the claim will not take, on every click.
+    caught_by: 'scheduled_clock_test',
+    file:  'app/models/dispatch_policy/staged_job.rb',
+    find:  'where("scheduled_at IS NULL OR scheduled_at <= ?", DispatchPolicy::Repository.app_clock)',
+    replace: 'where("scheduled_at IS NULL OR scheduled_at <= now()")'
+  },
+  {
+    id:    '50',
+    label: 'adaptive lag: clock_timestamp() back to now()',
+    # now() is the TRANSACTION timestamp. Inside a host that wraps the perform in
+    # one it stops advancing, and the queue wait becomes "time since that
+    # transaction opened" — the controller never sees a job as late.
+    caught_by: 'adaptive_clock_test',
+    file:  'lib/dispatch_policy/inflight_tracker.rb',
+    find:  '"(clock_timestamp()::timestamp - admitted_at)) * 1000, 0)::bigint AS queue_lag_ms " \\',
+    replace: '"(now()::timestamp - admitted_at)) * 1000, 0)::bigint AS queue_lag_ms " \\'
+  },
+  {
+    id:    '51',
+    label: 'clock binding narrows config.clock to a Time',
+    # config.clock is public API and every other reader calls .to_f on it, so a
+    # lambda returning an epoch Float has always worked. Bound raw into SQL it
+    # raises inside the admission path.
+    caught_by: 'scheduled_clock_test',
+    file:  'lib/dispatch_policy/repository.rb',
+    find:  '      value.is_a?(Numeric) ? Time.at(value).utc : value',
+    replace: '      value'
   },
     ].freeze
   end

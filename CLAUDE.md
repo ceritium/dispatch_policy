@@ -19,7 +19,7 @@ See `README.md` for the API and examples.
 v0.1 (on master). The whole main flow is implemented and tested.
 What's pending lives in `IDEAS.md` with the rationale.
 
-323 runs / 804 assertions. `bundle exec rake test` from the root.
+332 runs / 832 assertions. `bundle exec rake test` from the root.
 A mutation battery guards the tests themselves: `bundle exec rake
 mutations:all` (see `test/mutations/README.md`, and "Fixing a defect"
 below).
@@ -153,8 +153,13 @@ dispatch_policy_policy_settings               one row per policy — pause flag
   same footing, so they are read with `now()`. Application-written ones —
   `staged_jobs.scheduled_at` and the `scheduled_eligible_at` horizon
   derived from it — are bound from Ruby and serialized by `quoted_date`,
-  so they are compared against a BOUND `DispatchPolicy.config.now`, never
-  `now()`. Mixing them needs no misconfiguration to be wrong, just a host
+  so they are compared against a BOUND `Repository.app_clock` (which is
+  `config.now`, coerced — `config.clock` is public API and may hand back an
+  epoch Float, which every other reader accepts via `.to_f` and Postgres
+  rejects as a timestamp), never `now()`. That holds OUTSIDE Repository
+  too: `StagedJob.due` is the scope the drain button counts what is left
+  with, and read on the wrong clock it flashes "N still pending — click
+  drain again" about rows the claim will not take. Mixing them needs no misconfiguration to be wrong, just a host
   that sets `variables: { timezone: … }` in database.yml, and then
   `set(wait:)` fires early on a zone east of UTC and never on one west of
   it, with no trace in any metric (A11). The same rule applies outside
@@ -164,7 +169,13 @@ dispatch_policy_policy_settings               one row per policy — pause flag
   and the difference is the AIMD controller's entire input (A10). Use
   `clock_timestamp()` and not `now()` there: `now()` is the transaction
   timestamp, so inside a host that wraps the perform in a transaction it
-  stops advancing.
+  stops advancing. What this rule does NOT fix, and cannot: two Postgres
+  sessions that disagree about their TimeZone. `admitted_at` is stored in
+  the writing session's frame, so a tick and a worker configured
+  differently still read each other wrong — and the lag's
+  `GREATEST(…, 0)` silently absorbs one direction of that. Consistent
+  session configuration across the fleet is an assumption of the whole
+  schema, not just of this column.
 - **The partition sweeper holds a throttled partition until its bucket
   has REFILLED, not until its window is out.** `sweep_inactive_partitions!`
   refills the stored value to now with the same expression the admission
@@ -351,6 +362,22 @@ dispatch_policy_policy_settings               one row per policy — pause flag
   safety valve `max(remaining, initial_max)` when `in_flight=0`.
   Integration test:
   `test/integration/adaptive_with_fairness_test.rb`.
+- **The heartbeat is ONE thread per process, and the pool must have one
+  connection above the worker's thread count.** The thread beats every
+  registered job in a single statement, so its demand is constant rather
+  than proportional to concurrency — but constant is not zero: with the
+  Rails default sizing (pool and threads both from RAILS_MAX_THREADS) a
+  saturated worker holds every connection and the beat still gets nothing.
+  Measured with pool=3 and 3 running jobs: every beat raised
+  ConnectionTimeoutError, and the gem's OWN sweeper then deleted all three
+  inflight rows while the jobs were still running, after which the
+  concurrency gate admits over occupied slots. pool=4 kept every row.
+  `beat!` logs that one timeout at error level naming the sizing, and
+  `config.inflight_heartbeat_interval`'s comment states the requirement.
+  The registry is module state, so `start_heartbeat` drops everything it
+  inherited when `Process.pid` changes: a fork copies the ids but not the
+  thread, and a child beating its parent's jobs keeps rows fresh that
+  nothing will ever release.
 - **Adaptive's feedback signal is the queue wait between admission and
   perform, measured end to end by the database.**
   `InflightTracker.lookup_admission` reads the inflight row the Tick
@@ -445,18 +472,34 @@ dispatch_policy_policy_settings               one row per policy — pause flag
   against one bulk-enqueuing process, at the worst possible moment (during
   the load that made someone want to pause), rolling the controller's
   transaction back so the policy was NOT paused while the tick kept
-  admitting and the request answered 500. One writer still has no order:
-  `sweep_inactive_partitions!`'s DELETE, safe only because it runs every
-  `sweep_every_ticks`.
+  admitting and the request answered 500. `sweep_inactive_partitions!` has it now
+  too — an ordered `FOR UPDATE OF p SKIP LOCKED` CTE ahead of the DELETE.
+  "It only runs every `sweep_every_ticks`" was not safety: measured at
+  4-10 deadlocks per 20s run against one bulk-enqueuing process, and
+  Postgres picked the operator's pause CLICK as the victim in one of them.
+  Every multi-row writer of this table now takes its locks byte-ordered;
+  keep it that way.
 - **A multi-row partition writer that SLICES gives up all-or-nothing, so
-  the caller has to make every partial state safe.** `set_partitions_status!`
+  the caller has to serialize itself some other way.** `set_partitions_status!`
   cannot hold every lock of a large policy behind one click — that is A1's
-  lock convoy — so it commits per slice. `PoliciesController` therefore
-  writes the policy-level pause flag FIRST on pause and LAST on resume:
-  the flag is what `claim_partitions` actually reads, so every partial
-  state is "more paused", never "the partition list says paused while
-  admission runs". Reversing either order is silent until an operator
-  needs it.
+  lock convoy — so it commits per slice. Two consequences, and BOTH are
+  load-bearing:
+  1. `PoliciesController` writes the policy-level pause flag FIRST on
+     pause and LAST on resume. The flag is what `claim_partitions` reads,
+     so a crash mid-flip leaves "more paused", never "the partition list
+     says paused while admission runs".
+  2. Both actions run inside `Repository.with_policy_pause_lock`, a
+     `pg_try_advisory_lock` on (policy). Ordering alone does NOT survive a
+     concurrent click: a resume that clears the flag while a pause is
+     still walking its slices leaves `paused = false` with every partition
+     `status = 'paused'`, which admits nothing and says so nowhere — and
+     never heals, because `upsert_partition!` never writes `status` and
+     the sweeper needs a `pending_count` of 0 an unclaimable partition
+     cannot reach. Measured at 5 corrupt runs in 6 with the clicks 2ms
+     apart. It is `try`, not a wait, because this is a web request; the
+     second operator is told to try again. The lock is SESSION-scoped, so
+     the release in `ensure` is not optional — leak it and the button
+     refuses every later click on that connection.
 - **`claim_staged_jobs!` requires `limit > 0`** (it's now the
   admit-only path). The pure-deny path goes through
   `Repository.bulk_record_partition_denies!`: the Tick accumulates
@@ -500,12 +543,12 @@ http://localhost:3000/                       # forms to enqueue
 http://localhost:3000/dispatch_policy        # dashboard
 
 # Tests
-bundle exec rake test                        # 323 runs / 804 assertions
+bundle exec rake test                        # 332 runs / 832 assertions
 
 # Mutation battery — breaks each load-bearing line and checks a test
 # notices. Slow (one full suite per mutation). See test/mutations/README.md.
 bundle exec rake mutations:list              # the catalogue, no work done
-bundle exec rake mutations:all               # 43 mutations, 42 must be caught
+bundle exec rake mutations:all               # 51 mutations, 50 must be caught
 FILTER=19 bundle exec rake mutations:all     # one of them
 
 # When you add a column or table:

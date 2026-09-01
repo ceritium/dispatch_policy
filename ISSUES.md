@@ -15,6 +15,55 @@ pause button. That one is fixed here, together with the four low findings
 whose common shape turned out to be the same as A10's and A11's: **a
 comparison whose two sides come from different clocks.**
 
+## Review round on this branch — three of the six fixes were defective
+
+Same discipline as the fourth audit's fix branch, same result, which is
+why it is recorded rather than quietly corrected. Three independent
+adversarial reviewers, each required to reproduce every claim by running
+something. What they found was again **in the fixes, not in the audit**:
+
+- **The pause fix introduced a worse bug than the one it fixed.** Dropping
+  the transaction made the two writes non-atomic against a CONCURRENT
+  click, not just against a crash. Resume clears the flag while pause is
+  still walking its slices, pause's remaining slices land afterwards, and
+  the policy ends with `paused = false` and every partition
+  `status = 'paused'`: nothing admits, the dashboard says the policy is
+  running, and it never heals — `upsert_partition!` does not write
+  `status`, and the sweeper needs a `pending_count` of 0 that an
+  unclaimable partition never reaches. 5 corrupt runs in 6 with the clicks
+  2ms apart; master's single transaction: 0 in 6. Fixed with a
+  `pg_try_advisory_lock` per policy, which serializes the clicks without
+  putting a row lock near the enqueue path.
+- **The A12 fix did not fix A12 at the sizing A12 names.** Demand went
+  from `2N` to 1, but at `pool == threads` the supply is 0 either way:
+  with pool=3 and 3 running jobs every beat still raised
+  `ConnectionTimeoutError` and the gem's own sweeper deleted all three
+  inflight rows while the jobs ran on. The fix is real but conditional on
+  `pool >= threads + 1`, which is now stated as a requirement in
+  `config.rb`, the CHANGELOG and CLAUDE.md, and the one timeout that says
+  so is logged at error level instead of as an indistinguishable warning.
+- **Two of the new tests were decorative**, and the mutation battery found
+  one of them only in a FULL run: counting the heartbeat's statements
+  races the loop, so mutation 44 was CAUGHT alone and SURVIVED among 43.
+  The other was an upper-bound assertion on the adaptive lag, which the
+  failure mode itself satisfies — an unknown wait is recorded as 0, and 0
+  is less than any bound. Both replaced with assertions that have no
+  window: the contents of the first beat, and a two-sided range.
+
+Three further defects the reviewers reproduced and this branch also fixes:
+the partition sweeper's DELETE was the last unordered multi-row writer of
+`partitions` (4-10 deadlocks per 20s run, and in one of them the
+operator's click was the victim); `StagedJob.due` — the scope the drain
+button counts with — was still on the session clock; and a forked child
+inherited the heartbeat registry and beat its parent's jobs, keeping rows
+fresh that nothing would ever release.
+
+Two gaps they found in the tests rather than the code are closed with
+mutations 45-51, and one they found in the reasoning is recorded above:
+`clock_timestamp()` vs `now()` was unpinned by any test even after the
+range fix, because the range closed the "measured after the block" half
+and not the "transaction timestamp" half.
+
 ## P1 — Pausing a policy deadlocks against an ordinary bulk enqueue
 
 `PoliciesController#pause` / `#resume` wrote every partition row of the

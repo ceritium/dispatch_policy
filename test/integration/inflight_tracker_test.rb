@@ -47,8 +47,7 @@ class InflightTrackerHeartbeatTest < DispatchPolicy::IntegrationTest
     refute_includes DispatchPolicy::InflightTracker.heartbeat_ids.keys, token,
                     "a stopped job must not keep getting beaten — its row is about to be deleted"
 
-    deadline = Time.now + 5
-    sleep 0.05 while heartbeat_threads.any? && Time.now < deadline
+    quiesce_heartbeat_threads!
     assert_empty heartbeat_threads, "the thread must retire once nothing is running"
   ensure
     DispatchPolicy.reset_config!
@@ -126,6 +125,41 @@ class InflightTrackerHeartbeatTest < DispatchPolicy::IntegrationTest
   ensure
     DispatchPolicy::InflightTracker.stop_heartbeat("ghost")
     DispatchPolicy.reset_config!
+  end
+
+  # A fork copies the module-level registry but not the thread. Beating the
+  # parent's jobs from the child is worse than not beating them: it keeps
+  # the inflight row of a job that is not running here fresh, so the stale
+  # sweeper never reclaims it and the concurrency slot is lost for as long
+  # as the child lives. Reproduced with a real fork (the child beat the
+  # parent's job 2.6s after the parent stopped); pinned here on the pid
+  # branch itself, which is the whole mechanism and does not need a forked
+  # ActiveRecord connection to exercise.
+  def test_a_process_that_inherits_the_registry_drops_it
+    DispatchPolicy.config.inflight_heartbeat_interval = 0.05
+    DispatchPolicy::InflightTracker.start_heartbeat("parents-job")
+    assert_includes DispatchPolicy::InflightTracker.heartbeat_ids.keys, "parents-job"
+
+    Process.stub(:pid, Process.pid + 1) do
+      DispatchPolicy::InflightTracker.start_heartbeat("childs-job")
+    end
+
+    assert_equal %w[childs-job], DispatchPolicy::InflightTracker.heartbeat_ids.keys,
+                 "a job running in the parent must not be heartbeated by the child"
+  ensure
+    # The pid switch orphans the thread the parent had started: it is still
+    # alive, and the next test's "exactly one thread" assertion sees two.
+    # Wait it out rather than leave the pollution for whoever runs next.
+    DispatchPolicy::InflightTracker.heartbeat_ids.keys.each do |id|
+      DispatchPolicy::InflightTracker.stop_heartbeat(id)
+    end
+    quiesce_heartbeat_threads!
+    DispatchPolicy.reset_config!
+  end
+
+  def quiesce_heartbeat_threads!
+    deadline = Time.now + 5
+    sleep 0.05 while heartbeat_threads.any? && Time.now < deadline
   end
 
   def heartbeat_threads

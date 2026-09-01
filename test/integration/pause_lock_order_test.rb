@@ -177,18 +177,73 @@ class PauseLockOrderTest < DispatchPolicy::IntegrationTest
     assert_equal 2, DispatchPolicy::Partition.for_policy(POLICY).where(status: "active").count
   end
 
+  # The two writes cannot share a transaction — the flip slices on purpose
+  # — and without one they are no longer atomic against a CONCURRENT click.
+  # A resume that clears the flag while a pause is still walking its slices
+  # leaves `paused = false` with every partition still marked paused:
+  # nothing admits, the dashboard says the policy is running, and nothing
+  # heals it (`upsert_partition!` never writes `status`, and the sweeper
+  # needs a `pending_count` of 0 that an unclaimable partition never
+  # reaches). Measured at 5 corrupt runs in 6 before the advisory lock.
+  def test_a_second_click_is_refused_while_one_is_still_running
+    held    = Queue.new
+    release = Queue.new
+
+    holder = Thread.new do
+      ActiveRecord::Base.connection_pool.with_connection do
+        DispatchPolicy::Repository.with_policy_pause_lock(policy_name: POLICY) do
+          held << true
+          release.pop
+        end
+      end
+    end
+    held.pop
+
+    # BOTH actions, because both write the same two rows and either one
+    # racing the other produces the wedge — a fix applied to one of them is
+    # no fix at all.
+    %i[pause resume].each do |action|
+      redirects = run_action(action)
+      assert_equal DispatchPolicy::PoliciesController::BUSY_NOTICE, redirects.last[:alert],
+                   "#{action}: the operator has to be told the click did nothing"
+    end
+
+    refute DispatchPolicy::PolicySetting.for_policy(POLICY).pick(:paused),
+           "a refused click must not write half of a pause"
+    assert_equal 0, DispatchPolicy::Partition.for_policy(POLICY).where(status: "paused").count
+  ensure
+    release << true
+    holder&.join(5)
+  end
+
+  # The other half, and the one that turns a lock into an outage if it is
+  # wrong: the lock is held on the CONNECTION, so a click that forgets to
+  # release it refuses every later click on that connection for the life of
+  # the process.
+  def test_the_lock_is_released_so_the_next_click_works
+    2.times do
+      assert_equal "Policy paused.", run_action(:pause).last[:notice]
+      assert_equal "Policy resumed.", run_action(:resume).last[:notice]
+    end
+    refute DispatchPolicy::PolicySetting.for_policy(POLICY).pick(:paused)
+  end
+
   private
 
   def ordering_step?(name)
     %w[set_policy_paused lock_partitions_for_status].include?(name)
   end
 
+  # Returns the redirects the action issued, so a test can read the flash
+  # it set — a refused click is only visible there.
   def run_action(action)
     controller = DispatchPolicy::PoliciesController.new
     controller.instance_variable_set(:@policy_name, POLICY)
-    def controller.policy_path(*) = "/dispatch_policy/policies/x"
-    def controller.redirect_to(*, **) = nil
+    redirects = []
+    controller.define_singleton_method(:policy_path) { |*| "/dispatch_policy/policies/x" }
+    controller.define_singleton_method(:redirect_to) { |*, **kwargs| redirects << kwargs }
     controller.public_send(action)
+    redirects
   end
 
   def lock_row(conn, key)

@@ -104,6 +104,40 @@ class ScheduledClockTest < DispatchPolicy::IntegrationTest
                  "through the offset"
   end
 
+  # The scope the drain button counts what is left with has to agree with
+  # the claim. Read on the session's clock it does not, and
+  # `PartitionsController#drain` then flashes "N still pending — click
+  # drain again" about rows nothing can move, on every click.
+  def test_the_due_scope_agrees_with_the_claim_under_an_eastward_timezone
+    stage!(scheduled_at: Time.now.utc + 3600)
+    session_timezone(EAST)
+
+    assert_equal 0, DispatchPolicy::StagedJob.for_partition(POLICY, KEY).due.count,
+                 "the drain must not report as pending what the claim will not take"
+    assert_empty claim_staged
+  end
+
+  def test_the_due_scope_still_counts_due_work_under_a_westward_timezone
+    stage!(scheduled_at: Time.now.utc - 300)
+    session_timezone(WEST)
+
+    assert_equal 1, DispatchPolicy::StagedJob.for_partition(POLICY, KEY).due.count
+    assert_equal 1, claim_staged.size
+  end
+
+  # `config.clock` is public API, and every other reader in the gem calls
+  # `.to_f` on what it returns — so a lambda handing back an epoch Float
+  # has always worked. Binding the clock into SQL must not narrow that as a
+  # side effect: Postgres rejects "1788304522.524707" as a timestamp, and
+  # the failure lands inside the admission path.
+  def test_a_clock_that_returns_an_epoch_float_still_admits
+    DispatchPolicy.config.clock = -> { Time.now.utc.to_f }
+    stage!(scheduled_at: nil)
+
+    assert_equal 1, DispatchPolicy::Repository.claim_partitions(policy_name: POLICY, limit: 10).size
+    assert_equal 1, claim_staged.size
+  end
+
   # `defer_partition_to_next_scheduled!` reads the same column from both
   # ends: MIN over rows still in the future, and a NOT EXISTS guard over
   # rows already due. On a skewed session both answers move together — the

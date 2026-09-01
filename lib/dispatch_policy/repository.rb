@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require "json"
+require "zlib"
 
 module DispatchPolicy
   # SQL access layer for staged_jobs / partitions / inflight_jobs.
@@ -43,6 +44,19 @@ module DispatchPolicy
     PARKED_SQL = "(p.scheduled_eligible_at IS NOT NULL AND p.scheduled_eligible_at > $1)"
 
     module_function
+
+    # The application clock, as a Time, for binding into SQL.
+    #
+    # `config.clock` is public API and every other reader in the gem calls
+    # `.to_f` on what it returns, so a lambda handing back an epoch Float
+    # has always worked. Binding that value as a timestamp parameter does
+    # not — Postgres rejects "1788304522.524707" as a timestamp — so the
+    # coercion lives here rather than narrowing a documented contract as a
+    # side effect of moving these comparisons onto the app clock.
+    def app_clock
+      value = DispatchPolicy.config.now
+      value.is_a?(Numeric) ? Time.at(value).utc : value
+    end
 
     # The class the gem opens its connection on — which must be the class
     # the ADAPTER writes through, because the whole at-least-once
@@ -284,7 +298,7 @@ module DispatchPolicy
     # `next_eligible_at` stays on `now()` for exactly the same reason: it
     # is written on that clock, so that is the clock it must be read on.
     def claim_partitions(policy_name:, limit:, shard: nil)
-      params      = [policy_name, DispatchPolicy.config.now]
+      params      = [policy_name, app_clock]
       shard_sql   = ""
       if shard
         params    << shard
@@ -366,7 +380,7 @@ module DispatchPolicy
       SQL
       rows = connection.exec_query(
         sql_select, "claim_staged_jobs",
-        [policy_name, partition_key, limit, DispatchPolicy.config.now]
+        [policy_name, partition_key, limit, app_clock]
       ).to_a
 
       # The gate_state patch may depend on how many rows we actually
@@ -718,7 +732,7 @@ module DispatchPolicy
             )
         SQL
         "defer_partition_to_next_scheduled",
-        [policy_name, partition_key, DispatchPolicy.config.now]
+        [policy_name, partition_key, app_clock]
       )
     end
 
@@ -833,6 +847,58 @@ module DispatchPolicy
         "set_policy_paused",
         [policy_name, paused ? true : false]
       )
+    end
+
+    # Advisory-lock namespace for the pause/resume button. The TWO-INT form
+    # of pg_advisory_lock has its own key space, separate from the 64-bit
+    # form good_job takes its locks in, so a hash collision with the host's
+    # queue adapter is not possible — only with another caller using this
+    # same classid.
+    PAUSE_LOCK_CLASS = 0x64_70_00_01 # "dp" + 1, inside int4
+
+    # Serialize the pause/resume button for one policy, holding NO row lock.
+    #
+    # The two writes it guards cannot share a transaction — `set_partitions_status!`
+    # slices precisely so a large policy does not hold every partition's row
+    # lock behind one click — and without a transaction they are no longer
+    # atomic against each OTHER. Two overlapping clicks interleave: a resume
+    # clears the flag while a pause is still walking its slices, the pause's
+    # remaining slices land afterwards, and the policy ends up with
+    # `paused = false` and every partition `status = 'paused'`. Nothing
+    # admits, and the dashboard says the policy is running. It does not
+    # self-heal: `upsert_partition!` never writes `status`, and
+    # `sweep_inactive_partitions!` needs `pending_count = 0`, which a
+    # partition that can never be claimed never reaches. Measured at 5
+    # corrupt runs in 6 with two clicks 2ms apart; 0 in 6 with the single
+    # transaction this replaced.
+    #
+    # An advisory lock is what fits: it serializes the two CLICKS without
+    # putting a row lock anywhere near the enqueue path. `try` rather than
+    # a wait, because this runs in a web request — a second operator gets
+    # "try again" instead of a hung page, and the button is idempotent.
+    #
+    # Returns false when another click holds the lock, without running the
+    # block.
+    def with_policy_pause_lock(policy_name:)
+      objid = policy_lock_id(policy_name)
+      return false unless connection.select_value(
+        "SELECT pg_try_advisory_lock(#{Integer(PAUSE_LOCK_CLASS)}, #{Integer(objid)})"
+      )
+
+      begin
+        yield
+      ensure
+        connection.select_value(
+          "SELECT pg_advisory_unlock(#{Integer(PAUSE_LOCK_CLASS)}, #{Integer(objid)})"
+        )
+      end
+      true
+    end
+
+    # CRC32 of the policy name folded into a signed int4, which is what
+    # pg_advisory_lock's two-int form takes.
+    def policy_lock_id(policy_name)
+      [Zlib.crc32(policy_name.to_s)].pack("L").unpack1("l")
     end
 
     # Partitions per status-flip transaction. Same two bounds as
@@ -1252,7 +1318,7 @@ module DispatchPolicy
     # that distinction is not cosmetic.
     def partition_round_trip_stats(policy_name: nil)
       filter_sql = "WHERE p.status = 'active' AND p.pending_count > 0"
-      params     = [DispatchPolicy.config.now]
+      params     = [app_clock]
       if policy_name
         params << policy_name
         filter_sql += " AND p.policy_name = $#{params.size}"
@@ -1337,7 +1403,7 @@ module DispatchPolicy
           GROUP BY p.policy_name
         SQL
         "partition_round_trip_stats_by_policy",
-        [DispatchPolicy.config.now]
+        [app_clock]
       )
       result.to_a.each_with_object({}) do |r, h|
         h[r["policy_name"]] = {
@@ -1565,18 +1631,43 @@ module DispatchPolicy
         age_sql = "COALESCE(p.last_admit_at, p.created_at) < now() - ($1 || ' seconds')::interval"
       end
 
+      # Picks its victims in the same BYTE order every other multi-row
+      # writer of this table uses, and SKIPs any row somebody else already
+      # holds. A bare `DELETE … WHERE` locks in whatever order the plan
+      # produces — here an index scan on idx_dp_partitions_scheduled_order,
+      # which tie-breaks equal keys by ctid, i.e. heap order — so it
+      # deadlocks against `stage_many!` and against the pause button:
+      # measured at 4-10 deadlocks per 20s run against one bulk-enqueuing
+      # process, and in one run the OPERATOR'S CLICK was the victim rather
+      # than the sweep. Postgres usually kills the sweep, and
+      # `TickLoop.sweep!`'s blanket rescue then silently skips the rest of
+      # that pass — partition GC, tick-sample GC and adaptive-stat GC all.
+      #
+      # SKIP LOCKED as well as the order: the sweep is periodic and
+      # best-effort, so a partition somebody is writing right now is better
+      # left to the next pass than waited on. With nothing to wait for
+      # there is nothing to deadlock over, and the ordering keeps the
+      # guarantee if the SKIP is ever dropped.
       connection.exec_query(
         <<~SQL.squish,
-          DELETE FROM #{PARTITIONS_TABLE} p
-          WHERE p.pending_count = 0
-            #{filter}
-            AND #{age_sql}
-            #{refilled_bucket_sql}
-            AND NOT EXISTS (
-              SELECT 1 FROM #{STAGED_TABLE} s
-              WHERE s.policy_name = p.policy_name
-                AND s.partition_key = p.partition_key
-            )
+          WITH victims AS (
+            SELECT p.policy_name, p.partition_key
+            FROM #{PARTITIONS_TABLE} p
+            WHERE p.pending_count = 0
+              #{filter}
+              AND #{age_sql}
+              #{refilled_bucket_sql}
+              AND NOT EXISTS (
+                SELECT 1 FROM #{STAGED_TABLE} s
+                WHERE s.policy_name = p.policy_name
+                  AND s.partition_key = p.partition_key
+              )
+            ORDER BY p.policy_name COLLATE "C", p.partition_key COLLATE "C"
+            FOR UPDATE OF p SKIP LOCKED
+          )
+          DELETE FROM #{PARTITIONS_TABLE} d
+          USING victims v
+          WHERE d.policy_name = v.policy_name AND d.partition_key = v.partition_key
         SQL
         "sweep_inactive_partitions",
         params
@@ -1706,7 +1797,7 @@ module DispatchPolicy
       connection with_connection
       normalize_partition normalize_staged parse_jsonb
       sample_filter next_eligible_clause trend_direction clamp_backoff
-      base_class
+      base_class policy_lock_id app_clock
     ].freeze
 
     (singleton_methods(false) - ROLE_ROUTING_EXCLUDED).each do |method_name|
