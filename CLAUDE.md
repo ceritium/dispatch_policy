@@ -548,7 +548,7 @@ bundle exec rake test                        # 332 runs / 832 assertions
 # Mutation battery — breaks each load-bearing line and checks a test
 # notices. Slow (one full suite per mutation). See test/mutations/README.md.
 bundle exec rake mutations:list              # the catalogue, no work done
-bundle exec rake mutations:all               # 51 mutations, 50 must be caught
+bundle exec rake mutations:all               # 50 mutations, 49 must be caught
 FILTER=19 bundle exec rake mutations:all     # one of them
 
 # When you add a column or table:

@@ -59,7 +59,7 @@ inherited the heartbeat registry and beat its parent's jobs, keeping rows
 fresh that nothing would ever release.
 
 Two gaps they found in the tests rather than the code are closed with
-mutations 45-51, and one they found in the reasoning is recorded above:
+mutations 45-51 (50 in the catalogue), and one they found in the reasoning is recorded above:
 `clock_timestamp()` vs `now()` was unpinned by any test even after the
 range fix, because the range closed the "measured after the block" half
 and not the "transaction timestamp" half.
