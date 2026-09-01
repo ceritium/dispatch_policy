@@ -6,6 +6,126 @@ are as of the commit named in the audit heading.
 
 ---
 
+# Follow-up pass 2026-09-02 — A1's lock order on the pause button, and A8/A10/A11/A12
+
+The fourth audit fixed A1 where it was measured — the deny flush — and
+CLAUDE.md recorded, as a known gap, that two other multi-row writers of
+`dispatch_policy_partitions` still had no lock order. One of them is the
+pause button. That one is fixed here, together with the four low findings
+whose common shape turned out to be the same as A10's and A11's: **a
+comparison whose two sides come from different clocks.**
+
+## P1 — Pausing a policy deadlocks against an ordinary bulk enqueue
+
+`PoliciesController#pause` / `#resume` wrote every partition row of the
+policy with `Partition.for_policy(name).update_all(...)`, inside a
+transaction, with no lock order: a seq scan locks in heap order, an index
+scan in the database's collation, and neither is the byte order
+`stage_many!` sorts by. Reproduced deterministically (two connections, the
+enqueue side holding the byte-lowest key and reaching for the highest only
+once the click is provably blocked on a row lock):
+
+```
+MODE=old  errors: [["click", "ActiveRecord::Deadlocked", …]]
+          policy flag paused: nil     partitions marked paused: 0/2
+MODE=new  errors: []
+          policy flag paused: true    partitions marked paused: 2/2
+```
+
+That is the whole severity: the deadlock rolls back the controller's
+transaction, so the policy is **not** paused, the tick keeps admitting,
+and the request answers 500 with nothing saying the pause failed —
+during the load that made someone click pause, which is the only time
+anyone does.
+
+Fixed with an ordered `SELECT … FOR UPDATE` before the write, exactly as
+A1 was, and sliced (`PARTITION_STATUS_BATCH`) so a policy with tens of
+thousands of partitions does not hold every row lock behind one click —
+which would replace A1's deadlock with A1's lock convoy. Slicing costs
+all-or-nothing, so the controller orders its two writes to fail closed
+instead: the policy-level flag (the source of truth the tick reads) is
+written first on pause and last on resume, and every partial state is
+"more paused", never "the UI says paused while admission runs".
+
+## A11 — Scheduled work read on the database session's clock
+
+Every datetime column here is `timestamp WITHOUT time zone`.
+`scheduled_at`, and the `scheduled_eligible_at` horizon derived from it,
+are written by the application and serialized by `quoted_date`; the four
+comparisons that decided whether that work was due used `now()`, a
+timestamptz, so Postgres reinterpreted the stored value in the session
+TimeZone:
+
+```
+SET timezone='America/New_York';
+SELECT timestamp '2026-09-01 22:25:58' <= now();   -- a job due in 1 minute
+ ?column?
+----------
+ f                                     -- and for the next four hours
+```
+
+Rails sets that session to UTC by default, which is why this hid: it
+needs a host that sets `variables: { timezone: … }` in `database.yml` —
+a supported knob, commonly used to make raw psql output readable. Then
+`set(wait:)` runs early on a zone east of UTC and not at all on one west
+of it, and nothing anywhere records the difference. Fixed by binding
+`config.now` on both sides. `next_eligible_at` deliberately stays on
+`now()`: Postgres writes it, so that is the clock it must be read on.
+
+## A10 — The adaptive gate's feedback signal spanned two clocks
+
+`queue_lag = Time.current - admitted_at` subtracted the worker's clock
+from a timestamp Postgres wrote on the tick's connection. It is the AIMD
+controller's only input, so a host a few hundred milliseconds fast against
+`target_lag_ms` reads every job as late, shrinks `current_max` on every
+observation and never grows it back — the cap collapses to `min` and stays
+there. The lag is now computed by the database in the same statement that
+already reads the admission row, with `clock_timestamp()` rather than
+`now()` so a host that wraps the perform in a transaction does not report
+"time since that transaction opened".
+
+## A12 — The heartbeat competed with the workers for their own pool
+
+One thread per running job, each checking out its own connection, against
+a pool the Rails default sizes to the worker's thread count — while every
+performing job holds one for the length of its perform. Demand was
+therefore `2N` against a pool of `N`: the beats queue behind
+`checkout_timeout`, raise, get swallowed as best-effort, and
+`heartbeat_at` stops advancing. That is exactly what the stale sweeper
+reaps, so a still-running job loses its inflight row and the concurrency
+gate re-admits against an occupied slot — the cap lapses under precisely
+the load that makes it matter.
+
+Now one process-wide thread beats every running job in one statement, so
+the heartbeat's connection demand is a constant 1 instead of `N`, which
+fits the single spare connection the adapters already ask for. It does
+not make starvation impossible; it stops it scaling with concurrency. The
+beat's `RETURNING` also tells the registry which rows still exist, so an
+id whose thread was killed before `track`'s ensure is dropped rather than
+carried for the life of the process.
+
+## A8 — A scheduled workload read as a stuck tick
+
+Partitions parked behind a future horizon counted as "never checked" —
+which fires the hint "the tick is not getting through them — increase
+partition_batch_size or shard", pointing the operator at the one knob
+that cannot help — and their frozen `last_checked_at` dragged the
+round-trip percentiles toward infinity. They are excluded from both and
+reported on their own as `schedule_parked`.
+
+## A9 — left open, deliberately
+
+The pending sparkline drops periods with no tick samples, so a tick loop
+that dies reads as a backlog that stopped growing. The query change is
+easy and would be wrong: zero-filling the gaps asserts a pending total of
+zero for a window nobody measured, which is a different lie in the same
+place. The honest fix is a gap-aware series plus an explicit "no ticks in
+this window" signal — a UI change with its own design, not a tweak to
+`tick_samples_buckets`, and out of scope for a pass about clocks and lock
+order.
+
+---
+
 # Audit 2026-08-30 — whole-gem hunt, fourth pass (`c4c6475`)
 
 Six hunters over the ground the first three passes did not cover, each
@@ -26,7 +146,8 @@ documented multi-database install), interaction (two ordinary
 participants deadlocking), and failure (one bad row wedging a partition
 forever).
 
-> **Status:** A1-A7 fixed. A8-A12 recorded, not fixed.
+> **Status:** A1-A7 fixed. A8, A10, A11 and A12 fixed in the follow-up
+> pass below; A9 still open, with its reasoning there.
 
 ## Five review rounds on the fix branch
 
@@ -137,21 +258,24 @@ never pushed into the sort and it spills at ANY limit — 13.7 MB even at
 `LIMIT 1`. Remove the locking clause and the same query becomes a 40 kB
 top-N heapsort, which is where the "could not reproduce" came from.
 
-## Low — recorded, not fixed
+## Low — recorded
 
-- **A8** Round-trip stats count schedule-parked partitions as "never
-  checked", so a normal `set(wait:)` workload shows a red dashboard.
-- **A9** The pending sparkline averages across policies and drops empty
-  periods, so a dead tick loop reads as a falling backlog.
-- **A10** The adaptive gate's `queue_lag` subtracts the worker's clock
-  from the database's, so host skew above `target_lag_ms` shrinks the cap
-  permanently.
-- **A11** Scheduled-work comparisons mix an app-written timestamp with
-  Postgres `now()`, so a non-UTC session TimeZone runs `set(wait:)` jobs
-  early (or never).
-- **A12** The heartbeat thread contends for the same pool the worker
-  holds for the whole perform; at the Rails-default pool size a beat that
-  lands early and then starves can get a still-running job swept as stale.
+All but A9 are fixed; see the follow-up pass at the top of this file.
+
+- **A8** *(fixed)* Round-trip stats count schedule-parked partitions as
+  "never checked", so a normal `set(wait:)` workload shows a red dashboard.
+- **A9** *(open)* The pending sparkline averages across policies and drops
+  empty periods, so a dead tick loop reads as a falling backlog.
+- **A10** *(fixed)* The adaptive gate's `queue_lag` subtracts the worker's
+  clock from the database's, so host skew above `target_lag_ms` shrinks the
+  cap permanently.
+- **A11** *(fixed)* Scheduled-work comparisons mix an app-written timestamp
+  with Postgres `now()`, so a non-UTC session TimeZone runs `set(wait:)`
+  jobs early (or never).
+- **A12** *(fixed)* The heartbeat thread contends for the same pool the
+  worker holds for the whole perform; at the Rails-default pool size a beat
+  that lands early and then starves can get a still-running job swept as
+  stale.
 
 ## Verified against the real adapter
 

@@ -16,11 +16,19 @@ class InflightTrackerHeartbeatTest < DispatchPolicy::IntegrationTest
                 .find_by(active_job_id: "ajid-heartbeat").heartbeat_at
 
     hb = DispatchPolicy::InflightTracker.start_heartbeat("ajid-heartbeat")
-    sleep 0.3
-    DispatchPolicy::InflightTracker.stop_heartbeat(hb)
+    # Polled rather than slept: the process-wide thread may be part-way
+    # through a slice of a previously configured interval, so the first
+    # beat under this test's cadence lands within a second, not instantly.
+    deadline = Time.now + 5
+    refreshed = nil
+    loop do
+      refreshed = DispatchPolicy::InflightJob
+                    .find_by(active_job_id: "ajid-heartbeat").heartbeat_at
+      break if refreshed > initial || Time.now > deadline
 
-    refreshed = DispatchPolicy::InflightJob
-                  .find_by(active_job_id: "ajid-heartbeat").heartbeat_at
+      sleep 0.05
+    end
+    DispatchPolicy::InflightTracker.stop_heartbeat(hb)
 
     assert refreshed > initial,
            "heartbeat_at should have advanced (#{initial.iso8601(3)} -> #{refreshed.iso8601(3)})"
@@ -28,20 +36,96 @@ class InflightTrackerHeartbeatTest < DispatchPolicy::IntegrationTest
     DispatchPolicy.reset_config!
   end
 
-  def test_heartbeat_stops_cleanly_after_perform
+  def test_stopping_the_last_job_retires_the_thread
     DispatchPolicy.config.inflight_heartbeat_interval = 0.05
 
-    DispatchPolicy::Repository.insert_inflight!([{
-      policy_name: "p", partition_key: "k", active_job_id: "ajid-stop"
-    }])
+    token = DispatchPolicy::InflightTracker.start_heartbeat("ajid-stop")
+    assert_equal "ajid-stop", token
+    assert_includes DispatchPolicy::InflightTracker.heartbeat_ids.keys, token
 
-    hb = DispatchPolicy::InflightTracker.start_heartbeat("ajid-stop")
-    DispatchPolicy::InflightTracker.stop_heartbeat(hb)
+    DispatchPolicy::InflightTracker.stop_heartbeat(token)
+    refute_includes DispatchPolicy::InflightTracker.heartbeat_ids.keys, token,
+                    "a stopped job must not keep getting beaten — its row is about to be deleted"
 
-    assert hb.stop_flag.true?, "stop_flag must be set after stop_heartbeat"
-    refute hb.thread.alive?,   "heartbeat thread must terminate after stop"
+    deadline = Time.now + 5
+    sleep 0.05 while heartbeat_threads.any? && Time.now < deadline
+    assert_empty heartbeat_threads, "the thread must retire once nothing is running"
   ensure
     DispatchPolicy.reset_config!
+  end
+
+  # A12: ONE thread for the whole process, not one per running job.
+  #
+  # Per job, each thread checked out its own connection from a pool the
+  # Rails default sizes to the worker's thread count — while every
+  # performing job holds one for the length of its perform. A saturated
+  # worker therefore had every beat queued behind `checkout_timeout`, and a
+  # beat that never lands is a `heartbeat_at` that stops advancing, which
+  # is what the stale sweeper reaps: it deletes the row of a job that is
+  # still running and the concurrency gate re-admits against an occupied
+  # slot.
+  def test_every_running_job_shares_one_thread_and_one_statement
+    DispatchPolicy.config.inflight_heartbeat_interval = 0.05
+    ids = %w[a b c]
+    ids.each do |id|
+      DispatchPolicy::Repository.insert_inflight!([{
+        policy_name: "p", partition_key: "k", active_job_id: id
+      }])
+    end
+    before = heartbeats_for(ids)
+
+    beats = []
+    sub = ActiveSupport::Notifications.subscribe("sql.active_record") do |*, payload|
+      beats << payload[:sql] if payload[:name] == "heartbeat_inflight"
+    end
+
+    tokens = ids.map { |id| DispatchPolicy::InflightTracker.start_heartbeat(id) }
+    assert_equal 1, heartbeat_threads.size,
+                 "three running jobs must not mean three threads and three connections"
+
+    deadline = Time.now + 5
+    sleep 0.05 while beats.empty? && Time.now < deadline
+    tokens.each { |t| DispatchPolicy::InflightTracker.stop_heartbeat(t) }
+
+    assert_equal 1, beats.size, "all three rows in one statement, not one statement each"
+    ids.each do |id|
+      assert_operator heartbeats_for(ids)[id], :>, before[id], "#{id} was not beaten"
+    end
+  ensure
+    ActiveSupport::Notifications.unsubscribe(sub) if sub
+    DispatchPolicy.reset_config!
+  end
+
+  # A thread killed before `track`'s ensure never unregisters its job, and
+  # the registry is process-wide: without a way to notice, the id would be
+  # carried in every beat for the life of the worker. The beat's own
+  # RETURNING answers which rows still exist.
+  def test_a_job_whose_row_is_gone_stops_being_beaten
+    DispatchPolicy.config.inflight_heartbeat_interval = 0.05
+    DispatchPolicy::Repository.insert_inflight!([{
+      policy_name: "p", partition_key: "k", active_job_id: "ghost"
+    }])
+    DispatchPolicy::InflightTracker.start_heartbeat("ghost")
+    DispatchPolicy::Repository.delete_inflight!(active_job_id: "ghost")
+
+    deadline = Time.now + 5
+    while DispatchPolicy::InflightTracker.heartbeat_ids.key?("ghost") && Time.now < deadline
+      sleep 0.05
+    end
+
+    refute_includes DispatchPolicy::InflightTracker.heartbeat_ids.keys, "ghost"
+  ensure
+    DispatchPolicy::InflightTracker.stop_heartbeat("ghost")
+    DispatchPolicy.reset_config!
+  end
+
+  def heartbeat_threads
+    Thread.list.select { |t| t.alive? && t.name == DispatchPolicy::InflightTracker::HEARTBEAT_THREAD_NAME }
+  end
+
+  def heartbeats_for(ids)
+    DispatchPolicy::InflightJob.where(active_job_id: ids)
+                               .pluck(:active_job_id, :heartbeat_at).to_h
   end
 
   def test_heartbeat_disabled_when_interval_zero

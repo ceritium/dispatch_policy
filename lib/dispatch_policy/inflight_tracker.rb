@@ -121,9 +121,8 @@ module DispatchPolicy
       partition_key = policy.partition_key_for(ctx)
 
       adaptive_gates = policy.gates.select { |g| g.name == :adaptive_concurrency }
-      admitted_at     = nil
+      queue_lag_ms    = nil
       observation_key = nil
-      perform_start   = nil
       heartbeat      = nil
       started        = false
       succeeded      = false
@@ -139,12 +138,15 @@ module DispatchPolicy
         }])
 
         if adaptive_gates.any?
-          admitted_at, admitted_key = lookup_admission(job.job_id)
+          # This IS the measurement of the queue wait, and it happens here —
+          # before `yield` — so perform duration cannot leak into the
+          # signal. The lag is computed by the database rather than
+          # subtracted from `Time.current`; see `lookup_admission`.
+          queue_lag_ms, admitted_key = lookup_admission(job.job_id)
           # Fall back to the recomputed key only when the row is gone.
           observation_key = admitted_key || partition_key
         end
-        perform_start = Time.current
-        heartbeat     = start_heartbeat(job.job_id)
+        heartbeat = start_heartbeat(job.job_id)
 
         started = true
         yield
@@ -159,8 +161,7 @@ module DispatchPolicy
             policy:        policy,
             gates:         adaptive_gates,
             partition_key: observation_key || partition_key,
-            admitted_at:   admitted_at,
-            perform_start: perform_start,
+            queue_lag_ms:  queue_lag_ms,
             succeeded:     succeeded
           )
         end
@@ -231,13 +232,32 @@ module DispatchPolicy
       )
     end
 
-    # Reads the admitted_at column from the inflight row that the Tick
-    # pre-inserted. Used as the start-of-queue-wait reference for the
-    # adaptive_concurrency feedback signal (queue_lag = perform_start
-    # - admitted_at). nil if the row vanished or the lookup fails —
-    # the observation is then skipped.
-    # Returns [admitted_at, partition_key] from the row the Tick
-    # pre-inserted — the admission's own record of both facts.
+    # Returns [queue_lag_ms, partition_key] from the inflight row the Tick
+    # pre-inserted — the admission's own record of both facts. `[nil, nil]`
+    # when the row is gone or the lookup fails, and the caller then records
+    # the observation with a lag of 0 rather than dropping it.
+    #
+    # A10: the LAG IS COMPUTED BY THE DATABASE, not by subtracting
+    # `admitted_at` from the worker's `Time.current`. Those are two
+    # different clocks — `admitted_at` is written by Postgres `now()` on
+    # the tick process's connection — and the adaptive gate is an AIMD
+    # controller whose whole input is this number: a host running a few
+    # hundred milliseconds fast against `target_lag_ms` reads every job as
+    # late, shrinks `current_max` on every observation and never grows it
+    # back, so the cap collapses to `min` and stays there with nothing
+    # anywhere reporting a clock problem. A skew ALSO comes from the two
+    # ends disagreeing about the session TimeZone, since these columns are
+    # `timestamp WITHOUT time zone` — hence `clock_timestamp()::timestamp`,
+    # which lands in the same frame `now()` stored.
+    #
+    # `clock_timestamp()`, not `now()`: `now()` is the TRANSACTION
+    # timestamp, so inside a host that wraps the perform in a transaction
+    # (Rails transactional tests, among others) it stops advancing and the
+    # lag becomes "time since that transaction opened".
+    #
+    # GREATEST(..., 0) because the gate treats the lag as a duration: a
+    # tick and a worker whose sessions disagree about the TimeZone could
+    # otherwise hand it a negative one.
     #
     # The key matters as much as the timestamp. The gate READS the
     # partition row's key, so an observation written under a key
@@ -252,8 +272,9 @@ module DispatchPolicy
       # queue DB, not the default writing role of the worker process.
       result = Repository.with_connection do
         Repository.connection.exec_query(
-          "SELECT admitted_at, partition_key FROM dispatch_policy_inflight_jobs " \
-          "WHERE active_job_id = $1 LIMIT 1",
+          "SELECT partition_key, GREATEST(EXTRACT(EPOCH FROM " \
+          "(clock_timestamp()::timestamp - admitted_at)) * 1000, 0)::bigint AS queue_lag_ms " \
+          "FROM dispatch_policy_inflight_jobs WHERE active_job_id = $1 LIMIT 1",
           "lookup_admission",
           [active_job_id]
         )
@@ -261,23 +282,19 @@ module DispatchPolicy
       row = result.first
       return [nil, nil] unless row
 
-      ts = row["admitted_at"]
-      [ts.is_a?(Time) ? ts : Time.parse(ts.to_s), row["partition_key"]]
+      [row["queue_lag_ms"].to_i, row["partition_key"]]
     rescue StandardError
       [nil, nil]
     end
 
-    def self.record_adaptive_observations(policy:, gates:, partition_key:, admitted_at:, perform_start:, succeeded:)
+    def self.record_adaptive_observations(policy:, gates:, partition_key:, queue_lag_ms:, succeeded:)
       return if gates.empty?
 
-      queue_lag_ms = if admitted_at
-        ((perform_start - admitted_at) * 1000).to_i
-      else
-        # No admitted_at means we can't measure queue wait. Treat as 0
-        # so the observation still increments sample_count and the
-        # cap can grow if everything else is healthy.
-        0
-      end
+      # A nil lag means the inflight row was gone or the lookup failed, so
+      # the queue wait is unknown. Record 0 rather than dropping the
+      # observation: sample_count still advances and the cap can grow if
+      # everything else is healthy.
+      queue_lag_ms ||= 0
 
       gates.each do |gate|
         gate.record_observation(
@@ -294,40 +311,161 @@ module DispatchPolicy
     end
 
     # ----- heartbeat thread -----
+    #
+    # ONE thread per process, beating every job this process is running.
+    #
+    # A12: it used to be one thread per running job, each checking out its
+    # own connection. The Rails default sizes the pool to the worker's
+    # thread count (both come from RAILS_MAX_THREADS), and a performing job
+    # holds its connection for the whole perform — the executor only
+    # returns it when the job finishes. A saturated worker therefore has
+    # every connection held and every beat queued behind `checkout_timeout`,
+    # which raises, is swallowed as best-effort, and leaves `heartbeat_at`
+    # standing still. That is precisely what the stale sweeper reaps: it
+    # deletes the inflight row of a job that is still running, and the
+    # concurrency gate re-admits against a slot that is still occupied —
+    # the cap it exists to enforce silently lapses under exactly the load
+    # that makes it matter. One thread needs one connection for one
+    # statement per interval, whatever the worker is doing.
+    #
+    # The registry is a plain Hash under a Mutex. Thread lifecycle is
+    # decided under that same Mutex, which is what keeps a job registering
+    # from racing the thread's decision to exit when the set empties.
 
-    HEARTBEAT_KEY = :__dispatch_policy_heartbeat_token__
+    HEARTBEAT_THREAD_NAME = "dispatch_policy.heartbeat"
 
-    Heartbeat = Struct.new(:thread, :stop_flag)
+    @heartbeat_mutex  = Mutex.new
+    @heartbeat_ids    = {}
+    @heartbeat_thread = nil
+    @heartbeat_pid    = nil
 
+    class << self
+      attr_reader :heartbeat_mutex, :heartbeat_ids
+    end
+
+    # Registers a job for beating and returns the token `stop_heartbeat`
+    # takes. nil when the heartbeat is disabled.
     def self.start_heartbeat(active_job_id)
       interval = DispatchPolicy.config.inflight_heartbeat_interval.to_f
       return nil if interval <= 0
 
-      stop_flag = Concurrent::AtomicBoolean.new(false) if defined?(Concurrent::AtomicBoolean)
-      stop_flag ||= ThreadSafeFlag.new
-
-      thread = Thread.new do
-        Thread.current.name = "dispatch_policy.heartbeat:#{active_job_id}"
-
-        until stop_flag.true?
-          # Sleep in small slices so stop is responsive without polling tight.
-          slept = 0.0
-          slice = [interval, 1.0].min
-          while slept < interval && !stop_flag.true?
-            sleep(slice)
-            slept += slice
-          end
-          break if stop_flag.true?
-
-          beat!(active_job_id)
-        end
+      heartbeat_mutex.synchronize do
+        heartbeat_ids[active_job_id] = true
+        ensure_heartbeat_thread
       end
-
-      Heartbeat.new(thread, stop_flag)
+      active_job_id
     end
 
-    # One beat, connection returned. Split out of the loop so a test can
-    # drive it directly, and because the release below is the whole point.
+    def self.stop_heartbeat(token)
+      return if token.nil?
+
+      heartbeat_mutex.synchronize { heartbeat_ids.delete(token) }
+    end
+
+    # Caller holds heartbeat_mutex.
+    #
+    # Restarts after a fork as well as after a crash: a forked child
+    # inherits no threads, so a worker that forks (or a Puma process that
+    # preloads the app) would otherwise register jobs against a thread
+    # that does not exist in this process.
+    def self.ensure_heartbeat_thread
+      return if @heartbeat_thread && @heartbeat_pid == Process.pid && @heartbeat_thread.alive?
+
+      @heartbeat_pid = Process.pid
+      thread = Thread.new { heartbeat_loop }
+      # Named from HERE, not from inside the thread: a name set in the
+      # thread body is not there yet when this method returns, and the
+      # name is how an operator finds it in a thread dump.
+      thread.name       = HEARTBEAT_THREAD_NAME
+      @heartbeat_thread = thread
+    end
+
+    # The interval is re-read every iteration rather than captured at
+    # startup. This thread outlives any one job, so a captured value would
+    # pin the cadence to whatever the config happened to say when the
+    # process ran its first tracked job — and setting the interval to 0
+    # (the documented way to turn the heartbeat off) would leave the thread
+    # beating forever.
+    def self.heartbeat_loop
+      loop do
+        interval = DispatchPolicy.config.inflight_heartbeat_interval.to_f
+        # 0 is the documented way to turn the heartbeat off; a thread that
+        # captured the interval at startup would keep beating forever.
+        break if retire? { interval <= 0 }
+
+        sleep_interval(interval)
+
+        ids = heartbeat_mutex.synchronize { heartbeat_ids.keys }
+        if ids.empty?
+          break if retire? { heartbeat_ids.empty? }
+
+          next
+        end
+
+        # `beat!` answers with the ids that still had a row (nil if it could
+        # not talk to the database at all, in which case nothing is
+        # concluded). Anything missing has been deleted — the job finished
+        # and something killed the thread before `track`'s ensure could
+        # unregister it, or the sweeper reclaimed the row — so drop it
+        # rather than carry it in every beat for the life of the process.
+        alive = beat!(ids)
+        next if alive.nil?
+
+        gone = ids - alive
+        heartbeat_mutex.synchronize { gone.each { |id| heartbeat_ids.delete(id) } } if gone.any?
+      end
+    rescue StandardError => e
+      # The thread must not die quietly: every running job in this process
+      # would stop being heartbeated and get swept as stale. Drop the
+      # handle so the next `start_heartbeat` installs a new one.
+      retire? { true }
+      DispatchPolicy.config.logger&.warn(
+        "[dispatch_policy] heartbeat loop stopped: #{e.class}: #{e.message}"
+      )
+    end
+
+    # Evaluates the exit condition and clears the handle in ONE critical
+    # section. Checking from the other side cannot work: the thread is
+    # still `alive?` while it is on its way out, so a job registering at
+    # that moment would find a thread that is about to stop. Under this
+    # lock it either arrives first — the condition then sees its id and
+    # the thread carries on — or finds the handle already nil and starts a
+    # fresh thread.
+    def self.retire?
+      heartbeat_mutex.synchronize do
+        next false unless yield
+
+        # Only ever retire OURSELVES: after a fork the handle can already
+        # belong to the child's new thread.
+        @heartbeat_thread = nil if @heartbeat_thread == Thread.current
+        true
+      end
+    end
+
+    # Sleeps up to `interval`, in slices of at most a second, re-reading
+    # the configured interval as it goes.
+    #
+    # This thread outlives every job it beats, so the cadence cannot be
+    # fixed at the moment the process happened to run its first tracked
+    # job: lowering `inflight_heartbeat_interval` — or setting it to 0 to
+    # turn the heartbeat off — would otherwise have to wait out the old
+    # value, which at the default is half a minute of beating nobody asked
+    # for. The slice also keeps the thread's own retirement prompt.
+    def self.sleep_interval(interval)
+      slept = 0.0
+      while slept < interval
+        slice = [interval - slept, 1.0].min
+        sleep(slice)
+        slept += slice
+
+        current = DispatchPolicy.config.inflight_heartbeat_interval.to_f
+        break if current <= 0 || slept >= current
+      end
+    end
+
+    # One beat for every id given, connection returned. Split out of the
+    # loop so a test can drive it directly, and because the release below
+    # is the whole point.
     #
     # `Repository.with_connection` establishes config.database_role inside
     # this thread BEFORE the checkout: under multi-DB the pool must
@@ -340,19 +478,22 @@ module DispatchPolicy
     # the pool treats its lease as PERMANENT: `with_connection` marks it
     # sticky and its ensure then skips `release_connection` precisely
     # because it assumes something outside owns it. Nothing does. The
-    # first beat therefore pins a connection to the heartbeat thread for
-    # the rest of the job, and when the thread dies the connection is not
-    # returned either — it sits checked out with a dead owner until the
-    # pool reaper gets to it. With a pool sized to the worker's thread
-    # count (the Rails default: both come from RAILS_MAX_THREADS), every
-    # tracked job that outlives one interval doubles its connection
-    # demand, and the workers start raising ConnectionTimeoutError.
-    def self.beat!(active_job_id)
+    # beat would therefore pin a connection to the heartbeat thread for
+    # the life of the process, and when the thread dies the connection is
+    # not returned either — it sits checked out with a dead owner until
+    # the pool reaper gets to it. Now that there is one thread rather than
+    # one per job that is a single connection instead of the whole pool
+    # over again, which makes it cheaper to get wrong and no less wrong.
+    def self.beat!(active_job_ids)
+      ids = Array(active_job_ids)
+      return [] if ids.empty?
+
       Repository.with_connection do
-        Repository.heartbeat_inflight!(active_job_id: active_job_id)
+        Repository.heartbeat_inflight!(active_job_ids: ids)
       end
     rescue StandardError => e
-      DispatchPolicy.config.logger&.warn("[dispatch_policy] heartbeat #{active_job_id} failed: #{e.class}: #{e.message}")
+      DispatchPolicy.config.logger&.warn("[dispatch_policy] heartbeat #{ids.size} row(s) failed: #{e.class}: #{e.message}")
+      nil
     ensure
       begin
         # Through with_connection, not bare: `connected_to` is block-scoped,
@@ -367,24 +508,5 @@ module DispatchPolicy
       end
     end
 
-    def self.stop_heartbeat(heartbeat)
-      return if heartbeat.nil?
-
-      heartbeat.stop_flag.make_true
-      # Wake the thread out of any in-progress sleep so we don't wait the full slice.
-      heartbeat.thread.wakeup if heartbeat.thread.alive?
-      heartbeat.thread.join(1.0)
-    rescue StandardError
-      # Worst case: the thread is killed by GC; the inflight row gets a stale
-      # heartbeat_at and the sweeper will reclaim it after inflight_stale_after.
-    end
-
-    # Tiny fallback if concurrent-ruby isn't available (it's a Rails dep
-    # via active_support so it normally is).
-    class ThreadSafeFlag
-      def initialize; @mutex = Mutex.new; @value = false; end
-      def true?; @mutex.synchronize { @value }; end
-      def make_true; @mutex.synchronize { @value = true }; end
-    end
   end
 end

@@ -139,8 +139,8 @@ module DispatchPolicy
     # record of what it decided — never recomputed from ctx.
     caught_by: 'live_policy_edit_test',
     file:  'lib/dispatch_policy/inflight_tracker.rb',
-    find:  '[ts.is_a?(Time) ? ts : Time.parse(ts.to_s), row["partition_key"]]',
-    replace: '[ts.is_a?(Time) ? ts : Time.parse(ts.to_s), nil]'
+    find:  '[row["queue_lag_ms"].to_i, row["partition_key"]]',
+    replace: '[row["queue_lag_ms"].to_i, nil]'
   },
   {
     id:    '09',
@@ -430,6 +430,153 @@ module DispatchPolicy
     file:  'lib/dispatch_policy/forwarder.rb',
     find:  'rescue UnresolvableJobClass, StandardError => e',
     replace: 'rescue UnresolvableJobClass, NameError, TypeError, KeyError, InvalidPolicy => e'
+  },
+  {
+    id:    '35',
+    label: 'pause flip: COLLATE dropped',
+    # Same rule as 01, on the button an operator presses during a load spike. A
+    # bare ORDER BY inherits the database collation, which is not the byte order
+    # `stage_many!` sorts by — so the deadlock the sort exists to prevent comes
+    # back on every install whose database is not C-collated.
+    caught_by: 'pause_lock_order_test',
+    file:  'lib/dispatch_policy/repository.rb',
+    find:  [
+      '              ORDER BY policy_name COLLATE "C", partition_key COLLATE "C"',
+      '              FOR UPDATE',
+      '            SQL',
+      '            "lock_partitions_for_status",'
+    ].join("\n"),
+    replace: [
+      '              ORDER BY policy_name, partition_key',
+      '              FOR UPDATE',
+      '            SQL',
+      '            "lock_partitions_for_status",'
+    ].join("\n")
+  },
+  {
+    id:    '36',
+    label: 'pause flip: ORDER BY deleted',
+    # Without an order the planner locks in heap order, which is what
+    # `update_all` did and what deadlocked 5 times in 12 clicks.
+    caught_by: 'pause_lock_order_test',
+    file:  'lib/dispatch_policy/repository.rb',
+    find:  [
+      '              ORDER BY policy_name COLLATE "C", partition_key COLLATE "C"',
+      '              FOR UPDATE',
+      '            SQL',
+      '            "lock_partitions_for_status",'
+    ].join("\n"),
+    replace: [
+      '              FOR UPDATE',
+      '            SQL',
+      '            "lock_partitions_for_status",'
+    ].join("\n")
+  },
+  {
+    id:    '37',
+    label: 'pause action: back to the unordered update_all',
+    # The fix has to be reachable from the button. Reverting the controller
+    # alone puts the deadlock back with the Repository method left intact and
+    # unused, which is exactly how a fix ships broken.
+    caught_by: 'pause_lock_order_test',
+    file:  'app/controllers/dispatch_policy/policies_controller.rb',
+    find:  [
+      '      Repository.set_policy_paused!(policy_name: @policy_name, paused: true)',
+      '      Repository.set_partitions_status!(policy_name: @policy_name, status: "paused")'
+    ].join("\n"),
+    replace: [
+      '      Partition.transaction do',
+      '        Repository.set_policy_paused!(policy_name: @policy_name, paused: true)',
+      '        Partition.for_policy(@policy_name).update_all(status: "paused", updated_at: Time.current)',
+      '      end'
+    ].join("\n")
+  },
+  {
+    id:    '38',
+    label: 'claim_partitions: scheduled horizon back on the session clock',
+    # The horizon is an application-written timestamp in a `timestamp WITHOUT time
+    # zone` column. Reading it against the database session's clock is off by the
+    # session TimeZone offset — scheduled work then runs early or never, silently.
+    caught_by: 'scheduled_clock_test',
+    file:  'lib/dispatch_policy/repository.rb',
+    find:  '      params      = [policy_name, DispatchPolicy.config.now]',
+    replace: '      params      = [policy_name, connection.select_value("SELECT now()::timestamp")]'
+  },
+  {
+    id:    '39',
+    label: 'claim_staged_jobs!: due-time check back on the session clock',
+    # Same rule one level down: this is the comparison that decides whether a
+    # `set(wait:)` job may leave the staging table at all.
+    caught_by: 'scheduled_clock_test',
+    file:  'lib/dispatch_policy/repository.rb',
+    find:  '        [policy_name, partition_key, limit, DispatchPolicy.config.now]',
+    replace: '        [policy_name, partition_key, limit, connection.select_value("SELECT now()::timestamp")]'
+  },
+  {
+    id:    '40',
+    label: 'defer_partition_to_next_scheduled!: park computed on the session clock',
+    # Both ends of the park read `scheduled_at`. On a skewed session they move
+    # together: the future row reads as due, the guard suppresses the park, and the
+    # partition busy-loops every tick — M10, back again.
+    caught_by: 'scheduled_clock_test',
+    file:  'lib/dispatch_policy/repository.rb',
+    find:  '        [policy_name, partition_key, DispatchPolicy.config.now]',
+    replace: '        [policy_name, partition_key, connection.select_value("SELECT now()::timestamp")]'
+  },
+  {
+    id:    '41',
+    label: 'round-trip stats: schedule-parked partitions counted as never checked',
+    # A partition waiting on its own horizon is not one the tick failed to reach.
+    # Counting it turns the "increase partition_batch_size or shard" hint on
+    # permanently for any ordinary set(wait:) workload.
+    caught_by: 'round_trip_stats_test',
+    file:  'lib/dispatch_policy/repository.rb',
+    find:  'COUNT(*) FILTER (WHERE p.last_checked_at IS NULL AND NOT #{PARKED_SQL})::int AS never_checked',
+    replace: 'COUNT(*) FILTER (WHERE p.last_checked_at IS NULL)::int AS never_checked'
+  },
+  {
+    id:    '42',
+    label: 'adaptive: queue lag measured on the worker clock again',
+    # The AIMD controller's only input. Subtracted across the worker's clock and
+    # the database's, a host running fast reads every job as late, shrinks
+    # current_max on every observation and never grows it back.
+    caught_by: 'adaptive_clock_test',
+    file:  'lib/dispatch_policy/inflight_tracker.rb',
+    find:  [
+      '          "SELECT partition_key, GREATEST(EXTRACT(EPOCH FROM " \\',
+      '          "(clock_timestamp()::timestamp - admitted_at)) * 1000, 0)::bigint AS queue_lag_ms " \\',
+      '          "FROM dispatch_policy_inflight_jobs WHERE active_job_id = $1 LIMIT 1",',
+      '          "lookup_admission",',
+      '          [active_job_id]'
+    ].join("\n"),
+    replace: [
+      '          "SELECT partition_key, GREATEST(EXTRACT(EPOCH FROM " \\',
+      '          "($2::timestamp - admitted_at)) * 1000, 0)::bigint AS queue_lag_ms " \\',
+      '          "FROM dispatch_policy_inflight_jobs WHERE active_job_id = $1 LIMIT 1",',
+      '          "lookup_admission",',
+      '          [active_job_id, Time.current]'
+    ].join("\n")
+  },
+  {
+    id:    '43',
+    label: 'heartbeat: one thread per running job again',
+    # Per job, each thread checks out its own connection against a pool the Rails
+    # default sizes to the worker's thread count — every beat then queues behind
+    # checkout_timeout and a still-running job gets swept as stale.
+    caught_by: 'inflight_tracker_heartbeat_test',
+    file:  'lib/dispatch_policy/inflight_tracker.rb',
+    find:  '      return if @heartbeat_thread && @heartbeat_pid == Process.pid && @heartbeat_thread.alive?' + "\n\n",
+    replace: ''
+  },
+  {
+    id:    '44',
+    label: 'heartbeat: one statement per running job again',
+    # One thread is not enough on its own: N statements per interval is N
+    # round-trips on the connection the whole fix exists to stop competing for.
+    caught_by: 'inflight_tracker_heartbeat_test',
+    file:  'lib/dispatch_policy/inflight_tracker.rb',
+    find:  '        alive = beat!(ids)',
+    replace: '        alive = ids.flat_map { |id| beat!([id]) || [] }'
   },
     ].freeze
   end

@@ -89,25 +89,42 @@ module DispatchPolicy
     end
 
     def pause
-      # Policy-level flag is the source of truth the tick honors (so a key
-      # that first appears AFTER the pause is held too). The per-partition
-      # status update is kept for the partitions index display. One TX so
-      # both writes commit or neither: a flag without the statuses (or vice
-      # versa) leaves the partition list contradicting what admission
-      # actually does until the next toggle. set_policy_paused! shares the
-      # connection (same role via around_action), so it joins this TX.
-      Partition.transaction do
-        Repository.set_policy_paused!(policy_name: @policy_name, paused: true)
-        Partition.for_policy(@policy_name).update_all(status: "paused", updated_at: Time.current)
-      end
+      # Two writes, deliberately NOT in one transaction, and deliberately
+      # in this order.
+      #
+      # The policy-level flag is the source of truth the tick honors — its
+      # claim skips a paused policy outright, including partitions that
+      # first appear AFTER the pause (audit M6). The per-partition status
+      # is the second, redundant mechanism the partitions list renders.
+      #
+      # They used to share a transaction so neither could land alone. What
+      # that actually bought was a single failure that loses BOTH: the
+      # status flip writes every partition row of the policy with no lock
+      # order of its own, so it deadlocks against an ordinary bulk enqueue
+      # (5 in 12 clicks, measured), Postgres kills this transaction, and
+      # the pause silently does not happen while the request 500s. During
+      # the load that made the operator click pause, which is the only time
+      # anyone clicks it.
+      #
+      # `Repository.set_partitions_status!` now takes its row locks in the
+      # canonical byte order, which is what removes the deadlock; it slices
+      # so a large policy does not hold every lock at once, and that gives
+      # up all-or-nothing. Writing the flag FIRST is what makes the give-up
+      # safe: every partial state is "paused, and some rows not yet marked"
+      # — admission is already stopped. The reverse order could leave
+      # admission running with a UI that says paused.
+      Repository.set_policy_paused!(policy_name: @policy_name, paused: true)
+      Repository.set_partitions_status!(policy_name: @policy_name, status: "paused")
       redirect_to policy_path(@policy_name), notice: "Policy paused."
     end
 
     def resume
-      Partition.transaction do
-        Repository.set_policy_paused!(policy_name: @policy_name, paused: false)
-        Partition.for_policy(@policy_name).update_all(status: "active", updated_at: Time.current)
-      end
+      # Mirror image, for the same reason: statuses first, flag last. A
+      # partial resume then leaves the policy paused (the flag still holds
+      # admission), never partitions marked active under a flag nobody
+      # cleared. Both directions fail closed.
+      Repository.set_partitions_status!(policy_name: @policy_name, status: "active")
+      Repository.set_policy_paused!(policy_name: @policy_name, paused: false)
       redirect_to policy_path(@policy_name), notice: "Policy resumed."
     end
 

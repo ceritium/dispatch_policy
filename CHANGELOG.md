@@ -55,6 +55,68 @@
   after which the tick re-parks it in the new column.
 ### Fixed
 
+- **Pausing a policy no longer deadlocks against ordinary enqueues.**
+  `PoliciesController#pause` / `#resume` wrote every partition row of the
+  policy with one `update_all` inside a transaction, which has no lock
+  order of its own — a seq scan locks in heap order, an index scan in the
+  database's collation, and neither is the byte order `stage_many!` sorts
+  by. Against one bulk-enqueuing process that deadlocked 5 times in 12
+  clicks, and it landed in the worst possible place: the click happens
+  during the load that made the operator want to pause, Postgres kills the
+  transaction, so the policy is NOT paused, the tick keeps admitting, and
+  the request answers 500 with nothing saying the pause failed. The flip
+  now takes its row locks in the canonical `COLLATE "C"` order, sliced so
+  a large policy never holds every lock at once, and the controller writes
+  the policy-level flag first on pause and last on resume so any partial
+  state fails closed.
+
+- **Scheduled work is compared on the clock it was written with.**
+  `scheduled_at` and the `scheduled_eligible_at` horizon are
+  application-written timestamps in `timestamp WITHOUT time zone`
+  columns; the comparisons that decided whether they were due used
+  Postgres `now()`, a timestamptz, so the stored value was reinterpreted
+  in the session TimeZone. Rails keeps that at UTC by default, which is
+  why it hid — but a host that sets `variables: { timezone: … }` in
+  `database.yml` got every `set(wait:)` job off by the offset: early on a
+  zone east of UTC, never on one west of it, with no trace in any metric.
+  Those comparisons now bind `config.now`, so both sides go through the
+  same serialization the write did. `next_eligible_at`, which Postgres
+  writes, stays on `now()` for the same reason.
+
+- **The adaptive gate's feedback signal is measured on one clock.**
+  `queue_lag` was `Time.current` (the worker's clock) minus `admitted_at`
+  (written by Postgres on the tick's connection). That difference is the
+  AIMD controller's entire input: a worker running fast against
+  `target_lag_ms` reads every job as late, shrinks `current_max` on every
+  observation and never grows it back, so the cap collapses to `min` and
+  stays there with nothing reporting a clock problem. The lag is now
+  computed by the database in the same statement that reads the admission
+  row.
+
+- **One heartbeat thread per process instead of one per running job.**
+  Each tracked job spawned a thread that checked out its own connection,
+  against a pool the Rails default sizes to the worker's thread count —
+  while every performing job holds one for the length of its perform. A
+  saturated worker therefore had its beats queued behind
+  `checkout_timeout`, and a beat that never lands is a `heartbeat_at`
+  that stops advancing, which is exactly what the stale sweeper reaps: it
+  deletes the inflight row of a job that is still running and the
+  concurrency gate re-admits against an occupied slot. The heartbeat is
+  now one process-wide thread (named `dispatch_policy.heartbeat`) beating
+  every running job in a single statement, so its connection demand is a
+  constant 1 rather than proportional to concurrency — it fits the spare
+  connection the adapters already ask for. The interval is re-read every
+  cycle, so changing `inflight_heartbeat_interval` (0 to disable) takes
+  effect without restarting the process.
+
+- **The dashboard stops calling a scheduled workload a stuck tick.**
+  Partitions parked behind a future `scheduled_eligible_at` counted as
+  "never checked" and dragged the round-trip percentiles, so an ordinary
+  `set(wait:)` workload showed a permanent "the tick is not getting
+  through them — increase partition_batch_size or shard" warning and an
+  ever-growing p95. They are excluded from those figures and reported on
+  their own as **Schedule-parked**.
+
 - **The documented separate-queue-database install can admit jobs.**
   `Repository.with_connection` opened its role on `ActiveRecord::Base`,
   which swaps the role for every class in that hierarchy — the host's own

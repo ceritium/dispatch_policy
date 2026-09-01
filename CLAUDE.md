@@ -19,7 +19,7 @@ See `README.md` for the API and examples.
 v0.1 (on master). The whole main flow is implemented and tested.
 What's pending lives in `IDEAS.md` with the rationale.
 
-305 runs / 749 assertions. `bundle exec rake test` from the root.
+323 runs / 804 assertions. `bundle exec rake test` from the root.
 A mutation battery guards the tests themselves: `bundle exec rake
 mutations:all` (see `test/mutations/README.md`, and "Fixing a defect"
 below).
@@ -32,7 +32,8 @@ dispatch_policy_partitions                    one row per (policy, partition_key
                                               — gate_state (token bucket), shard,
                                               last_checked_at, next_eligible_at, …
 dispatch_policy_inflight_jobs                 admitted jobs currently running
-                                              — heartbeat_at refreshed by a thread
+                                              — heartbeat_at refreshed by ONE
+                                              per-process thread for all of them
 dispatch_policy_tick_samples                  one row per Tick.run for metrics
 dispatch_policy_adaptive_concurrency_stats    AIMD-tuned current_max + EWMA lag
                                               per partition for adaptive gates
@@ -54,7 +55,8 @@ dispatch_policy_policy_settings               one row per policy — pause flag
    the connection, so its INSERT joins the same TX.
 4. The adapter's worker runs the job: `InflightTracker.track`
    (around_perform) idempotently INSERTs into `inflight_jobs`,
-   spawns a heartbeat thread, and on `ensure` cancels it and DELETEs.
+   registers the job with the process's single heartbeat thread, and on
+   `ensure` unregisters it and DELETEs.
 
 ## Invariants — don't break without thinking
 
@@ -141,6 +143,28 @@ dispatch_policy_policy_settings               one row per policy — pause flag
   as `GREATEST(now, stored)`: two admission transactions can execute in
   the opposite order to the one they started in, and a stamp that moves
   backwards makes that interval refill twice.
+- **A comparison whose two sides come from different clocks is a bug, and
+  these columns make it invisible.** Every datetime column the gem owns is
+  `timestamp WITHOUT time zone`, so comparing one against `now()` (a
+  timestamptz) reinterprets the stored value in the SESSION TimeZone. That
+  is correct only while the session agrees with whatever wrote the value.
+  Postgres-written columns (`next_eligible_at`, `last_checked_at`,
+  `failed_at`, `heartbeat_at`, `sampled_at`) are written by `now()` on the
+  same footing, so they are read with `now()`. Application-written ones —
+  `staged_jobs.scheduled_at` and the `scheduled_eligible_at` horizon
+  derived from it — are bound from Ruby and serialized by `quoted_date`,
+  so they are compared against a BOUND `DispatchPolicy.config.now`, never
+  `now()`. Mixing them needs no misconfiguration to be wrong, just a host
+  that sets `variables: { timezone: … }` in database.yml, and then
+  `set(wait:)` fires early on a zone east of UTC and never on one west of
+  it, with no trace in any metric (A11). The same rule applies outside
+  SQL: the adaptive gate's `queue_lag` is computed BY THE DATABASE
+  (`clock_timestamp()::timestamp - admitted_at`) rather than subtracted
+  from the worker's `Time.current`, because those are two machines' clocks
+  and the difference is the AIMD controller's entire input (A10). Use
+  `clock_timestamp()` and not `now()` there: `now()` is the transaction
+  timestamp, so inside a host that wraps the perform in a transaction it
+  stops advancing.
 - **The partition sweeper holds a throttled partition until its bucket
   has REFILLED, not until its window is out.** `sweep_inactive_partitions!`
   refills the stored value to now with the same expression the admission
@@ -230,7 +254,7 @@ dispatch_policy_policy_settings               one row per policy — pause flag
   (`normalize_*`, `parse_jsonb`, `sample_filter`,
   `next_eligible_clause`, `trend_direction`) and the `connection`
   accessor are in `ROLE_ROUTING_EXCLUDED`. `InflightTracker`'s direct
-  AR access (`lookup_admitted_at`, the heartbeat thread) wraps
+  AR access (`lookup_admission`, the heartbeat thread) wraps
   explicitly. Staging tables and the adapter's table must live in the
   same DB for atomicity to hold.
 - **`ManualAdmission.force!` (UI admit/drain) pre-inserts inflight rows**
@@ -327,13 +351,15 @@ dispatch_policy_policy_settings               one row per policy — pause flag
   safety valve `max(remaining, initial_max)` when `in_flight=0`.
   Integration test:
   `test/integration/adaptive_with_fairness_test.rb`.
-- **Adaptive's feedback signal is `queue_lag = perform_start -
-  admitted_at`.** Measured in `InflightTracker.track` BEFORE
-  `block.call` so perform duration doesn't pollute the signal.
-  `admitted_at` is read from the inflight_jobs row pre-INSERTed by
-  the Tick — that timestamp is the canonical "moment of admission".
-  If the lookup fails (row missing, parse error) the observation is
-  recorded with `queue_lag_ms = 0` — the cap can still grow.
+- **Adaptive's feedback signal is the queue wait between admission and
+  perform, measured end to end by the database.**
+  `InflightTracker.lookup_admission` reads the inflight row the Tick
+  pre-INSERTed and returns `[queue_lag_ms, partition_key]`, the lag
+  computed in SQL from that row's `admitted_at`. It runs BEFORE
+  `block.call`, so perform duration doesn't pollute the signal. Do NOT go
+  back to `Time.current - admitted_at`: see the clock invariant above. If
+  the lookup fails (row missing, error) the observation is recorded with
+  `queue_lag_ms = 0` — the cap can still grow.
 - **In-tick fairness = ordering + cap, NOT mixed with selection.**
   `claim_partitions` still orders by `last_checked_at NULLS FIRST,
   id` (anti-stagnation: each partition with pending is processed
@@ -413,16 +439,24 @@ dispatch_policy_policy_settings               one row per policy — pause flag
   fixes nothing. Without it the two deadlock under an ordinary tick loop
   plus one `perform_all_later` process, and losing the flush loses every
   denied partition's backoff for that tick. If you add another statement
-  that writes several partition rows, give it the same order. Two do not
-  have it today: `sweep_inactive_partitions!`'s DELETE, safe only because
-  it runs every `sweep_every_ticks`, and `PoliciesController#pause` /
-  `#resume`, whose `update_all` covers every partition of the policy in
-  index order. The second fires on an operator click, at the worst
-  possible moment — during the load that made someone want to pause —
-  and a deadlock there rolls the whole transaction back, so the policy is
-  NOT paused, the tick keeps admitting, and the controller answers 500
-  with nothing saying the pause failed. Measured at 5 deadlocks in 12
-  clicks against one bulk-enqueuing process.
+  that writes several partition rows, give it the same order. `Repository.set_partitions_status!` — the
+  pause/resume button — has it now: it used to be a bare `update_all` over
+  every partition of the policy and deadlocked 5 times in 12 clicks
+  against one bulk-enqueuing process, at the worst possible moment (during
+  the load that made someone want to pause), rolling the controller's
+  transaction back so the policy was NOT paused while the tick kept
+  admitting and the request answered 500. One writer still has no order:
+  `sweep_inactive_partitions!`'s DELETE, safe only because it runs every
+  `sweep_every_ticks`.
+- **A multi-row partition writer that SLICES gives up all-or-nothing, so
+  the caller has to make every partial state safe.** `set_partitions_status!`
+  cannot hold every lock of a large policy behind one click — that is A1's
+  lock convoy — so it commits per slice. `PoliciesController` therefore
+  writes the policy-level pause flag FIRST on pause and LAST on resume:
+  the flag is what `claim_partitions` actually reads, so every partial
+  state is "more paused", never "the partition list says paused while
+  admission runs". Reversing either order is silent until an operator
+  needs it.
 - **`claim_staged_jobs!` requires `limit > 0`** (it's now the
   admit-only path). The pure-deny path goes through
   `Repository.bulk_record_partition_denies!`: the Tick accumulates
@@ -466,12 +500,12 @@ http://localhost:3000/                       # forms to enqueue
 http://localhost:3000/dispatch_policy        # dashboard
 
 # Tests
-bundle exec rake test                        # 305 runs / 749 assertions
+bundle exec rake test                        # 323 runs / 804 assertions
 
 # Mutation battery — breaks each load-bearing line and checks a test
 # notices. Slow (one full suite per mutation). See test/mutations/README.md.
 bundle exec rake mutations:list              # the catalogue, no work done
-bundle exec rake mutations:all               # 33 mutations, 32 must be caught
+bundle exec rake mutations:all               # 43 mutations, 42 must be caught
 FILTER=19 bundle exec rake mutations:all     # one of them
 
 # When you add a column or table:
