@@ -77,10 +77,15 @@ class AdaptiveClockTest < DispatchPolicy::IntegrationTest
     gate = AdaptiveJob::POLICY.gates.find { |g| g.name == :adaptive_concurrency }
 
     gate.stub(:record_observation, ->(**kwargs) { observed << kwargs }) do
-      DispatchPolicy::InflightTracker.track(job) { sleep 0.5 }
+      DispatchPolicy::InflightTracker.track(job) { sleep 1.5 }
     end
 
-    assert_operator observed.first[:queue_lag_ms], :<, 5_400,
+    # A RANGE, not an upper bound. The queue wait is unknown-safe: a failed
+    # lookup is recorded as a lag of 0, and 0 satisfies any `<` assertion —
+    # so `assert_operator :<` passes both when the fix works and when the
+    # measurement silently stops happening. Admitted 5s ago means ~5000ms;
+    # a lag read AFTER the block would be ~6500.
+    assert_in_delta 5_000, observed.first[:queue_lag_ms], 1_200,
                     "perform duration must not leak into the queue-wait signal"
   end
 
