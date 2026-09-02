@@ -52,8 +52,10 @@ something. What they found was again **in the fixes, not in the audit**:
 
 Three further defects the reviewers reproduced and this branch also fixes:
 the partition sweeper's DELETE was the last unordered multi-row writer of
-`partitions` (4-10 deadlocks per 20s run, and in one of them the
-operator's click was the victim); `StagedJob.due` — the scope the drain
+`partitions` — ordered here so the rule is exceptionless, though the
+4-10 deadlocks per 20s first reported for it turned out to be a shared
+database three processes were truncating, and on an isolated one it
+deadlocks neither before nor after; `StagedJob.due` — the scope the drain
 button counts with — was still on the session clock; and a forked child
 inherited the heartbeat registry and beat its parent's jobs, keeping rows
 fresh that nothing would ever release.

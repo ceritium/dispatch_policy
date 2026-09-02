@@ -125,11 +125,13 @@ class DenyLockOrderTest < DispatchPolicy::IntegrationTest
   # The partition sweeper's DELETE writes many partition rows too. A bare
   # `DELETE … WHERE` locks in whatever order the plan produces — an index
   # scan on idx_dp_partitions_scheduled_order tie-breaks equal keys by
-  # ctid, i.e. heap order — so it deadlocks against `stage_many!` and
-  # against the pause button: 4-10 per 20s run against one bulk-enqueuing
-  # process, and in one run the operator's CLICK was the victim. Postgres
-  # usually kills the sweep instead, and `TickLoop.sweep!`'s blanket rescue
-  # then silently skips the rest of that pass.
+  # ctid, i.e. heap order — which is the A1 hazard, and this was the last
+  # multi-row writer of the table still carrying it. No deadlock was
+  # actually reproduced for this one (0 in a 20s stress run on an isolated
+  # database, before and after); it is pinned because the guarantee is
+  # meant to be structural, and because Postgres usually picks the sweep as
+  # the victim, whose blanket rescue then silently skips the rest of that
+  # pass — partition GC, tick-sample GC and adaptive-stat GC.
   def test_the_partition_sweep_takes_its_locks_in_the_same_order
     seen = capture_sql do
       DispatchPolicy::Repository.sweep_inactive_partitions!(cutoff_seconds: 0, policy_name: POLICY)

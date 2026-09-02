@@ -1635,13 +1635,23 @@ module DispatchPolicy
       # writer of this table uses, and SKIPs any row somebody else already
       # holds. A bare `DELETE … WHERE` locks in whatever order the plan
       # produces — here an index scan on idx_dp_partitions_scheduled_order,
-      # which tie-breaks equal keys by ctid, i.e. heap order — so it
-      # deadlocks against `stage_many!` and against the pause button:
-      # measured at 4-10 deadlocks per 20s run against one bulk-enqueuing
-      # process, and in one run the OPERATOR'S CLICK was the victim rather
-      # than the sweep. Postgres usually kills the sweep, and
-      # `TickLoop.sweep!`'s blanket rescue then silently skips the rest of
-      # that pass — partition GC, tick-sample GC and adaptive-stat GC all.
+      # which tie-breaks equal keys by ctid, i.e. heap order — which is the
+      # A1 hazard exactly, and this was the last multi-row writer of the
+      # table still carrying it.
+      #
+      # Honest about the evidence: unlike A1 and unlike the pause button,
+      # NO deadlock was reproduced for this one. A 20-second stress run
+      # against a concurrent byte-ordered writer produced 0 on an isolated
+      # database, both before and after (an earlier run that showed 4-10
+      # was measuring a database three other processes were truncating).
+      # It runs every `sweep_every_ticks` rather than per enqueue, so the
+      # window is narrow. The order is here because the guarantee is
+      # supposed to be structural — "every multi-row writer of `partitions`
+      # locks byte-ordered" is checkable, "this one is rare enough" is not
+      # — and because when Postgres does pick a victim it is usually the
+      # sweep, whose blanket rescue in `TickLoop.sweep!` then silently
+      # skips the rest of that pass: partition GC, tick-sample GC and
+      # adaptive-stat GC.
       #
       # SKIP LOCKED as well as the order: the sweep is periodic and
       # best-effort, so a partition somebody is writing right now is better

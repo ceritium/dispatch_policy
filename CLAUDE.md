@@ -19,7 +19,7 @@ See `README.md` for the API and examples.
 v0.1 (on master). The whole main flow is implemented and tested.
 What's pending lives in `IDEAS.md` with the rationale.
 
-332 runs / 832 assertions. `bundle exec rake test` from the root.
+334 runs / 835 assertions. `bundle exec rake test` from the root.
 A mutation battery guards the tests themselves: `bundle exec rake
 mutations:all` (see `test/mutations/README.md`, and "Fixing a defect"
 below).
@@ -473,12 +473,14 @@ dispatch_policy_policy_settings               one row per policy — pause flag
   the load that made someone want to pause), rolling the controller's
   transaction back so the policy was NOT paused while the tick kept
   admitting and the request answered 500. `sweep_inactive_partitions!` has it now
-  too — an ordered `FOR UPDATE OF p SKIP LOCKED` CTE ahead of the DELETE.
-  "It only runs every `sweep_every_ticks`" was not safety: measured at
-  4-10 deadlocks per 20s run against one bulk-enqueuing process, and
-  Postgres picked the operator's pause CLICK as the victim in one of them.
-  Every multi-row writer of this table now takes its locks byte-ordered;
-  keep it that way.
+  too — an ordered `FOR UPDATE OF p SKIP LOCKED` CTE ahead of the DELETE —
+  so the rule is now exceptionless and stays checkable. Note what the
+  evidence for that last one actually is: NO deadlock was reproduced for
+  it (0 in a 20s stress run on an isolated database, before and after; an
+  earlier 4-10 was measuring a database three other processes were
+  truncating). It is ordered because "every multi-row writer of
+  `partitions` locks byte-ordered" is a property you can check and "this
+  one is rare enough" is not.
 - **A multi-row partition writer that SLICES gives up all-or-nothing, so
   the caller has to serialize itself some other way.** `set_partitions_status!`
   cannot hold every lock of a large policy behind one click — that is A1's
@@ -543,12 +545,12 @@ http://localhost:3000/                       # forms to enqueue
 http://localhost:3000/dispatch_policy        # dashboard
 
 # Tests
-bundle exec rake test                        # 332 runs / 832 assertions
+bundle exec rake test                        # 334 runs / 835 assertions
 
 # Mutation battery — breaks each load-bearing line and checks a test
 # notices. Slow (one full suite per mutation). See test/mutations/README.md.
 bundle exec rake mutations:list              # the catalogue, no work done
-bundle exec rake mutations:all               # 50 mutations, 49 must be caught
+bundle exec rake mutations:all               # 53 mutations, 52 must be caught
 FILTER=19 bundle exec rake mutations:all     # one of them
 
 # When you add a column or table:

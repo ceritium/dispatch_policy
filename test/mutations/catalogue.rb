@@ -685,6 +685,64 @@ module DispatchPolicy
     find:  '      value.is_a?(Numeric) ? Time.at(value).utc : value',
     replace: '      value'
   },
+  {
+    id:    '52',
+    label: 'heartbeat: a failed beat read as "no rows survived"',
+    # nil from beat! means the database was unreachable, not that every job
+    # finished. Read as an empty survivor list, ONE transient failure
+    # unregisters every running job in the process permanently, and the stale
+    # sweeper then deletes their rows while they run on.
+    caught_by: 'inflight_tracker_heartbeat_test',
+    file:  'lib/dispatch_policy/inflight_tracker.rb',
+    find:  '          next if alive.nil?',
+    replace: '          alive ||= []'
+  },
+  {
+    id:    '53',
+    label: 'heartbeat: the loop exits on a failing cycle',
+    # With a thread per job an error cost one job's heartbeat; with one thread it
+    # costs every running job in the process. Only a NEW registration would
+    # restart it, and a worker saturated with long jobs does not produce one.
+    caught_by: 'inflight_tracker_heartbeat_test',
+    file:  'lib/dispatch_policy/inflight_tracker.rb',
+    find:  [
+      '        rescue StandardError => e',
+      '          DispatchPolicy.config.logger&.warn(',
+      '            "[dispatch_policy] heartbeat cycle failed, retrying in " \\',
+      '            "#{HEARTBEAT_ERROR_BACKOFF}s: #{e.class}: #{e.message}"',
+      '          )',
+      '          sleep HEARTBEAT_ERROR_BACKOFF'
+    ].join("\n"),
+    replace: [
+      '        rescue StandardError => e',
+      '          DispatchPolicy.config.logger&.warn(',
+      '            "[dispatch_policy] heartbeat loop stopped: #{e.class}: #{e.message}"',
+      '          )',
+      '          retire? { true }',
+      '          break'
+    ].join("\n")
+  },
+  {
+    id:    '54',
+    label: 'pause action: the advisory lock dropped from #pause',
+    # 45 covers the resume side. Both write the same two rows, and either one
+    # racing the other produces the wedge, so a fix applied to one of them is no
+    # fix at all.
+    caught_by: 'pause_lock_order_test',
+    file:  'app/controllers/dispatch_policy/policies_controller.rb',
+    find:  [
+      '      ran = Repository.with_policy_pause_lock(policy_name: @policy_name) do',
+      '        Repository.set_policy_paused!(policy_name: @policy_name, paused: true)',
+      '        Repository.set_partitions_status!(policy_name: @policy_name, status: "paused")',
+      '      end',
+      '      return redirect_to policy_path(@policy_name), alert: BUSY_NOTICE unless ran',
+      ''
+    ].join("\n"),
+    replace: [
+      '      Repository.set_policy_paused!(policy_name: @policy_name, paused: true)',
+      '      Repository.set_partitions_status!(policy_name: @policy_name, status: "paused")'
+    ].join("\n")
+  },
     ].freeze
   end
 end

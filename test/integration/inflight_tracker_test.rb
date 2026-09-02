@@ -157,6 +157,61 @@ class InflightTrackerHeartbeatTest < DispatchPolicy::IntegrationTest
     DispatchPolicy.reset_config!
   end
 
+  # `beat!` answers nil when it could not reach the database at all — the
+  # ConnectionTimeoutError of a pool with no spare, most likely. Nil is "we
+  # learned nothing", NOT "no rows survived": read as an empty survivor
+  # list it unregisters every running job in the process on ONE transient
+  # failure, permanently, and `inflight_stale_after` later has the sweeper
+  # delete their rows while they run on — which is the over-admission this
+  # whole thread exists to prevent.
+  def test_a_beat_that_could_not_reach_the_database_unregisters_nobody
+    DispatchPolicy.config.inflight_heartbeat_interval = 0.05
+    ids = %w[keep-1 keep-2]
+    ids.each { |id| DispatchPolicy::InflightTracker.start_heartbeat(id) }
+
+    attempts = Queue.new
+    DispatchPolicy::InflightTracker.stub(:beat!, ->(_) { attempts << true; nil }) do
+      2.times { attempts.pop }
+    end
+
+    assert_equal ids.sort, DispatchPolicy::InflightTracker.heartbeat_ids.keys.sort,
+                 "a failed beat says nothing about which jobs are still running"
+  ensure
+    ids&.each { |id| DispatchPolicy::InflightTracker.stop_heartbeat(id) }
+    quiesce_heartbeat_threads!
+    DispatchPolicy.reset_config!
+  end
+
+  # The other half of the same trade: one thread instead of one per job
+  # means one uncaught error costs every running job in the process, not
+  # one. The loop must survive a failing cycle rather than exit and wait
+  # for some future job to reinstall it — a worker saturated with long jobs
+  # never produces one.
+  def test_the_loop_survives_a_failing_cycle
+    DispatchPolicy.config.inflight_heartbeat_interval = 0.05
+    DispatchPolicy::Repository.insert_inflight!([{
+      policy_name: "p", partition_key: "k", active_job_id: "survivor"
+    }])
+    before = heartbeats_for(["survivor"])["survivor"]
+    DispatchPolicy::InflightTracker.start_heartbeat("survivor")
+
+    boom = Queue.new
+    DispatchPolicy::InflightTracker.stub(:beat!, ->(_) { boom << true; raise "cycle exploded" }) do
+      boom.pop
+    end
+
+    deadline = Time.now + 8
+    sleep 0.1 while heartbeats_for(["survivor"])["survivor"] <= before && Time.now < deadline
+
+    assert heartbeat_threads.any?, "the thread must still be alive after a failing cycle"
+    assert_operator heartbeats_for(["survivor"])["survivor"], :>, before,
+                    "and must go back to beating once the failure clears"
+  ensure
+    DispatchPolicy::InflightTracker.stop_heartbeat("survivor")
+    quiesce_heartbeat_threads!
+    DispatchPolicy.reset_config!
+  end
+
   def quiesce_heartbeat_threads!
     deadline = Time.now + 5
     sleep 0.05 while heartbeat_threads.any? && Time.now < deadline

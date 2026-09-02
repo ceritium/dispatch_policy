@@ -81,12 +81,12 @@
   everything else.** `sweep_inactive_partitions!` was the last multi-row
   writer of `dispatch_policy_partitions` with no lock order of its own —
   its `DELETE` planned as an index scan that tie-breaks by ctid, i.e. heap
-  order. Against one bulk-enqueuing process that deadlocked 4-10 times per
-  20-second run; Postgres usually killed the sweep, whose blanket rescue
-  then silently skipped the rest of that pass (partition GC, tick-sample
-  GC and adaptive-stat GC), and in one run it killed the operator's pause
-  click instead. Now an ordered `FOR UPDATE … SKIP LOCKED` picks the
-  victims: 0 deadlocks in four 20-second runs.
+  order, which is the deadlock shape fixed in A1. An ordered
+  `FOR UPDATE … SKIP LOCKED` CTE now picks the victims, so the rule holds
+  for every writer of that table without exception. Unlike A1, no deadlock
+  was reproduced for this one: it runs every `sweep_every_ticks` rather
+  than per enqueue, and a 20-second stress run against a concurrent
+  byte-ordered writer produced none either way.
 
 - **`StagedJob.due` reads the same clock as the claim.** It is the scope
   the drain button counts what is left with, and on a session whose

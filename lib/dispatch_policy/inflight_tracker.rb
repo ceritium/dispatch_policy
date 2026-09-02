@@ -255,9 +255,15 @@ module DispatchPolicy
     # (Rails transactional tests, among others) it stops advancing and the
     # lag becomes "time since that transaction opened".
     #
-    # GREATEST(..., 0) because the gate treats the lag as a duration: a
-    # tick and a worker whose sessions disagree about the TimeZone could
-    # otherwise hand it a negative one.
+    # The lag is clamped at 0 because the gate treats it as a duration —
+    # but the clamp happens in RUBY, after a warning, rather than in SQL.
+    # A tick and a worker whose sessions disagree about the TimeZone hand
+    # this a negative number, and clamping it silently turns "the two ends
+    # disagree" into "the job waited no time at all", which is exactly what
+    # a healthy fast job looks like: the cap then grows on a measurement
+    # that means nothing, with nothing anywhere to notice. The opposite
+    # direction of the same mismatch announces itself by collapsing the cap
+    # to `min`, so it never needed the warning.
     #
     # The key matters as much as the timestamp. The gate READS the
     # partition row's key, so an observation written under a key
@@ -272,8 +278,8 @@ module DispatchPolicy
       # queue DB, not the default writing role of the worker process.
       result = Repository.with_connection do
         Repository.connection.exec_query(
-          "SELECT partition_key, GREATEST(EXTRACT(EPOCH FROM " \
-          "(clock_timestamp()::timestamp - admitted_at)) * 1000, 0)::bigint AS queue_lag_ms " \
+          "SELECT partition_key, EXTRACT(EPOCH FROM " \
+          "(clock_timestamp()::timestamp - admitted_at)) * 1000 AS raw_lag_ms " \
           "FROM dispatch_policy_inflight_jobs WHERE active_job_id = $1 LIMIT 1",
           "lookup_admission",
           [active_job_id]
@@ -282,7 +288,20 @@ module DispatchPolicy
       row = result.first
       return [nil, nil] unless row
 
-      [row["queue_lag_ms"].to_i, row["partition_key"]]
+      lag = row["raw_lag_ms"].to_f
+      if lag.negative?
+        # The one direction of a session-TimeZone mismatch that leaves no
+        # trace otherwise: clamped to 0 it is indistinguishable from a job
+        # that waited no time at all, and the AIMD cap then grows on a
+        # measurement that means nothing. The other direction announces
+        # itself by collapsing the cap. Say so once per observation.
+        DispatchPolicy.config.logger&.warn(
+          "[dispatch_policy] negative queue lag (#{lag.round}ms) for #{active_job_id}: the " \
+          "session that wrote admitted_at and this one disagree about TimeZone, so the " \
+          "adaptive cap is being tuned on an unreliable signal"
+        )
+      end
+      [[lag, 0.0].max.to_i, row["partition_key"]]
     rescue StandardError
       [nil, nil]
     end
@@ -404,42 +423,68 @@ module DispatchPolicy
     # process ran its first tracked job — and setting the interval to 0
     # (the documented way to turn the heartbeat off) would leave the thread
     # beating forever.
+    # How long the loop waits after an error before trying again. It does
+    # NOT exit on one: with a thread per job an error cost one job's
+    # heartbeat, and with one thread it would cost every running job in the
+    # process — they stay registered, nothing beats them, and
+    # `inflight_stale_after` later has the sweeper delete the rows of jobs
+    # that are still running. Only a NEW registration would have restarted
+    # it, and a worker saturated with long jobs does not produce one.
+    # Reproduced with a non-numeric `inflight_heartbeat_interval`: three
+    # registered jobs, no live thread, nothing beating them.
+    HEARTBEAT_ERROR_BACKOFF = 1.0
+
     def self.heartbeat_loop
       loop do
-        interval = DispatchPolicy.config.inflight_heartbeat_interval.to_f
-        # 0 is the documented way to turn the heartbeat off; a thread that
-        # captured the interval at startup would keep beating forever.
-        break if retire? { interval <= 0 }
+        begin
+          interval = DispatchPolicy.config.inflight_heartbeat_interval.to_f
+          # 0 is the documented way to turn the heartbeat off; a thread that
+          # captured the interval at startup would keep beating forever.
+          break if retire? { interval <= 0 }
 
-        sleep_interval(interval)
+          sleep_interval(interval)
 
-        ids = heartbeat_mutex.synchronize { heartbeat_ids.keys }
-        if ids.empty?
-          break if retire? { heartbeat_ids.empty? }
+          ids = heartbeat_mutex.synchronize { heartbeat_ids.keys }
+          if ids.empty?
+            break if retire? { heartbeat_ids.empty? }
 
-          next
+            next
+          end
+
+          # `beat!` answers with the ids that still had a row — or nil if it
+          # could not talk to the database at all, and nil is "we learned
+          # nothing", NOT "no rows survived". Reading it as an empty list
+          # unregisters every running job in the process on one transient
+          # failure, for good, and five minutes later the sweeper deletes
+          # their rows while they run on. Anything genuinely missing from a
+          # SUCCESSFUL beat has been deleted — the job finished and
+          # something killed the thread before `track`'s ensure could
+          # unregister it, or the sweeper reclaimed the row — so drop it
+          # rather than carry it in every beat for the life of the process.
+          alive = beat!(ids)
+          next if alive.nil?
+
+          gone = ids - alive
+          heartbeat_mutex.synchronize { gone.each { |id| heartbeat_ids.delete(id) } } if gone.any?
+        rescue StandardError => e
+          DispatchPolicy.config.logger&.warn(
+            "[dispatch_policy] heartbeat cycle failed, retrying in " \
+            "#{HEARTBEAT_ERROR_BACKOFF}s: #{e.class}: #{e.message}"
+          )
+          sleep HEARTBEAT_ERROR_BACKOFF
         end
-
-        # `beat!` answers with the ids that still had a row (nil if it could
-        # not talk to the database at all, in which case nothing is
-        # concluded). Anything missing has been deleted — the job finished
-        # and something killed the thread before `track`'s ensure could
-        # unregister it, or the sweeper reclaimed the row — so drop it
-        # rather than carry it in every beat for the life of the process.
-        alive = beat!(ids)
-        next if alive.nil?
-
-        gone = ids - alive
-        heartbeat_mutex.synchronize { gone.each { |id| heartbeat_ids.delete(id) } } if gone.any?
       end
-    rescue StandardError => e
-      # The thread must not die quietly: every running job in this process
-      # would stop being heartbeated and get swept as stale. Drop the
-      # handle so the next `start_heartbeat` installs a new one.
+    rescue Exception => e # rubocop:disable Lint/RescueException
+      # Only reachable for what the per-cycle rescue above does not catch —
+      # a Thread#raise, an Exception subclass outside StandardError. Drop
+      # the handle (and only ours) so the next `start_heartbeat` installs a
+      # fresh thread, then let it propagate.
       retire? { true }
-      DispatchPolicy.config.logger&.warn(
-        "[dispatch_policy] heartbeat loop stopped: #{e.class}: #{e.message}"
+      DispatchPolicy.config.logger&.error(
+        "[dispatch_policy] heartbeat thread died: #{e.class}: #{e.message}. " \
+        "Running jobs will not be heartbeated until another job starts."
       )
+      raise
     end
 
     # Evaluates the exit condition and clears the handle in ONE critical
