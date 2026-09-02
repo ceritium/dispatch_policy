@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require_relative "../test_helper"
+require "timeout"
 require_relative "../../app/models/dispatch_policy/application_record"
 require_relative "../../app/models/dispatch_policy/partition"
 require_relative "../../app/models/dispatch_policy/policy_setting"
@@ -193,13 +194,29 @@ class PauseLockOrderTest < DispatchPolicy::IntegrationTest
 
     holder = Thread.new do
       ActiveRecord::Base.connection_pool.with_connection do
-        DispatchPolicy::Repository.with_policy_pause_lock(policy_name: POLICY) do
-          held << true
+        # `with_policy_pause_lock` does NOT yield when it cannot take the
+        # lock, so the block alone can never signal. Reporting the refusal
+        # is what keeps this test from hanging on `held.pop` forever when
+        # some other session on this database is already holding it — and
+        # a hung run leaves ITS backend holding the session lock, so every
+        # later run against that database hangs here too. That is a test
+        # that poisons the database it failed in.
+        got = DispatchPolicy::Repository.with_policy_pause_lock(policy_name: POLICY) do
+          held << :acquired
           release.pop
         end
+        held << :refused unless got
       end
+    rescue StandardError => e
+      held << e
     end
-    held.pop
+
+    outcome = await(held)
+    raise outcome if outcome.is_a?(StandardError)
+    assert_equal :acquired, outcome,
+                 "the pause lock for #{POLICY} was already held on this database — a leaked " \
+                 "session lock from an earlier hung run. Clear it with: SELECT " \
+                 "pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = current_database()"
 
     # BOTH actions, because both write the same two rows and either one
     # racing the other produces the wedge — a fix applied to one of them is
@@ -216,6 +233,7 @@ class PauseLockOrderTest < DispatchPolicy::IntegrationTest
   ensure
     release << true
     holder&.join(5)
+    holder&.kill
   end
 
   # The other half, and the one that turns a lock into an outage if it is
@@ -231,6 +249,15 @@ class PauseLockOrderTest < DispatchPolicy::IntegrationTest
   end
 
   private
+
+  # Queue#pop(timeout:) is Ruby 3.2 and the gemspec floor is 3.1. A bare
+  # pop here is a hang, not a failure, and a hang leaves a backend holding
+  # a session-level advisory lock that makes every later run hang too.
+  def await(queue)
+    Timeout.timeout(15) { queue.pop }
+  rescue Timeout::Error
+    flunk "the lock holder never reported: neither acquired nor refused"
+  end
 
   def ordering_step?(name)
     %w[set_policy_paused lock_partitions_for_status].include?(name)
