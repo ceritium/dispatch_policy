@@ -19,7 +19,7 @@ See `README.md` for the API and examples.
 v0.1 (on master). The whole main flow is implemented and tested.
 What's pending lives in `IDEAS.md` with the rationale.
 
-338 runs / 846 assertions. `bundle exec rake test` from the root.
+340 runs / 851 assertions. `bundle exec rake test` from the root.
 A mutation battery guards the tests themselves: `bundle exec rake
 mutations:all` (see `test/mutations/README.md`, and "Fixing a defect"
 below).
@@ -149,8 +149,14 @@ dispatch_policy_policy_settings               one row per policy — pause flag
   timestamptz) reinterprets the stored value in the SESSION TimeZone. That
   is correct only while the session agrees with whatever wrote the value.
   Postgres-written columns (`next_eligible_at`, `last_checked_at`,
-  `failed_at`, `heartbeat_at`) are written by `now()` on the same footing,
-  so they are read with `now()`. Application-written ones —
+  `failed_at`, `heartbeat_at`, `decayed_admits_at`) are written by `now()`
+  on the same footing, so they are read with `now()` — which for
+  `decayed_admits_at` means the DATABASE computes the elapsed time the
+  Tick's fairness reorder decays by (`claim_partitions` returns it as
+  `decay_elapsed_seconds`). Subtracting it from `Time.current` inverted the
+  fairness order under a skewed session, and was the last instance of this
+  bug found: the list above is only worth having if every entry on it has
+  been checked, and this column was missing from it entirely. Application-written ones —
   `staged_jobs.scheduled_at`, the `scheduled_eligible_at` horizon derived
   from it, and `tick_samples.sampled_at` — are bound from Ruby and
   serialized by `quoted_date`,
@@ -162,8 +168,11 @@ dispatch_policy_policy_settings               one row per policy — pause flag
   with, and read on the wrong clock it flashes "N still pending — click
   drain again" about rows the claim will not take. Mixing them needs no misconfiguration to be wrong, just a host
   that sets `variables: { timezone: … }` in database.yml, and then
-  `set(wait:)` fires early on a zone east of UTC and never on one west of
-  it, with no trace in any metric (A11). `sampled_at` is on this list
+  `set(wait:)` is off by the session's UTC offset in whichever direction it
+  points — early by it east of UTC, LATE by it west — with no trace in any
+  metric (A11). It always fires; "never" stood here for three commits and
+  is wrong, and an operator whose jobs are consistently four hours late
+  will not match that symptom to a doc that says they never run. `sampled_at` is on this list
   because it was MOVED here: it used to be written by `now()` and read by
   five different Ruby-bounded windows, so on a session west of UTC every
   sample landed ten hours in the past and the dashboard showed an idle
@@ -491,14 +500,22 @@ dispatch_policy_policy_settings               one row per policy — pause flag
   the load that made someone want to pause), rolling the controller's
   transaction back so the policy was NOT paused while the tick kept
   admitting and the request answered 500. `sweep_inactive_partitions!` has it now
-  too — an ordered `FOR UPDATE OF p SKIP LOCKED` CTE ahead of the DELETE —
-  so the rule is now exceptionless and stays checkable. Note what the
-  evidence for that last one actually is: NO deadlock was reproduced for
-  it (0 in a 20s stress run on an isolated database, before and after; an
-  earlier 4-10 was measuring a database three other processes were
-  truncating). It is ordered because "every multi-row writer of
-  `partitions` locks byte-ordered" is a property you can check and "this
-  one is rare enough" is not.
+  too — an ordered `FOR UPDATE OF p SKIP LOCKED` CTE ahead of the DELETE.
+  Measured at 8-10 deadlocks per 20s run before, 0 after, on a database
+  with nobody else on it. **A retraction that once stood here, saying this
+  one could not be reproduced, was wrong**, and the way it went wrong is
+  worth more than the number: the harness behind it recycled its
+  partitions one key per autocommitted statement, so the writer it raced
+  never held two locks at once and had no inversion to offer. A negative
+  result from a harness that cannot produce the positive is not evidence.
+  Hold the locks in ONE transaction, the way `stage_many!` does, or you
+  are measuring nothing.
+  `claim_partitions` is the one deliberate exception to the rule, and it
+  is worth keeping straight why: it takes `FOR UPDATE SKIP LOCKED` over
+  many rows in `last_checked_at` order, and that ORDER BY is the
+  anti-stagnation guarantee this file forbids changing elsewhere. It never
+  waits — SKIP LOCKED leaves it nothing to deadlock over — so ordering it
+  by key would buy nothing and cost the rotation.
 - **A multi-row partition writer that SLICES gives up all-or-nothing, so
   the caller has to serialize itself some other way.** `set_partitions_status!`
   cannot hold every lock of a large policy behind one click — that is A1's
@@ -563,7 +580,7 @@ http://localhost:3000/                       # forms to enqueue
 http://localhost:3000/dispatch_policy        # dashboard
 
 # Tests
-bundle exec rake test                        # 338 runs / 846 assertions
+bundle exec rake test                        # 340 runs / 851 assertions
 # DB_NAME picks the database (default dispatch_policy_test). Use it whenever
 # anything else might be running the suite: every integration case TRUNCATEs
 # the gem's tables in setup, so two runs on one database produce failures
@@ -574,7 +591,7 @@ bundle exec rake test                        # 338 runs / 846 assertions
 # notices. Slow (one full suite per mutation). See test/mutations/README.md.
 bundle exec rake mutations:list              # the catalogue, no work done
 bundle exec rake mutations:check             # do the find-strings still match? (seconds)
-bundle exec rake mutations:all               # 58 mutations, 57 must be caught
+bundle exec rake mutations:all               # 61 mutations, 60 must be caught
 FILTER=19 bundle exec rake mutations:all     # one of them
 
 # When you add a column or table:

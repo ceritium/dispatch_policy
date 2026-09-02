@@ -159,6 +159,56 @@ class ScheduledClockTest < DispatchPolicy::IntegrationTest
     assert_equal 3, summary[:jobs_admitted]
   end
 
+  # The in-tick fairness reorder subtracts `decayed_admits_at`, which
+  # `record_partition_admit!` writes with Postgres `now()`. Computed against
+  # `Time.current` it is the A10 crossing in the one place the audit's sweep
+  # did not reach: east of UTC the stored value reads as being in the FUTURE,
+  # the elapsed time clamps to 0, no decay is applied, and the order INVERTS
+  # — the partition that just admitted a burst is served before one idle for
+  # ten minutes. And since the in-memory decay is the only thing that lowers
+  # `decayed_admits` between admissions, that partition then stays last.
+  def test_the_fairness_order_survives_a_skewed_session_timezone
+    # The session is skewed BEFORE the column is written, which is the only
+    # shape that reproduces: in production one session config applies to
+    # everything, so `record_partition_admit!`'s `now()` stores a local wall
+    # clock and Ruby then reads it back as UTC. Seeding under UTC and only
+    # reading under the skew tests nothing — that version stayed green with
+    # the crossing put back.
+    session_timezone(EAST)
+    seed_decayed!("busy",  admits: 10.0, ago: 600) # bursted, then idle 10 min
+    seed_decayed!("quiet", admits: 1.0,  ago: 0)   # just admitted a little
+
+    # A gate-less policy is enough: the reorder is the subject, and it runs
+    # whether or not any gate does.
+    DispatchPolicy.registry.register(
+      DispatchPolicy::PolicyDSL.build(POLICY) do
+        context ->(_args) { {} }
+        partition_by ->(_c) { "k" }
+      end
+    )
+
+    claimed = DispatchPolicy::Repository.claim_partitions(policy_name: POLICY, limit: 10)
+    tick    = DispatchPolicy::Tick.new(POLICY)
+    tick.send(:sort_partitions_for_fairness!, claimed)
+
+    assert_equal %w[busy quiet], claimed.map { |p| p["partition_key"] },
+                 "after 10 idle minutes `busy` has decayed below `quiet` and must go first; " \
+                 "read on the session clock the decay is skipped and the order inverts"
+  end
+
+  def seed_decayed!(key, admits:, ago:)
+    DispatchPolicy::Repository.stage!(
+      policy_name: POLICY, partition_key: key, queue_name: nil,
+      job_class: "X", job_data: {}, context: {}
+    )
+    DispatchPolicy::Repository.connection.exec_query(
+      "UPDATE dispatch_policy_partitions SET decayed_admits = $3, " \
+      "decayed_admits_at = now() - ($4 || ' seconds')::interval " \
+      "WHERE policy_name = $1 AND partition_key = $2",
+      "seed_decay", [POLICY, key, admits, ago.to_i]
+    )
+  end
+
   # `defer_partition_to_next_scheduled!` reads the same column from both
   # ends: MIN over rows still in the future, and a NOT EXISTS guard over
   # rows already due. On a skewed session both answers move together — the

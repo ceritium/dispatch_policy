@@ -82,11 +82,12 @@
   writer of `dispatch_policy_partitions` with no lock order of its own —
   its `DELETE` planned as an index scan that tie-breaks by ctid, i.e. heap
   order, which is the deadlock shape fixed in A1. An ordered
-  `FOR UPDATE … SKIP LOCKED` CTE now picks the victims, so the rule holds
-  for every writer of that table without exception. Unlike A1, no deadlock
-  was reproduced for this one: it runs every `sweep_every_ticks` rather
-  than per enqueue, and a 20-second stress run against a concurrent
-  byte-ordered writer produced none either way.
+  `FOR UPDATE … SKIP LOCKED` CTE now picks the victims: 8-10 deadlocks per
+  20-second run before, 0 after, against one process holding a byte-ordered
+  transaction over 40 partitions — which is what `stage_many!` does.
+  Postgres usually kills the sweep, whose blanket rescue then silently
+  skips the rest of that pass (partition GC, tick-sample GC and
+  adaptive-stat GC).
 
 - **The dashboard's metrics windows read the clock that writes them.**
   `tick_samples.sampled_at` was written by Postgres `now()` while all five
@@ -110,7 +111,7 @@
   in the session TimeZone. Rails keeps that at UTC by default, which is
   why it hid — but a host that sets `variables: { timezone: … }` in
   `database.yml` got every `set(wait:)` job off by the offset: early on a
-  zone east of UTC, never on one west of it, with no trace in any metric.
+  zone east of UTC, late by it on one west, with no trace in any metric.
   Those comparisons now bind the application clock, so both sides go
   through the same serialization the write did (via
   `Repository.app_clock`, which coerces — `config.clock` is public API and

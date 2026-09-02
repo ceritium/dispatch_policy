@@ -51,6 +51,22 @@ class RoundTripStatsTest < DispatchPolicy::IntegrationTest
     assert_in_delta 10, stats[:p95_age_seconds], 5
   end
 
+  # The dashboard INDEX reads a different method than the policy page, and
+  # it needed the same exclusion. Nothing covered it, so the filter could be
+  # deleted from `partition_round_trip_stats_by_policy` with the suite green
+  # — A8 half-fixed, on the page an operator opens first.
+  def test_the_by_policy_stats_exclude_schedule_parked_partitions_too
+    make_partition("parked", horizon: Time.now.utc + 3600, checked_ago: 86_400)
+    make_partition("fresh", checked_ago: 10)
+
+    row = DispatchPolicy::Repository.partition_round_trip_stats_by_policy[POLICY]
+
+    refute_nil row
+    assert_in_delta 10, row[:oldest_age_seconds], 5,
+                    "a partition waiting on its own horizon is not one the tick failed to reach"
+    assert_in_delta 10, row[:p95_age_seconds], 5
+  end
+
   # A horizon that has arrived is claimable again and counts normally —
   # the exclusion is "waiting on the clock", not "has ever been scheduled".
   def test_a_partition_whose_horizon_has_passed_counts_again

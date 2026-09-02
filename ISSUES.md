@@ -52,10 +52,9 @@ something. What they found was again **in the fixes, not in the audit**:
 
 Three further defects the reviewers reproduced and this branch also fixes:
 the partition sweeper's DELETE was the last unordered multi-row writer of
-`partitions` — ordered here so the rule is exceptionless, though the
-4-10 deadlocks per 20s first reported for it turned out to be a shared
-database three processes were truncating, and on an isolated one it
-deadlocks neither before nor after; `StagedJob.due` — the scope the drain
+`partitions` (8-10 deadlocks per 20s against one byte-ordered transaction
+over 40 partitions, 0 after — see the retraction-of-a-retraction below);
+`StagedJob.due` — the scope the drain
 button counts with — was still on the session clock; and a forked child
 inherited the heartbeat registry and beat its parent's jobs, keeping rows
 fresh that nothing would ever release.
@@ -151,8 +150,8 @@ SELECT timestamp '2026-09-01 22:25:58' <= now();   -- a job due in 1 minute
 Rails sets that session to UTC by default, which is why this hid: it
 needs a host that sets `variables: { timezone: … }` in `database.yml` —
 a supported knob, commonly used to make raw psql output readable. Then
-`set(wait:)` runs early on a zone east of UTC and not at all on one west
-of it, and nothing anywhere records the difference. Fixed by binding
+`set(wait:)` runs off by the session's UTC offset — early by it east of
+UTC, late by it west — and nothing anywhere records the difference. Fixed by binding
 `config.now` on both sides. `next_eligible_at` deliberately stays on
 `now()`: Postgres writes it, so that is the clock it must be read on.
 

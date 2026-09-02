@@ -616,15 +616,17 @@ module DispatchPolicy
       '      begin',
       '        yield',
       '      ensure',
-      '        connection.select_value(',
-      '          "SELECT pg_advisory_unlock(#{Integer(PAUSE_LOCK_CLASS)}, #{Integer(objid)})"',
-      '        )',
-      '      end',
-      '      true'
+      '        begin',
+      '          connection.select_value(',
+      '            "SELECT pg_advisory_unlock(#{Integer(PAUSE_LOCK_CLASS)}, #{Integer(objid)})"',
+      '          )'
     ].join("\n"),
     replace: [
-      '      yield',
-      '      true'
+      '      begin',
+      '        yield',
+      '      ensure',
+      '        begin',
+      '          nil'
     ].join("\n")
   },
   {
@@ -813,10 +815,58 @@ module DispatchPolicy
     # re-acquires its own leaked lock. Only asking the database catches it.
     caught_by: 'pause_lock_order_test',
     file:  'lib/dispatch_policy/repository.rb',
-    find:  '        connection.select_value(' + "\n" +
-           '          "SELECT pg_advisory_unlock(#{Integer(PAUSE_LOCK_CLASS)}, #{Integer(objid)})"' + "\n" +
-           '        )',
-    replace: '        nil'
+    find:  '          connection.select_value(' + "\n" +
+           '            "SELECT pg_advisory_unlock(#{Integer(PAUSE_LOCK_CLASS)}, #{Integer(objid)})"' + "\n" +
+           '          )',
+    replace: '          nil'
+  },
+  {
+    id:    '60',
+    label: 'deny flush: the ordered lock loses its transaction',
+    # Postgres holds row locks only to end of transaction. Without one the
+    # SELECT ... FOR UPDATE autocommits and every lock is gone before the UPDATE
+    # runs — the byte order is still there and A1's fix does nothing. The whole
+    # suite stayed green with this until the shape assertion was added.
+    caught_by: 'deny_lock_order_test',
+    file:  'lib/dispatch_policy/repository.rb',
+    find:  '      connection.transaction(requires_new: true) do' + "\n" +
+           '        connection.exec_query(' + "\n" +
+           '          <<~SQL.squish,' + "\n" +
+           '            SELECT 1 FROM #{PARTITIONS_TABLE}' + "\n" +
+           '            WHERE (policy_name, partition_key) IN (VALUES #{lock_values.join(", ")})',
+    replace: '      [nil].each do' + "\n" +
+             '        connection.exec_query(' + "\n" +
+             '          <<~SQL.squish,' + "\n" +
+             '            SELECT 1 FROM #{PARTITIONS_TABLE}' + "\n" +
+             '            WHERE (policy_name, partition_key) IN (VALUES #{lock_values.join(", ")})'
+  },
+  {
+    id:    '61',
+    label: 'fairness reorder: decay elapsed back on the worker clock',
+    # `decayed_admits_at` is Postgres-written. Subtracted from Time.current, an
+    # east-of-UTC session makes it read as future, the decay is skipped, and the
+    # order inverts — the partition that just bursted is served first, forever.
+    caught_by: 'scheduled_clock_test',
+    file:  'lib/dispatch_policy/tick.rb',
+    find:  '      seconds = partition["decay_elapsed_seconds"]' + "\n" +
+           '      return [seconds.to_f, 0.0].max if seconds' + "\n\n",
+    replace: ''
+  },
+  {
+    id:    '62',
+    label: 'round-trip by_policy: parked partitions counted again',
+    # A8's other half, on the page an operator opens first. The policy page and
+    # the dashboard index read different methods; only one was covered.
+    caught_by: 'round_trip_stats_test',
+    file:  'lib/dispatch_policy/repository.rb',
+    find:  '            EXTRACT(EPOCH FROM (now() - MIN(p.last_checked_at) FILTER (WHERE NOT #{PARKED_SQL})))::float AS oldest_age_seconds,' + "\n" +
+           '            EXTRACT(EPOCH FROM (now() - PERCENTILE_DISC(0.05) WITHIN GROUP (ORDER BY p.last_checked_at) FILTER (WHERE NOT #{PARKED_SQL})))::float AS p95_age_seconds' + "\n" +
+           '          FROM #{PARTITIONS_TABLE} p' + "\n" +
+           "          WHERE p.status = 'active' AND p.pending_count > 0",
+    replace: '            EXTRACT(EPOCH FROM (now() - MIN(p.last_checked_at) FILTER (WHERE $1::timestamp IS NOT NULL)))::float AS oldest_age_seconds,' + "\n" +
+             '            EXTRACT(EPOCH FROM (now() - PERCENTILE_DISC(0.05) WITHIN GROUP (ORDER BY p.last_checked_at) FILTER (WHERE $1::timestamp IS NOT NULL)))::float AS p95_age_seconds' + "\n" +
+             '          FROM #{PARTITIONS_TABLE} p' + "\n" +
+             "          WHERE p.status = 'active' AND p.pending_count > 0"
   },
     ].freeze
   end

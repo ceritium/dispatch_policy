@@ -290,13 +290,21 @@ module DispatchPolicy
     # host that sets `variables: { timezone: … }` in database.yml (a
     # supported knob, and a common one for readable psql output) breaks the
     # match, and scheduled work then runs off by the offset: early on a
-    # zone east of UTC, never on one west of it. Nothing records the
-    # difference; `set(wait: 1.hour)` simply fires at the wrong hour.
+    # zone east of UTC, LATE by it on one west. It always fires, at the
+    # wrong hour, and nothing records the difference.
     # Binding the clock puts both sides of the comparison through the same
     # `quoted_date` the write went through, so they agree under any
     # combination of session TimeZone and `ActiveRecord.default_timezone`.
     # `next_eligible_at` stays on `now()` for exactly the same reason: it
     # is written on that clock, so that is the clock it must be read on.
+    #
+    # `decay_elapsed_seconds` is returned for the same rule, from the other
+    # side. `decayed_admits_at` is Postgres-written (`record_partition_admit!`
+    # sets it to `now()`), and the Tick's in-memory fairness reorder used to
+    # subtract it from `Time.current` — the A10 crossing exactly, in the one
+    # place nobody looked. Computing the elapsed time HERE, in the same
+    # statement and the same frame the column was written in, is what makes
+    # the reorder independent of the session's TimeZone.
     def claim_partitions(policy_name:, limit:, shard: nil)
       params      = [policy_name, app_clock]
       shard_sql   = ""
@@ -327,7 +335,8 @@ module DispatchPolicy
         SET last_checked_at = now()
         FROM candidates
         WHERE p.id = candidates.id
-        RETURNING p.*
+        RETURNING p.*,
+          EXTRACT(EPOCH FROM (now() - p.decayed_admits_at)) AS decay_elapsed_seconds
       SQL
       result = connection.exec_query(sql, "claim_partitions", params)
       result.to_a.map { |row| normalize_partition(row) }
@@ -888,9 +897,25 @@ module DispatchPolicy
       begin
         yield
       ensure
-        connection.select_value(
-          "SELECT pg_advisory_unlock(#{Integer(PAUSE_LOCK_CLASS)}, #{Integer(objid)})"
-        )
+        begin
+          connection.select_value(
+            "SELECT pg_advisory_unlock(#{Integer(PAUSE_LOCK_CLASS)}, #{Integer(objid)})"
+          )
+        rescue StandardError => e
+          # Do not let the release replace the caller's exception. The one
+          # way this raises is a connection already in an aborted
+          # transaction — which needs a HOST that wraps the action in one,
+          # since the gem's controller does not — and there the unlock
+          # cannot run at all, so this rescue buys the real error message
+          # back and NOT the release: the lock stays held until that
+          # backend goes away. Being loud about it is the most this layer
+          # can do; see CLAUDE.md's pause bullet for what a held lock does.
+          DispatchPolicy.config.logger&.error(
+            "[dispatch_policy] could not release the pause lock for #{policy_name}: " \
+            "#{e.class}: #{e.message}. Pause/resume for this policy will be refused on " \
+            "every OTHER connection until this backend is gone."
+          )
+        end
       end
       true
     end
@@ -1650,24 +1675,24 @@ module DispatchPolicy
       # Picks its victims in the same BYTE order every other multi-row
       # writer of this table uses, and SKIPs any row somebody else already
       # holds. A bare `DELETE … WHERE` locks in whatever order the plan
-      # produces — here an index scan on idx_dp_partitions_scheduled_order,
-      # which tie-breaks equal keys by ctid, i.e. heap order — which is the
-      # A1 hazard exactly, and this was the last multi-row writer of the
-      # table still carrying it.
+      # produces — an index scan that tie-breaks equal keys by ctid, i.e.
+      # heap order — which is the A1 hazard exactly, and this was the last
+      # multi-row writer of the table still carrying it.
       #
-      # Honest about the evidence: unlike A1 and unlike the pause button,
-      # NO deadlock was reproduced for this one. A 20-second stress run
-      # against a concurrent byte-ordered writer produced 0 on an isolated
-      # database, both before and after (an earlier run that showed 4-10
-      # was measuring a database three other processes were truncating).
-      # It runs every `sweep_every_ticks` rather than per enqueue, so the
-      # window is narrow. The order is here because the guarantee is
-      # supposed to be structural — "every multi-row writer of `partitions`
-      # locks byte-ordered" is checkable, "this one is rare enough" is not
-      # — and because when Postgres does pick a victim it is usually the
-      # sweep, whose blanket rescue in `TickLoop.sweep!` then silently
-      # skips the rest of that pass: partition GC, tick-sample GC and
-      # adaptive-stat GC.
+      # Measured, after one retraction that was itself wrong: 8-10 deadlocks
+      # per 20s run against ONE process holding a byte-ordered transaction
+      # over 40 partitions, which is what `stage_many!` does; 0 with this
+      # CTE; three runs each, on a database with nobody else on it. An
+      # earlier harness reported 0 for BOTH and the retraction it produced
+      # went into three files — it recycled its partitions one key per
+      # autocommitted statement, so the writer it was racing never held two
+      # locks at once and never offered an inversion to invert. If you
+      # re-measure this, hold the locks in ONE transaction or you are
+      # measuring nothing.
+      #
+      # Postgres usually picks the sweep as the victim, and
+      # `TickLoop.sweep!`'s blanket rescue then silently skips the rest of
+      # that pass — partition GC, tick-sample GC and adaptive-stat GC.
       #
       # SKIP LOCKED as well as the order: the sweep is periodic and
       # best-effort, so a partition somebody is writing right now is better

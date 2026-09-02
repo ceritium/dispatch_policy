@@ -174,13 +174,38 @@ module DispatchPolicy
       return partitions if half_life.nil? || half_life <= 0
 
       tau = half_life.to_f / Math.log(2)
-      now = Time.current.to_f
 
       partitions.sort_by! do |p|
-        last_t = decayed_admits_epoch(p["decayed_admits_at"]) || now
-        elapsed = [now - last_t, 0.0].max
+        elapsed = fairness_elapsed(p)
         (p["decayed_admits"] || 0.0).to_f * Math.exp(-elapsed / tau)
       end
+    end
+
+    # Seconds since this partition's decay counter was last written.
+    #
+    # It comes from the database, as `claim_partitions`'s computed
+    # `decay_elapsed_seconds` column. `decayed_admits_at` is written by
+    # Postgres `now()`, so subtracting it from `Time.current` here put the
+    # two ends of one subtraction on two clocks — the A10/A11 shape, in the
+    # only place the audit's sweep did not reach. Under the configuration
+    # A11 was fixed for (a session TimeZone east of UTC) the stored value
+    # reads as being in the FUTURE, `elapsed` clamps to 0, no decay is
+    # applied, and the fairness order inverts: the partition that just
+    # admitted a burst is served before one idle for ten minutes. The
+    # in-memory decay is the only thing that lowers `decayed_admits`
+    # between admissions, so that partition then stays last forever.
+    #
+    # The fallback is for rows a caller built by hand rather than claimed;
+    # it is the old crossing, and it is why the column is preferred rather
+    # than merely tried.
+    def fairness_elapsed(partition)
+      seconds = partition["decay_elapsed_seconds"]
+      return [seconds.to_f, 0.0].max if seconds
+
+      last_t = decayed_admits_epoch(partition["decayed_admits_at"])
+      return 0.0 unless last_t
+
+      [Time.current.to_f - last_t, 0.0].max
     end
 
     # exec_query gives us a Time for timestamp columns; the other branches

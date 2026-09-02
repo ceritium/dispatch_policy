@@ -300,8 +300,14 @@ class InflightTrackerHeartbeatTest < DispatchPolicy::IntegrationTest
     flunk message
   end
 
+  # `.dup` is a SHALLOW copy, so the seq arrays are the live ones and
+  # deleting from them while iterating skips every other element — an id
+  # registered twice was left half-registered, and the next test's "exactly
+  # one thread" assertion then failed for an unrelated reason.
   def stop_everything!
-    DispatchPolicy::InflightTracker.heartbeat_ids.dup.each do |id, seqs|
+    DispatchPolicy::InflightTracker.heartbeat_ids
+                                   .map { |id, seqs| [id, seqs.dup] }
+                                   .each do |id, seqs|
       seqs.each do |seq|
         DispatchPolicy::InflightTracker.stop_heartbeat(
           DispatchPolicy::InflightTracker::Registration.new(id, seq)

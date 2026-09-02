@@ -79,6 +79,24 @@ class DenyLockOrderTest < DispatchPolicy::IntegrationTest
                              .reject { |v| v == POLICY }
     assert_equal %w[Acme acct:10 acct:1:eu], keys,
                  "the order has to match what stage_many! sorts by, or the two still cross"
+
+    # And that the lock and the UPDATE share a TRANSACTION. Postgres holds
+    # row locks only to end of transaction, so without it the
+    # `SELECT … FOR UPDATE` autocommits and every lock is gone before the
+    # UPDATE runs — the byte order is still there, in the right statement,
+    # in the right place, and the entire A1 fix does nothing. Verified: the
+    # whole suite stays green with the transaction removed, and the
+    # deadlock comes straight back. The two multi-row writers this project
+    # added later both pin their shape; the original did not.
+    shape = seen.filter_map do |p|
+      next p[:sql].strip[0, 6] if p[:name] == "TRANSACTION"
+      next "LOCK" if p[:name] == "lock_partitions_for_deny"
+
+      "UPDATE" if p[:name] == "bulk_record_partition_denies"
+    end
+    assert_equal %w[BEGIN LOCK UPDATE COMMIT], shape,
+                 "the lock and the UPDATE must be in one transaction, or the lock is released " \
+                 "before the UPDATE it exists to order"
   end
 
   # The ordering must not have changed what the flush actually records.
