@@ -99,16 +99,16 @@ module DispatchPolicy
   {
     id:    '05',
     label: 'partition sweeper: anti-join against staged_jobs removed',
-    # The partition sweeper must not collect a partition whose only remaining rows
-    # are held: that strands them with nothing pointing at them.
+    # Without it the sweeper collects a partition whose only remaining rows are
+    # quarantined, and the hold's own retry has nothing left to release into.
     caught_by: 'undeliverable_job_test',
     file:  'lib/dispatch_policy/repository.rb',
     find:  [
-      '            AND NOT EXISTS (',
-      '              SELECT 1 FROM #{STAGED_TABLE} s',
-      '              WHERE s.policy_name = p.policy_name',
-      '                AND s.partition_key = p.partition_key',
-      '            )'
+      '              AND NOT EXISTS (',
+      '                SELECT 1 FROM #{STAGED_TABLE} s',
+      '                WHERE s.policy_name = p.policy_name',
+      '                  AND s.partition_key = p.partition_key',
+      '              )'
     ].join("\n"),
     replace: ''
   },
@@ -139,8 +139,8 @@ module DispatchPolicy
     # record of what it decided — never recomputed from ctx.
     caught_by: 'live_policy_edit_test',
     file:  'lib/dispatch_policy/inflight_tracker.rb',
-    find:  '[row["queue_lag_ms"].to_i, row["partition_key"]]',
-    replace: '[row["queue_lag_ms"].to_i, nil]'
+    find:  '[[lag, 0.0].max.to_i, row["partition_key"]]',
+    replace: '[[lag, 0.0].max.to_i, nil]'
   },
   {
     id:    '09',
@@ -502,7 +502,7 @@ module DispatchPolicy
     # session TimeZone offset — scheduled work then runs early or never, silently.
     caught_by: 'scheduled_clock_test',
     file:  'lib/dispatch_policy/repository.rb',
-    find:  '      params      = [policy_name, DispatchPolicy.config.now]',
+    find:  '      params      = [policy_name, app_clock]',
     replace: '      params      = [policy_name, connection.select_value("SELECT now()::timestamp")]'
   },
   {
@@ -512,7 +512,7 @@ module DispatchPolicy
     # `set(wait:)` job may leave the staging table at all.
     caught_by: 'scheduled_clock_test',
     file:  'lib/dispatch_policy/repository.rb',
-    find:  '        [policy_name, partition_key, limit, DispatchPolicy.config.now]',
+    find:  '        [policy_name, partition_key, limit, app_clock]',
     replace: '        [policy_name, partition_key, limit, connection.select_value("SELECT now()::timestamp")]'
   },
   {
@@ -523,7 +523,7 @@ module DispatchPolicy
     # partition busy-loops every tick — M10, back again.
     caught_by: 'scheduled_clock_test',
     file:  'lib/dispatch_policy/repository.rb',
-    find:  '        [policy_name, partition_key, DispatchPolicy.config.now]',
+    find:  '        [policy_name, partition_key, app_clock]',
     replace: '        [policy_name, partition_key, connection.select_value("SELECT now()::timestamp")]'
   },
   {
@@ -546,15 +546,15 @@ module DispatchPolicy
     caught_by: 'adaptive_clock_test',
     file:  'lib/dispatch_policy/inflight_tracker.rb',
     find:  [
-      '          "SELECT partition_key, GREATEST(EXTRACT(EPOCH FROM " \\',
-      '          "(clock_timestamp()::timestamp - admitted_at)) * 1000, 0)::bigint AS queue_lag_ms " \\',
+      '          "SELECT partition_key, EXTRACT(EPOCH FROM " \\',
+      '          "(clock_timestamp()::timestamp - admitted_at)) * 1000 AS raw_lag_ms " \\',
       '          "FROM dispatch_policy_inflight_jobs WHERE active_job_id = $1 LIMIT 1",',
       '          "lookup_admission",',
       '          [active_job_id]'
     ].join("\n"),
     replace: [
-      '          "SELECT partition_key, GREATEST(EXTRACT(EPOCH FROM " \\',
-      '          "($2::timestamp - admitted_at)) * 1000, 0)::bigint AS queue_lag_ms " \\',
+      '          "SELECT partition_key, EXTRACT(EPOCH FROM " \\',
+      '          "($2::timestamp - admitted_at)) * 1000 AS raw_lag_ms " \\',
       '          "FROM dispatch_policy_inflight_jobs WHERE active_job_id = $1 LIMIT 1",',
       '          "lookup_admission",',
       '          [active_job_id, Time.current]'
@@ -671,8 +671,8 @@ module DispatchPolicy
     # transaction opened" — the controller never sees a job as late.
     caught_by: 'adaptive_clock_test',
     file:  'lib/dispatch_policy/inflight_tracker.rb',
-    find:  '"(clock_timestamp()::timestamp - admitted_at)) * 1000, 0)::bigint AS queue_lag_ms " \\',
-    replace: '"(now()::timestamp - admitted_at)) * 1000, 0)::bigint AS queue_lag_ms " \\'
+    find:  '"(clock_timestamp()::timestamp - admitted_at)) * 1000 AS raw_lag_ms " \\',
+    replace: '"(now()::timestamp - admitted_at)) * 1000 AS raw_lag_ms " \\'
   },
   {
     id:    '51',

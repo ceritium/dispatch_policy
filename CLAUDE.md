@@ -550,6 +550,7 @@ bundle exec rake test                        # 334 runs / 835 assertions
 # Mutation battery — breaks each load-bearing line and checks a test
 # notices. Slow (one full suite per mutation). See test/mutations/README.md.
 bundle exec rake mutations:list              # the catalogue, no work done
+bundle exec rake mutations:check             # do the find-strings still match? (seconds)
 bundle exec rake mutations:all               # 53 mutations, 52 must be caught
 FILTER=19 bundle exec rake mutations:all     # one of them
 
@@ -629,7 +630,17 @@ So, when you fix something:
 
 1. Add the mutation that puts the bug back (`test/mutations/catalogue.rb`)
    and run `FILTER=<id> bundle exec rake mutations:all`. It must say
-   `CAUGHT`. If it survives, the test is decorative — fix the test.
+   `CAUGHT`, and the CAUGHT has to name the test you expect. If it
+   survives, the test is decorative — fix the test.
+   Then run `bundle exec rake mutations:check`: editing a line somebody
+   already mutates stales that entry silently, and a stale entry proves
+   nothing while reading exactly like a passing one. Four went stale in
+   one sitting on this branch.
+   Watch for the other shape too — a mutation that is CAUGHT when run
+   alone and SURVIVES in a full run. That is a test with a timing window,
+   not a flaky runner: it happened here to a test that COUNTED the
+   heartbeat's statements, because the subscriber wakes the test thread on
+   the first one. Assert something with no window.
 2. Or, equivalently, revert the production file to its parent in a scratch
    copy and confirm the new test goes red there.
 
