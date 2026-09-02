@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require_relative "../test_helper"
+require "timeout"
 require_relative "../../app/models/dispatch_policy/application_record"
 require_relative "../../app/models/dispatch_policy/inflight_job"
 
@@ -40,11 +41,11 @@ class InflightTrackerHeartbeatTest < DispatchPolicy::IntegrationTest
     DispatchPolicy.config.inflight_heartbeat_interval = 0.05
 
     token = DispatchPolicy::InflightTracker.start_heartbeat("ajid-stop")
-    assert_equal "ajid-stop", token
-    assert_includes DispatchPolicy::InflightTracker.heartbeat_ids.keys, token
+    assert_equal "ajid-stop", token.active_job_id
+    assert_includes DispatchPolicy::InflightTracker.heartbeat_ids.keys, token.active_job_id
 
     DispatchPolicy::InflightTracker.stop_heartbeat(token)
-    refute_includes DispatchPolicy::InflightTracker.heartbeat_ids.keys, token,
+    refute_includes DispatchPolicy::InflightTracker.heartbeat_ids.keys, token.active_job_id,
                     "a stopped job must not keep getting beaten — its row is about to be deleted"
 
     quiesce_heartbeat_threads!
@@ -113,7 +114,7 @@ class InflightTrackerHeartbeatTest < DispatchPolicy::IntegrationTest
     DispatchPolicy::Repository.insert_inflight!([{
       policy_name: "p", partition_key: "k", active_job_id: "ghost"
     }])
-    DispatchPolicy::InflightTracker.start_heartbeat("ghost")
+    ghost = DispatchPolicy::InflightTracker.start_heartbeat("ghost")
     DispatchPolicy::Repository.delete_inflight!(active_job_id: "ghost")
 
     deadline = Time.now + 5
@@ -123,7 +124,7 @@ class InflightTrackerHeartbeatTest < DispatchPolicy::IntegrationTest
 
     refute_includes DispatchPolicy::InflightTracker.heartbeat_ids.keys, "ghost"
   ensure
-    DispatchPolicy::InflightTracker.stop_heartbeat("ghost")
+    DispatchPolicy::InflightTracker.stop_heartbeat(ghost)
     DispatchPolicy.reset_config!
   end
 
@@ -137,7 +138,7 @@ class InflightTrackerHeartbeatTest < DispatchPolicy::IntegrationTest
   # ActiveRecord connection to exercise.
   def test_a_process_that_inherits_the_registry_drops_it
     DispatchPolicy.config.inflight_heartbeat_interval = 0.05
-    DispatchPolicy::InflightTracker.start_heartbeat("parents-job")
+    parent = DispatchPolicy::InflightTracker.start_heartbeat("parents-job")
     assert_includes DispatchPolicy::InflightTracker.heartbeat_ids.keys, "parents-job"
 
     Process.stub(:pid, Process.pid + 1) do
@@ -150,9 +151,7 @@ class InflightTrackerHeartbeatTest < DispatchPolicy::IntegrationTest
     # The pid switch orphans the thread the parent had started: it is still
     # alive, and the next test's "exactly one thread" assertion sees two.
     # Wait it out rather than leave the pollution for whoever runs next.
-    DispatchPolicy::InflightTracker.heartbeat_ids.keys.each do |id|
-      DispatchPolicy::InflightTracker.stop_heartbeat(id)
-    end
+    stop_everything!
     quiesce_heartbeat_threads!
     DispatchPolicy.reset_config!
   end
@@ -167,7 +166,7 @@ class InflightTrackerHeartbeatTest < DispatchPolicy::IntegrationTest
   def test_a_beat_that_could_not_reach_the_database_unregisters_nobody
     DispatchPolicy.config.inflight_heartbeat_interval = 0.05
     ids = %w[keep-1 keep-2]
-    ids.each { |id| DispatchPolicy::InflightTracker.start_heartbeat(id) }
+    tokens = ids.map { |id| DispatchPolicy::InflightTracker.start_heartbeat(id) }
 
     attempts = Queue.new
     DispatchPolicy::InflightTracker.stub(:beat!, ->(_) { attempts << true; nil }) do
@@ -177,7 +176,7 @@ class InflightTrackerHeartbeatTest < DispatchPolicy::IntegrationTest
     assert_equal ids.sort, DispatchPolicy::InflightTracker.heartbeat_ids.keys.sort,
                  "a failed beat says nothing about which jobs are still running"
   ensure
-    ids&.each { |id| DispatchPolicy::InflightTracker.stop_heartbeat(id) }
+    tokens&.each { |t| DispatchPolicy::InflightTracker.stop_heartbeat(t) }
     quiesce_heartbeat_threads!
     DispatchPolicy.reset_config!
   end
@@ -193,7 +192,7 @@ class InflightTrackerHeartbeatTest < DispatchPolicy::IntegrationTest
       policy_name: "p", partition_key: "k", active_job_id: "survivor"
     }])
     before = heartbeats_for(["survivor"])["survivor"]
-    DispatchPolicy::InflightTracker.start_heartbeat("survivor")
+    survivor = DispatchPolicy::InflightTracker.start_heartbeat("survivor")
 
     boom = Queue.new
     DispatchPolicy::InflightTracker.stub(:beat!, ->(_) { boom << true; raise "cycle exploded" }) do
@@ -207,9 +206,98 @@ class InflightTrackerHeartbeatTest < DispatchPolicy::IntegrationTest
     assert_operator heartbeats_for(["survivor"])["survivor"], :>, before,
                     "and must go back to beating once the failure clears"
   ensure
-    DispatchPolicy::InflightTracker.stop_heartbeat("survivor")
+    DispatchPolicy::InflightTracker.stop_heartbeat(survivor)
     quiesce_heartbeat_threads!
     DispatchPolicy.reset_config!
+  end
+
+  # ActiveJob KEEPS the job_id across retries, so "the same id leaves and
+  # comes back" is what `retry_on` does, not an exotic race. The beat's
+  # pruning compares against a snapshot taken before the UPDATE: a retry
+  # that registers in that window would be unregistered by the answer to a
+  # question about the execution it replaced, and the live execution then
+  # never beats again — five minutes later the sweeper deletes its row
+  # while it runs.
+  def test_a_retry_that_registers_during_a_beat_is_not_pruned
+    DispatchPolicy.config.inflight_heartbeat_interval = 0.05
+    first = DispatchPolicy::InflightTracker.start_heartbeat("retried")
+
+    # Widen the beat instead of reimplementing the pruning: the loop, the
+    # snapshot and the `gone` computation are the production code, and only
+    # the duration of the UPDATE is under the test's control. Asserting a
+    # copy of the pruning line here would pass with the real one deleted.
+    in_beat  = Queue.new
+    proceed  = Queue.new
+    retried  = nil
+    registered = nil
+
+    slow_beat = lambda do |_ids|
+      in_beat << true
+      proceed.pop
+      [] # the row of the execution that FINISHED is gone
+    end
+
+    DispatchPolicy::InflightTracker.stub(:beat!, slow_beat) do
+      await(in_beat)                    # cycle 1 is inside beat!
+      DispatchPolicy::InflightTracker.stop_heartbeat(first)
+      retried = DispatchPolicy::InflightTracker.start_heartbeat("retried")
+      proceed << true                   # beat! answers []
+
+      # Cycle 2 STARTING is the proof that cycle 1 finished, pruning
+      # included. If cycle 1 pruned the retry the registry is empty, the
+      # loop retires, and no cycle 2 ever comes — which is the bug, so
+      # `await` fails the test rather than hanging.
+      await(in_beat, "the loop retired: the retry was pruned and nothing beats it now")
+      registered = DispatchPolicy::InflightTracker.heartbeat_ids.keys.dup
+      proceed << true
+    end
+
+    assert_includes registered, "retried",
+                    "the retry is a different execution and is still running"
+  ensure
+    DispatchPolicy::InflightTracker.stop_heartbeat(retried) if retried
+    stop_everything!
+    quiesce_heartbeat_threads!
+    DispatchPolicy.reset_config!
+  end
+
+  # At-least-once delivery can put two deliveries of one job on the same
+  # worker. With a thread per execution one could not stop the other's
+  # heartbeat; collapsing them into one registry brought that back unless
+  # the registry counts executions rather than ids.
+  def test_stopping_one_execution_leaves_a_concurrent_one_registered
+    DispatchPolicy.config.inflight_heartbeat_interval = 0.05
+    a = DispatchPolicy::InflightTracker.start_heartbeat("twice")
+    b = DispatchPolicy::InflightTracker.start_heartbeat("twice")
+
+    DispatchPolicy::InflightTracker.stop_heartbeat(a)
+
+    assert_includes DispatchPolicy::InflightTracker.heartbeat_ids.keys, "twice",
+                    "the second delivery is still running and still needs beating"
+
+    DispatchPolicy::InflightTracker.stop_heartbeat(b)
+    refute_includes DispatchPolicy::InflightTracker.heartbeat_ids.keys, "twice"
+  ensure
+    stop_everything!
+    quiesce_heartbeat_threads!
+    DispatchPolicy.reset_config!
+  end
+
+  # Queue#pop(timeout:) is Ruby 3.2, and the gemspec floor is 3.1.
+  def await(queue, message = "the heartbeat loop never got there")
+    Timeout.timeout(10) { queue.pop }
+  rescue Timeout::Error
+    flunk message
+  end
+
+  def stop_everything!
+    DispatchPolicy::InflightTracker.heartbeat_ids.dup.each do |id, seqs|
+      seqs.each do |seq|
+        DispatchPolicy::InflightTracker.stop_heartbeat(
+          DispatchPolicy::InflightTracker::Registration.new(id, seq)
+        )
+      end
+    end
   end
 
   def quiesce_heartbeat_threads!

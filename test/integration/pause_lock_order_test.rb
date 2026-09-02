@@ -62,7 +62,7 @@ class PauseLockOrderTest < DispatchPolicy::IntegrationTest
         conn.transaction do
           lock_row(conn, KEY_LO)
           grabbed_lo << true
-          wait_for_a_blocked_lock_request!
+          wait_for_the_click_to_block!
           lock_row(conn, KEY_HI)
         end
       end
@@ -253,17 +253,39 @@ class PauseLockOrderTest < DispatchPolicy::IntegrationTest
     )
   end
 
-  # Blocks until some backend is waiting on a row lock. Deterministic
-  # where a sleep is not: too short a sleep lets the click finish before
-  # the enqueuer reaches for HI, and the test then passes against the bug.
-  def wait_for_a_blocked_lock_request!
+  # Blocks until the CLICK is waiting on a lock. Deterministic where a
+  # sleep is not: too short a sleep lets the click finish before the
+  # enqueuer reaches for HI, and the test then passes against the bug.
+  #
+  # The obvious gate — `SELECT count(*) FROM pg_locks WHERE NOT granted` —
+  # is worse than a sleep, because it disarms silently. `pg_locks` is
+  # CLUSTER-wide: any backend anywhere, in any database, waiting on any
+  # lock satisfies it on the first poll. A leftover backend from another
+  # run, or a second test process, and this returns immediately while the
+  # click is nowhere near a lock. So: this database, not our own backend,
+  # actually waiting on a Lock, and waiting inside a statement against the
+  # table in question.
+  def wait_for_the_click_to_block!
     deadline = Time.now + 10
     loop do
       blocked = ActiveRecord::Base.connection_pool.with_connection do |c|
-        c.select_value("SELECT count(*) FROM pg_locks WHERE NOT granted").to_i
+        # This poll runs inside the enqueuer's open transaction, and
+        # Postgres caches the backend-status snapshot behind
+        # pg_stat_activity for the life of a transaction — without this the
+        # view answers with the state from before the click existed, every
+        # time, until the deadline. (pg_locks reads the lock manager live,
+        # which is why the cluster-wide version did not need it.)
+        c.execute("SELECT pg_stat_clear_snapshot()")
+        c.select_value(<<~SQL.squish).to_i
+          SELECT count(*) FROM pg_stat_activity
+          WHERE datname = current_database()
+            AND pid <> pg_backend_pid()
+            AND wait_event_type = 'Lock'
+            AND query LIKE '%#{DispatchPolicy::Repository::PARTITIONS_TABLE}%'
+        SQL
       end
       break if blocked.positive?
-      raise "no lock request ever blocked" if Time.now > deadline
+      raise "the click never blocked on a partition row lock" if Time.now > deadline
 
       sleep 0.02
     end

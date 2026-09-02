@@ -19,7 +19,7 @@ See `README.md` for the API and examples.
 v0.1 (on master). The whole main flow is implemented and tested.
 What's pending lives in `IDEAS.md` with the rationale.
 
-334 runs / 835 assertions. `bundle exec rake test` from the root.
+336 runs / 841 assertions. `bundle exec rake test` from the root.
 A mutation battery guards the tests themselves: `bundle exec rake
 mutations:all` (see `test/mutations/README.md`, and "Fixing a defect"
 below).
@@ -377,7 +377,17 @@ dispatch_policy_policy_settings               one row per policy — pause flag
   The registry is module state, so `start_heartbeat` drops everything it
   inherited when `Process.pid` changes: a fork copies the ids but not the
   thread, and a child beating its parent's jobs keeps rows fresh that
-  nothing will ever release.
+  nothing will ever release. It maps an id to the SEQUENCE NUMBERS of the
+  executions registered under it, not to `true`, and both halves earn
+  their keep: ActiveJob reuses the job_id across retries, so a retry that
+  registers while a beat is in flight would be pruned by the answer to a
+  question about its predecessor; and at-least-once delivery can put two
+  deliveries of one job on one worker, where `stop_heartbeat` on the first
+  would otherwise silence the second. A thread per execution could do
+  neither — both are the price of the shared thread, and both are paid
+  here. One uncaught error is the third: the loop rescues PER CYCLE and
+  retries, because exiting costs every running job in the process and only
+  a NEW registration would reinstall it.
 - **Adaptive's feedback signal is the queue wait between admission and
   perform, measured end to end by the database.**
   `InflightTracker.lookup_admission` reads the inflight row the Tick
@@ -545,13 +555,13 @@ http://localhost:3000/                       # forms to enqueue
 http://localhost:3000/dispatch_policy        # dashboard
 
 # Tests
-bundle exec rake test                        # 334 runs / 835 assertions
+bundle exec rake test                        # 336 runs / 841 assertions
 
 # Mutation battery — breaks each load-bearing line and checks a test
 # notices. Slow (one full suite per mutation). See test/mutations/README.md.
 bundle exec rake mutations:list              # the catalogue, no work done
 bundle exec rake mutations:check             # do the find-strings still match? (seconds)
-bundle exec rake mutations:all               # 53 mutations, 52 must be caught
+bundle exec rake mutations:all               # 55 mutations, 54 must be caught
 FILTER=19 bundle exec rake mutations:all     # one of them
 
 # When you add a column or table:

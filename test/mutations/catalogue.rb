@@ -743,6 +743,31 @@ module DispatchPolicy
       '      Repository.set_partitions_status!(policy_name: @policy_name, status: "paused")'
     ].join("\n")
   },
+  {
+    id:    '55',
+    label: 'heartbeat: pruning ignores a re-registration',
+    # ActiveJob keeps the job_id across retries, so "the same id leaves and comes
+    # back" is what retry_on does. Pruned on a snapshot taken before the beat, the
+    # retry never beats again and the sweeper deletes its row while it runs.
+    caught_by: 'inflight_tracker_heartbeat_test',
+    file:  'lib/dispatch_policy/inflight_tracker.rb',
+    find:  '              gone.each { |id| heartbeat_ids.delete(id) if heartbeat_ids[id] == snapshot[id] }',
+    replace: '              gone.each { |id| heartbeat_ids.delete(id) }'
+  },
+  {
+    id:    '56',
+    label: 'heartbeat: the registry counts ids, not executions',
+    # At-least-once delivery can put two deliveries of one job on the same worker.
+    # A thread per execution could not stop its sibling's heartbeat; one shared
+    # registry can, unless it counts executions.
+    caught_by: 'inflight_tracker_heartbeat_test',
+    file:  'lib/dispatch_policy/inflight_tracker.rb',
+    find:  [
+      '        seqs.delete(token.seq)',
+      '        heartbeat_ids.delete(token.active_job_id) if seqs.empty?'
+    ].join("\n"),
+    replace: '        heartbeat_ids.delete(token.active_job_id)'
+  },
     ].freeze
   end
 end

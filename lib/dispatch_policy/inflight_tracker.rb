@@ -353,8 +353,35 @@ module DispatchPolicy
 
     HEARTBEAT_THREAD_NAME = "dispatch_policy.heartbeat"
 
+    # What `start_heartbeat` hands back and `stop_heartbeat` takes. NOT the
+    # active_job_id: the registry maps an id to the sequence numbers of the
+    # EXECUTIONS currently registered under it, and both halves of that
+    # matter.
+    #
+    # A count, because an id is not unique in time OR in parallel. At-least-once
+    # delivery can put two deliveries of one job on the same worker, and
+    # `stop_heartbeat` on the first would otherwise unregister the second —
+    # a regression this rewrite introduced, since a thread per execution
+    # could not do that to its sibling. (Their inflight ROW is shared
+    # either way, which is an older and larger problem: `insert_inflight!`
+    # is ON CONFLICT DO NOTHING and `delete_inflight!` keys on
+    # active_job_id, so the first to finish deletes the other's row too.
+    # Fixing that needs a per-execution key in the forwarded payload.)
+    #
+    # A sequence, because ActiveJob KEEPS the job_id across retries, so
+    # "the same id leaves and comes back" is not exotic — it is what
+    # `retry_on` does. The beat's pruning compares against a snapshot taken
+    # before the UPDATE, and without a sequence a retry that registers in
+    # that window is pruned by the answer to a question about its
+    # predecessor: the live execution then never beats again, and
+    # `inflight_stale_after` later has the sweeper delete its row while it
+    # runs. Reproduced by widening the beat, with the loop, the snapshot
+    # and the pruning untouched.
+    Registration = Struct.new(:active_job_id, :seq)
+
     @heartbeat_mutex  = Mutex.new
     @heartbeat_ids    = {}
+    @heartbeat_seq    = 0
     @heartbeat_thread = nil
     @heartbeat_pid    = nil
 
@@ -370,10 +397,11 @@ module DispatchPolicy
 
       heartbeat_mutex.synchronize do
         forget_inherited_registrations!
-        heartbeat_ids[active_job_id] = true
+        @heartbeat_seq += 1
+        (heartbeat_ids[active_job_id] ||= []) << @heartbeat_seq
         ensure_heartbeat_thread
+        Registration.new(active_job_id, @heartbeat_seq)
       end
-      active_job_id
     end
 
     # Caller holds heartbeat_mutex.
@@ -396,7 +424,13 @@ module DispatchPolicy
     def self.stop_heartbeat(token)
       return if token.nil?
 
-      heartbeat_mutex.synchronize { heartbeat_ids.delete(token) }
+      heartbeat_mutex.synchronize do
+        seqs = heartbeat_ids[token.active_job_id]
+        next if seqs.nil?
+
+        seqs.delete(token.seq)
+        heartbeat_ids.delete(token.active_job_id) if seqs.empty?
+      end
     end
 
     # Caller holds heartbeat_mutex.
@@ -444,7 +478,12 @@ module DispatchPolicy
 
           sleep_interval(interval)
 
-          ids = heartbeat_mutex.synchronize { heartbeat_ids.keys }
+          # The snapshot carries the sequence numbers, not just the ids:
+          # the pruning below has to be able to tell "this id is gone" from
+          # "this id left and a retry registered it again while the beat
+          # was in flight".
+          snapshot = heartbeat_mutex.synchronize { heartbeat_ids.transform_values(&:dup) }
+          ids = snapshot.keys
           if ids.empty?
             break if retire? { heartbeat_ids.empty? }
 
@@ -465,7 +504,15 @@ module DispatchPolicy
           next if alive.nil?
 
           gone = ids - alive
-          heartbeat_mutex.synchronize { gone.each { |id| heartbeat_ids.delete(id) } } if gone.any?
+          if gone.any?
+            heartbeat_mutex.synchronize do
+              # Only when nothing re-registered in the meantime. Otherwise
+              # a retry that arrived while the UPDATE was in flight is
+              # unregistered by the answer to a question about the
+              # execution it replaced.
+              gone.each { |id| heartbeat_ids.delete(id) if heartbeat_ids[id] == snapshot[id] }
+            end
+          end
         rescue StandardError => e
           DispatchPolicy.config.logger&.warn(
             "[dispatch_policy] heartbeat cycle failed, retrying in " \

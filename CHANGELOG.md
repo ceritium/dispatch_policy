@@ -136,7 +136,11 @@
   cycle, so changing `inflight_heartbeat_interval` (0 to disable) takes
   effect without restarting the process, and the registry is dropped when
   the process id changes so a forked child does not keep the inflight rows
-  of its parent's jobs alive.
+  of its parent's jobs alive. The registry counts EXECUTIONS rather than
+  job ids — ActiveJob reuses the job_id across retries, and at-least-once
+  delivery can put two deliveries of one job on one worker — and the loop
+  survives a failing cycle instead of exiting, since with one thread an
+  uncaught error costs every running job in the process rather than one.
 
   **This needs one connection in the pool above the worker's thread
   count**, and that is now stated as a requirement rather than as
