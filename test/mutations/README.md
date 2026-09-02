@@ -2,10 +2,31 @@
 
 ```bash
 bundle exec rake mutations:list          # the catalogue, no work done
-bundle exec rake mutations:all           # 33 mutations, 32 must be caught (slow: one suite each)
+bundle exec rake mutations:check         # do the find-strings still match? (seconds)
+bundle exec rake mutations:all           # 58 mutations, 57 must be caught (slow: one suite each)
 FILTER=19 bundle exec rake mutations:all # one mutation
 FILTER=forwarder bundle exec rake mutations:all
 ```
+
+The count above goes stale the moment somebody adds an entry, so treat it
+as a smell test rather than a contract: `mutations:list` is the answer.
+What is NOT optional is `mutations:check` — editing a line an existing
+mutation already breaks stales that entry silently, and a stale entry
+proves nothing while reading exactly like a passing one. Four went stale
+in one sitting on the branch that added this task.
+
+Two ways a mutation can look fine and mean nothing, both of which have
+happened here:
+
+- **CAUGHT alone, SURVIVED in a full run.** That is a test with a timing
+  window, not a flaky runner. A test that COUNTED how many statements the
+  heartbeat issued passed against a per-statement implementation, because
+  the subscriber wakes the asserting thread on the first one. Assert
+  something with no window.
+- **NO RESULT.** Almost always a test that HANGS under its own mutation
+  rather than failing: an unbounded `Queue#pop` waiting for a signal the
+  broken code never sends. Bound every wait in a test that drives a
+  thread, and make the timeout `flunk` with a message.
 
 Needs Postgres, like the integration suite. `MUTATION_DB` overrides the
 database (do it if two people run at once — a shared one produces

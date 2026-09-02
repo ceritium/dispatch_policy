@@ -88,6 +88,14 @@
   than per enqueue, and a 20-second stress run against a concurrent
   byte-ordered writer produced none either way.
 
+- **The dashboard's metrics windows read the clock that writes them.**
+  `tick_samples.sampled_at` was written by Postgres `now()` while all five
+  of its readers — the 1m/5m/15m summaries, the sparkline, the denial
+  breakdown and the retention sweep — bound on a Ruby `Time`. The same
+  mismatch as the scheduled-work one, in mirror image: on a session west
+  of UTC every sample lands hours in the past and the dashboard shows an
+  idle tick loop; east of it, samples never age out.
+
 - **`StagedJob.due` reads the same clock as the claim.** It is the scope
   the drain button counts what is left with, and on a session whose
   TimeZone is not what Rails wrote with, it counted rows the claim will

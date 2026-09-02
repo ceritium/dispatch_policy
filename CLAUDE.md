@@ -19,7 +19,7 @@ See `README.md` for the API and examples.
 v0.1 (on master). The whole main flow is implemented and tested.
 What's pending lives in `IDEAS.md` with the rationale.
 
-336 runs / 841 assertions. `bundle exec rake test` from the root.
+338 runs / 846 assertions. `bundle exec rake test` from the root.
 A mutation battery guards the tests themselves: `bundle exec rake
 mutations:all` (see `test/mutations/README.md`, and "Fixing a defect"
 below).
@@ -149,10 +149,11 @@ dispatch_policy_policy_settings               one row per policy — pause flag
   timestamptz) reinterprets the stored value in the SESSION TimeZone. That
   is correct only while the session agrees with whatever wrote the value.
   Postgres-written columns (`next_eligible_at`, `last_checked_at`,
-  `failed_at`, `heartbeat_at`, `sampled_at`) are written by `now()` on the
-  same footing, so they are read with `now()`. Application-written ones —
-  `staged_jobs.scheduled_at` and the `scheduled_eligible_at` horizon
-  derived from it — are bound from Ruby and serialized by `quoted_date`,
+  `failed_at`, `heartbeat_at`) are written by `now()` on the same footing,
+  so they are read with `now()`. Application-written ones —
+  `staged_jobs.scheduled_at`, the `scheduled_eligible_at` horizon derived
+  from it, and `tick_samples.sampled_at` — are bound from Ruby and
+  serialized by `quoted_date`,
   so they are compared against a BOUND `Repository.app_clock` (which is
   `config.now`, coerced — `config.clock` is public API and may hand back an
   epoch Float, which every other reader accepts via `.to_f` and Postgres
@@ -162,7 +163,14 @@ dispatch_policy_policy_settings               one row per policy — pause flag
   drain again" about rows the claim will not take. Mixing them needs no misconfiguration to be wrong, just a host
   that sets `variables: { timezone: … }` in database.yml, and then
   `set(wait:)` fires early on a zone east of UTC and never on one west of
-  it, with no trace in any metric (A11). The same rule applies outside
+  it, with no trace in any metric (A11). `sampled_at` is on this list
+  because it was MOVED here: it used to be written by `now()` and read by
+  five different Ruby-bounded windows, so on a session west of UTC every
+  sample landed ten hours in the past and the dashboard showed an idle
+  tick loop. An earlier version of this very paragraph listed it as
+  Postgres-written and safe, which is how a reviewer found it — the list
+  is only worth having if each entry has actually been checked. The same
+  rule applies outside
   SQL: the adaptive gate's `queue_lag` is computed BY THE DATABASE
   (`clock_timestamp()::timestamp - admitted_at`) rather than subtracted
   from the worker's `Time.current`, because those are two machines' clocks
@@ -555,13 +563,13 @@ http://localhost:3000/                       # forms to enqueue
 http://localhost:3000/dispatch_policy        # dashboard
 
 # Tests
-bundle exec rake test                        # 336 runs / 841 assertions
+bundle exec rake test                        # 338 runs / 846 assertions
 
 # Mutation battery — breaks each load-bearing line and checks a test
 # notices. Slow (one full suite per mutation). See test/mutations/README.md.
 bundle exec rake mutations:list              # the catalogue, no work done
 bundle exec rake mutations:check             # do the find-strings still match? (seconds)
-bundle exec rake mutations:all               # 55 mutations, 54 must be caught
+bundle exec rake mutations:all               # 58 mutations, 57 must be caught
 FILTER=19 bundle exec rake mutations:all     # one of them
 
 # When you add a column or table:

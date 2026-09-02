@@ -237,15 +237,24 @@ class PauseLockOrderTest < DispatchPolicy::IntegrationTest
   end
 
   # The other half, and the one that turns a lock into an outage if it is
-  # wrong: the lock is held on the CONNECTION, so a click that forgets to
-  # release it refuses every later click on that connection for the life of
-  # the process.
+  # wrong: a session advisory lock outlives the request that took it, so a
+  # click that forgets to release it leaves a backend holding it for the
+  # life of the process.
+  #
+  # Clicking repeatedly does NOT test that, which is the trap this fell
+  # into first: advisory locks are RE-ENTRANT within a session, so the
+  # same pooled connection re-acquires its own leaked lock happily and
+  # every later click succeeds. Ask the database what it is holding
+  # instead — that has no such escape.
   def test_the_lock_is_released_so_the_next_click_works
     2.times do
       assert_equal "Policy paused.", run_action(:pause).last[:notice]
       assert_equal "Policy resumed.", run_action(:resume).last[:notice]
     end
     refute DispatchPolicy::PolicySetting.for_policy(POLICY).pick(:paused)
+    assert_equal 0, advisory_locks_held,
+                 "the click left its session lock behind; every later click on that " \
+                 "connection is refused for the life of the process"
   end
 
   private
@@ -257,6 +266,22 @@ class PauseLockOrderTest < DispatchPolicy::IntegrationTest
     Timeout.timeout(15) { queue.pop }
   rescue Timeout::Error
     flunk "the lock holder never reported: neither acquired nor refused"
+  end
+
+  def advisory_locks_held
+    cls = Integer(DispatchPolicy::Repository::PAUSE_LOCK_CLASS)
+    obj = Integer(DispatchPolicy::Repository.policy_lock_id(POLICY))
+    ActiveRecord::Base.connection_pool.with_connection do |c|
+      # Scoped to THIS database. pg_locks is cluster-wide, and a leaked
+      # advisory lock in someone else's database has the same (classid,
+      # objid) — the same trap that made the deadlock test's gate disarm
+      # itself, arriving here as a false FAILURE instead.
+      c.select_value(
+        "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' " \
+        "AND classid = #{cls} AND objid = #{obj} " \
+        "AND database = (SELECT oid FROM pg_database WHERE datname = current_database())"
+      ).to_i
+    end
   end
 
   def ordering_step?(name)

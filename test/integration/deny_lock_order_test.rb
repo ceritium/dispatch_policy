@@ -157,6 +157,27 @@ class DenyLockOrderTest < DispatchPolicy::IntegrationTest
     assert_equal 0, DispatchPolicy::Partition.for_policy(POLICY).count
   end
 
+  # The ordered CTE introduced a failure the single `DELETE … WHERE` could
+  # not have: a wrong or incomplete join back to the victims. Dropping
+  # `AND d.partition_key = v.partition_key` makes the sweep delete EVERY
+  # partition of the policy as soon as ONE of them is collectable —
+  # destroying the token buckets and pending counts of partitions that
+  # still hold work, which is M11's quota reset with a bigger blast
+  # radius. Nothing else in the suite exercises the join.
+  def test_the_sweep_deletes_only_the_partitions_it_selected
+    DispatchPolicy::Repository.connection.execute(
+      "UPDATE dispatch_policy_partitions SET pending_count = 0, " \
+      "created_at = now() - interval '2 hours', last_admit_at = NULL " \
+      "WHERE partition_key = 'Acme'"
+    )
+
+    DispatchPolicy::Repository.sweep_inactive_partitions!(cutoff_seconds: 60, policy_name: POLICY)
+
+    assert_equal %w[acct:10 acct:1:eu],
+                 DispatchPolicy::Partition.for_policy(POLICY).order(:partition_key).pluck(:partition_key),
+                 "only the drained partition was collectable; the other two still hold work"
+  end
+
   # One bind per held partition and one transaction over all of them:
   # Postgres caps parameters at 65,535, and holding FOR UPDATE on every
   # row for the whole loop was measured at ~0.5s on 2,500 partitions with

@@ -1101,6 +1101,20 @@ module DispatchPolicy
     # Records one row per Tick.run with admission and timing aggregates so the
     # operator UI can display rates over time without sampling on the read
     # path.
+    # `sampled_at` is written from the APPLICATION clock, not `now()`.
+    #
+    # Every reader of this column is an application-supplied window —
+    # `sample_filter`, `tick_summaries_by_policy`,
+    # `top_denied_reason_by_policy`, `tick_samples_buckets`, and the
+    # retention sweep — all comparing against a Ruby `Time`. Written with
+    # `now()` it would land in the SESSION TimeZone while those bounds are
+    # serialized by `quoted_date`, so under a host that sets
+    # `variables: { timezone: … }` in database.yml the dashboard's 1m/5m/15m
+    # windows would be off by the offset: empty in one direction, and
+    # everything-for-hours in the other. Same mismatch as A11, in mirror
+    # image — there the column was app-written and read with `now()`.
+    # CLAUDE.md listed this column among the Postgres-written ones, which
+    # was simply wrong, and is what a reviewer caught.
     def record_tick_sample!(policy_name:, duration_ms:, partitions_seen:, partitions_admitted:,
                             partitions_denied:, jobs_admitted:, forward_failures:,
                             pending_total:, inflight_total:, denied_reasons:)
@@ -1110,12 +1124,13 @@ module DispatchPolicy
             (policy_name, sampled_at, duration_ms, partitions_seen, partitions_admitted,
              partitions_denied, jobs_admitted, forward_failures, pending_total,
              inflight_total, denied_reasons)
-          VALUES ($1, now(), $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb)
+          VALUES ($1, $11, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb)
         SQL
         "record_tick_sample",
         [policy_name, duration_ms.to_i, partitions_seen.to_i, partitions_admitted.to_i,
          partitions_denied.to_i, jobs_admitted.to_i, forward_failures.to_i,
-         pending_total.to_i, inflight_total.to_i, JSON.dump(denied_reasons || {})]
+         pending_total.to_i, inflight_total.to_i, JSON.dump(denied_reasons || {}),
+         app_clock]
       )
     end
 
@@ -1524,11 +1539,12 @@ module DispatchPolicy
 
     # ----- tick samples sweep -------------------------------------------------
 
+    # On the application clock, because that is what writes `sampled_at`.
     def sweep_old_tick_samples!(cutoff_seconds:)
       connection.exec_query(
-        "DELETE FROM #{SAMPLES_TABLE} WHERE sampled_at < now() - ($1 || ' seconds')::interval",
+        "DELETE FROM #{SAMPLES_TABLE} WHERE sampled_at < $2::timestamp - ($1 || ' seconds')::interval",
         "sweep_old_tick_samples",
-        [cutoff_seconds.to_i]
+        [cutoff_seconds.to_i, app_clock]
       )
     end
 

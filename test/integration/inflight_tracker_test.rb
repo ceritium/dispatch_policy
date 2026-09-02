@@ -168,9 +168,15 @@ class InflightTrackerHeartbeatTest < DispatchPolicy::IntegrationTest
     ids = %w[keep-1 keep-2]
     tokens = ids.map { |id| DispatchPolicy::InflightTracker.start_heartbeat(id) }
 
+    # TWO beats, because one proves nothing: the pruning happens after
+    # `beat!` returns, so asserting off the first would race it. And each
+    # wait is BOUNDED — under the mutation this exists for, the first beat
+    # empties the registry, the loop retires, and a bare `pop` would hang
+    # the whole battery instead of failing it (the runner scores that
+    # NO RESULT, which its own README says must never count as a pass).
     attempts = Queue.new
     DispatchPolicy::InflightTracker.stub(:beat!, ->(_) { attempts << true; nil }) do
-      2.times { attempts.pop }
+      2.times { await(attempts, "the loop stopped beating: the registry was emptied") }
     end
 
     assert_equal ids.sort, DispatchPolicy::InflightTracker.heartbeat_ids.keys.sort,

@@ -138,6 +138,27 @@ class ScheduledClockTest < DispatchPolicy::IntegrationTest
     assert_equal 1, claim_staged.size
   end
 
+  # The mirror image of A11, and the one CLAUDE.md got wrong: `sampled_at`
+  # was written by Postgres `now()` while every reader of it — the
+  # dashboard's 1m/5m/15m windows, the sparkline, the denial breakdown and
+  # the retention sweep — bounds on a Ruby `Time`. On a session west of
+  # UTC the sample lands ten hours in the past and the dashboard shows an
+  # idle tick loop; east of UTC it never ages out.
+  def test_a_tick_sample_written_on_a_skewed_session_is_still_in_the_window
+    session_timezone(WEST)
+    DispatchPolicy::Repository.record_tick_sample!(
+      policy_name: POLICY, duration_ms: 5, partitions_seen: 1, partitions_admitted: 1,
+      partitions_denied: 0, jobs_admitted: 3, forward_failures: 0,
+      pending_total: 0, inflight_total: 0, denied_reasons: {}
+    )
+
+    summary = DispatchPolicy::Repository.tick_summary(policy_name: POLICY, since: Time.now.utc - 60)
+    assert_equal 1, summary[:ticks],
+                 "the tick that just ran must appear in the last minute, whatever the " \
+                 "session TimeZone is"
+    assert_equal 3, summary[:jobs_admitted]
+  end
+
   # `defer_partition_to_next_scheduled!` reads the same column from both
   # ends: MIN over rows still in the future, and a NOT EXISTS guard over
   # rows already due. On a skewed session both answers move together — the

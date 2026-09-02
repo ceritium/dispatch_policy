@@ -768,6 +768,41 @@ module DispatchPolicy
     ].join("\n"),
     replace: '        heartbeat_ids.delete(token.active_job_id)'
   },
+  {
+    id:    '57',
+    label: 'partition sweep: victims joined on policy alone',
+    # The ordered CTE introduced a failure the single DELETE...WHERE could not
+    # have. Without the key in the join the sweep deletes EVERY partition of the
+    # policy as soon as one is collectable — M11's quota reset, wholesale.
+    caught_by: 'deny_lock_order_test',
+    file:  'lib/dispatch_policy/repository.rb',
+    find:  '          WHERE d.policy_name = v.policy_name AND d.partition_key = v.partition_key',
+    replace: '          WHERE d.policy_name = v.policy_name'
+  },
+  {
+    id:    '58',
+    label: 'tick samples: sampled_at back on the session clock',
+    # Every reader of this column bounds on a Ruby Time. Written with now() it
+    # lands in the session TimeZone, and the dashboard's windows are then off by
+    # the offset: an idle-looking tick loop, or samples that never age out.
+    caught_by: 'scheduled_clock_test',
+    file:  'lib/dispatch_policy/repository.rb',
+    find:  '          VALUES ($1, $11, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb)',
+    replace: '          VALUES ($1, now(), $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb)'
+  },
+  {
+    id:    '59',
+    label: 'pause lock: released, but nothing checks the database',
+    # Advisory locks are RE-ENTRANT within a session, so a test that just clicks
+    # again passes with the unlock deleted — the same pooled connection
+    # re-acquires its own leaked lock. Only asking the database catches it.
+    caught_by: 'pause_lock_order_test',
+    file:  'lib/dispatch_policy/repository.rb',
+    find:  '        connection.select_value(' + "\n" +
+           '          "SELECT pg_advisory_unlock(#{Integer(PAUSE_LOCK_CLASS)}, #{Integer(objid)})"' + "\n" +
+           '        )',
+    replace: '        nil'
+  },
     ].freeze
   end
 end
