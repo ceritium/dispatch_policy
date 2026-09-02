@@ -28,6 +28,23 @@ happened here:
   broken code never sends. Bound every wait in a test that drives a
   thread, and make the timeout `flunk` with a message.
 
+A timeout is not free, which is why the runner cleans up after one. It
+kills the whole process GROUP — `bundle exec rake test` is three processes
+deep and killing only the pid we hold leaves the grandchild running
+(measured at 36 orphaned `rake_test_loader` processes after a session with
+several timeouts) — and it terminates whatever is still connected to
+`MUTATION_DB`, because a hanging test can be holding a SESSION-level
+advisory lock and one NO RESULT would otherwise make every later mutation
+score NO RESULT too.
+
+Never reach for `pkill -9` on a pattern to clean up after a run. A pattern
+that matches a Postgres BACKEND takes the whole local cluster into crash
+recovery — SIGKILL on a backend makes the postmaster assume shared memory
+is corrupt and reset every connection. That happened here. Use
+`psql -d postgres -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity
+WHERE datname = 'yours'"`, which asks the backend to exit cleanly and
+release its locks.
+
 Needs Postgres, like the integration suite. `MUTATION_DB` overrides the
 database (do it if two people run at once — a shared one produces
 failures that belong to neither run) and `MUTATION_TIMEOUT` the per-suite

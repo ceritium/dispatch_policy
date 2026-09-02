@@ -77,6 +77,33 @@ module DispatchPolicy
         end
       end
 
+      # SIGKILL the whole group, never a pattern. `pkill -9 -f <something>`
+      # matched a Postgres BACKEND once during this project's review and
+      # took the entire local cluster into crash recovery: killing a
+      # backend with SIGKILL makes the postmaster assume shared memory is
+      # corrupt and reset every connection. Address the group we spawned.
+      def kill_process_group(pid)
+        Process.kill("KILL", -Process.getpgid(pid))
+      rescue StandardError
+        begin
+          Process.kill("KILL", pid)
+        rescue StandardError
+          nil
+        end
+      end
+
+      # Terminate whatever is still connected to the mutation database.
+      # `pg_terminate_backend` asks the backend to exit cleanly, releasing
+      # its session locks — the opposite of SIGKILL, which is what makes it
+      # safe to use here.
+      def reap_database_backends!
+        system("psql", "-d", "postgres", "-tAc",
+               "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '#{DB}'",
+               out: File::NULL, err: File::NULL)
+      rescue StandardError
+        nil
+      end
+
       def select(filter)
         return ALL if filter.nil? || filter.empty?
 
@@ -138,24 +165,39 @@ module DispatchPolicy
         out = +""
         timed_out = false
         Bundler.with_unbundled_env do
+          # Its own process GROUP, so the timeout below can kill the whole
+          # tree. `bundle exec rake test` is three processes deep — bundle,
+          # rake, and the rake_test_loader that actually runs minitest —
+          # and killing only the pid we hold leaves the grandchild running:
+          # measured at 36 orphaned rake_test_loader processes after a
+          # session with several timeouts, each still holding its database
+          # connections and competing for the machine with every later
+          # mutation.
           Open3.popen2e({ "DB_NAME" => DB, "DISPATCH_POLICY_REQUIRE_DB" => "1" },
-                        "bundle", "exec", "rake", "test", chdir: tree) do |stdin, oe, wait|
+                        "bundle", "exec", "rake", "test",
+                        chdir: tree, pgroup: true) do |stdin, oe, wait|
             stdin.close
             reader = Thread.new { out << oe.read }
             if wait.join(TIMEOUT)
               reader.join
             else
               timed_out = true
-              begin
-                Process.kill("KILL", wait.pid)
-              rescue StandardError
-                nil
-              end
+              kill_process_group(wait.pid)
               reader.kill
             end
           end
         end
-        return { ran: false, green: false, summary: "timed out after #{TIMEOUT}s" } if timed_out
+        if timed_out
+          # A timed-out suite is usually a test that HANGS under the
+          # mutation rather than failing, and a hanging test can be holding
+          # a SESSION-level advisory lock (the pause button takes one). The
+          # backend keeps that lock as long as it lives, so the next run
+          # against this database blocks on it and times out too — one
+          # NO RESULT turns into every subsequent mutation scoring
+          # NO RESULT, with nothing saying why. Clear the room.
+          reap_database_backends!
+          return { ran: false, green: false, summary: "timed out after #{TIMEOUT}s" }
+        end
 
         line = out[/^\d+ runs, \d+ assertions, \d+ failures, \d+ errors.*$/]
         unless line
