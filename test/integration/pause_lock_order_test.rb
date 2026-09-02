@@ -54,15 +54,16 @@ class PauseLockOrderTest < DispatchPolicy::IntegrationTest
   # byte-ascending it is waiting on LO holding nothing, so HI is free and
   # both finish.
   def test_pausing_under_a_concurrent_bulk_enqueue_does_not_deadlock
-    errors = []
-    grabbed_lo = Queue.new
+    errors      = []
+    grabbed_lo  = Queue.new
+    clicker_pid = Queue.new
 
     enqueuer = Thread.new do
       ActiveRecord::Base.connection_pool.with_connection do |conn|
         conn.transaction do
           lock_row(conn, KEY_LO)
           grabbed_lo << true
-          wait_for_the_click_to_block!
+          wait_until_blocked!(conn, clicker_pid.pop)
           lock_row(conn, KEY_HI)
         end
       end
@@ -73,7 +74,8 @@ class PauseLockOrderTest < DispatchPolicy::IntegrationTest
     grabbed_lo.pop
 
     clicker = Thread.new do
-      ActiveRecord::Base.connection_pool.with_connection do
+      ActiveRecord::Base.connection_pool.with_connection do |conn|
+        clicker_pid << conn.select_value("SELECT pg_backend_pid()").to_i
         DispatchPolicy::Repository.set_policy_paused!(policy_name: POLICY, paused: true)
         DispatchPolicy::Repository.set_partitions_status!(policy_name: POLICY, status: "paused")
       end
@@ -244,6 +246,39 @@ class PauseLockOrderTest < DispatchPolicy::IntegrationTest
     controller.define_singleton_method(:redirect_to) { |*, **kwargs| redirects << kwargs }
     controller.public_send(action)
     redirects
+  end
+
+  def lock_row(conn, key)
+    conn.exec_query(
+      "SELECT 1 FROM dispatch_policy_partitions WHERE policy_name = $1 AND partition_key = $2 FOR UPDATE",
+      "bulk_enqueue_lock", [POLICY, key]
+    )
+  end
+
+  # Blocks until the CLICK's own backend is waiting on somebody's lock.
+  # Deterministic where a sleep is not: too short a sleep lets the click
+  # finish before the enqueuer reaches for HI, and the test then passes
+  # against the bug.
+  #
+  # It asks about ONE pid, deliberately. The obvious gates are all
+  # cluster-wide and disarm silently: `pg_locks WHERE NOT granted` is
+  # satisfied by any backend anywhere waiting on anything — an orphan from
+  # a killed run in an unrelated database did exactly that here, and the
+  # test passed against the bug eight times out of eight. Narrowing it to
+  # this database and a query mentioning the partitions table is not
+  # enough either: that matches on TEXT, so a developer's psql session
+  # blocked on anything, whose statement happens to name the table, re-arms
+  # the same failure. `pg_blocking_pids` names who is blocking THIS
+  # backend, and nothing else in the cluster can satisfy it.
+  def wait_until_blocked!(conn, pid)
+    deadline = Time.now + 10
+    loop do
+      blocked = conn.select_value("SELECT cardinality(pg_blocking_pids(#{Integer(pid)})) > 0")
+      break if blocked == true || blocked == "t"
+      raise "the click never blocked on a partition row lock" if Time.now > deadline
+
+      sleep 0.02
+    end
   end
 
   def lock_row(conn, key)
