@@ -564,6 +564,11 @@ http://localhost:3000/dispatch_policy        # dashboard
 
 # Tests
 bundle exec rake test                        # 338 runs / 846 assertions
+# DB_NAME picks the database (default dispatch_policy_test). Use it whenever
+# anything else might be running the suite: every integration case TRUNCATEs
+# the gem's tables in setup, so two runs on one database produce failures
+# that belong to neither of them — measured today as a partition count read
+# mid-flip, reported as a defect, and green in isolation.
 
 # Mutation battery — breaks each load-bearing line and checks a test
 # notices. Slow (one full suite per mutation). See test/mutations/README.md.
