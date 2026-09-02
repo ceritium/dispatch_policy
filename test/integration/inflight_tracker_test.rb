@@ -202,7 +202,7 @@ class InflightTrackerHeartbeatTest < DispatchPolicy::IntegrationTest
 
     boom = Queue.new
     DispatchPolicy::InflightTracker.stub(:beat!, ->(_) { boom << true; raise "cycle exploded" }) do
-      boom.pop
+      await(boom, "the loop never reached a beat")
     end
 
     deadline = Time.now + 8
@@ -239,7 +239,11 @@ class InflightTrackerHeartbeatTest < DispatchPolicy::IntegrationTest
 
     slow_beat = lambda do |_ids|
       in_beat << true
-      proceed.pop
+      # Bounded even here, in the heartbeat thread: an unbounded wait
+      # leaves the thread parked forever if the test dies first, and the
+      # next test's "exactly one thread" assertion then fails for an
+      # unrelated reason.
+      Timeout.timeout(15) { proceed.pop }
       [] # the row of the execution that FINISHED is gone
     end
 

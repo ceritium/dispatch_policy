@@ -64,7 +64,7 @@ class PauseLockOrderTest < DispatchPolicy::IntegrationTest
         conn.transaction do
           lock_row(conn, KEY_LO)
           grabbed_lo << true
-          wait_until_blocked!(conn, clicker_pid.pop)
+          wait_until_blocked!(conn, await(clicker_pid))
           lock_row(conn, KEY_HI)
         end
       end
@@ -72,7 +72,12 @@ class PauseLockOrderTest < DispatchPolicy::IntegrationTest
       errors << ["enqueue", e.class.name]
     end
 
-    grabbed_lo.pop
+    # Bounded, like every other wait in these files. An unbounded pop is
+    # not a slow test, it is a HANG: the runner scores a hanging mutation
+    # NO RESULT, which its own README says must never count as a pass, and
+    # five of this branch's mutations scored exactly that before the waits
+    # were bounded.
+    await(grabbed_lo)
 
     clicker = Thread.new do
       ActiveRecord::Base.connection_pool.with_connection do |conn|
@@ -262,10 +267,10 @@ class PauseLockOrderTest < DispatchPolicy::IntegrationTest
   # Queue#pop(timeout:) is Ruby 3.2 and the gemspec floor is 3.1. A bare
   # pop here is a hang, not a failure, and a hang leaves a backend holding
   # a session-level advisory lock that makes every later run hang too.
-  def await(queue)
+  def await(queue, message = "a thread never reported back")
     Timeout.timeout(15) { queue.pop }
   rescue Timeout::Error
-    flunk "the lock holder never reported: neither acquired nor refused"
+    flunk message
   end
 
   def advisory_locks_held
