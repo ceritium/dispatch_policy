@@ -787,8 +787,23 @@ module DispatchPolicy
     # the offset: an idle-looking tick loop, or samples that never age out.
     caught_by: 'scheduled_clock_test',
     file:  'lib/dispatch_policy/repository.rb',
-    find:  '          VALUES ($1, $11, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb)',
-    replace: '          VALUES ($1, now(), $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb)'
+    find:  [
+      '          VALUES ($1, $11, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb)',
+      '        SQL',
+      '        "record_tick_sample",',
+      '        [policy_name, duration_ms.to_i, partitions_seen.to_i, partitions_admitted.to_i,',
+      '         partitions_denied.to_i, jobs_admitted.to_i, forward_failures.to_i,',
+      '         pending_total.to_i, inflight_total.to_i, JSON.dump(denied_reasons || {}),',
+      '         app_clock]'
+    ].join("\n"),
+    replace: [
+      '          VALUES ($1, now(), $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb)',
+      '        SQL',
+      '        "record_tick_sample",',
+      '        [policy_name, duration_ms.to_i, partitions_seen.to_i, partitions_admitted.to_i,',
+      '         partitions_denied.to_i, jobs_admitted.to_i, forward_failures.to_i,',
+      '         pending_total.to_i, inflight_total.to_i, JSON.dump(denied_reasons || {})]'
+    ].join("\n")
   },
   {
     id:    '59',
