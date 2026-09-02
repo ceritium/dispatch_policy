@@ -61,10 +61,43 @@ inherited the heartbeat registry and beat its parent's jobs, keeping rows
 fresh that nothing would ever release.
 
 Two gaps they found in the tests rather than the code are closed with
-mutations 45-51 (50 in the catalogue), and one they found in the reasoning is recorded above:
+mutations 45-51, and one they found in the reasoning is recorded above:
 `clock_timestamp()` vs `now()` was unpinned by any test even after the
 range fix, because the range closed the "measured after the block" half
 and not the "transaction timestamp" half.
+
+**A second and third round on the same branch** found five more, and all
+of the code ones are the price of collapsing N heartbeat threads into one
+— a price the first fix had not paid:
+
+- an uncaught error EXITED the loop, so one bad cycle stopped every
+  running job in the process being heartbeated, and only a NEW
+  registration reinstalled the thread (a worker full of long jobs produces
+  none). It rescues per cycle and retries now.
+- `next if alive.nil?` was load-bearing and nothing pinned it: nil from
+  `beat!` means the database was unreachable, not that every job finished,
+  and reading it as an empty survivor list unregisters every running job
+  on ONE transient failure, permanently.
+- the registry mapped an id to `true`. ActiveJob reuses the job_id across
+  retries, so a retry registering while a beat was in flight was pruned by
+  the answer to a question about its predecessor; and two deliveries of
+  one job on one worker shared an entry, so stopping the first silenced
+  the second. It maps an id to the sequence numbers of the executions
+  under it now.
+
+Plus two in the tests. The deadlock test's gate polled
+`pg_locks WHERE NOT granted`, which is CLUSTER-wide: any backend anywhere
+satisfied it, so the enqueuer reached for the second key before the click
+was near it and the test passed against the bug. Rescoped to this
+database, this table and a backend that is not us — and that version then
+needs `pg_stat_clear_snapshot()`, because the poll runs inside the
+enqueuer's open transaction and Postgres caches pg_stat_activity for the
+life of one. With both, reverting the lock order fails the test with
+`ActiveRecord::Deadlocked`, which is what it always claimed to do. And
+`rake mutations:check` exists now: four catalogue entries went stale in a
+single sitting, each because a fix edited a line an older mutation already
+breaks, and a stale entry proves nothing while reading exactly like a
+passing one.
 
 ## P1 — Pausing a policy deadlocks against an ordinary bulk enqueue
 
