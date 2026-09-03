@@ -902,14 +902,18 @@ module DispatchPolicy
             "SELECT pg_advisory_unlock(#{Integer(PAUSE_LOCK_CLASS)}, #{Integer(objid)})"
           )
         rescue StandardError => e
-          # Do not let the release replace the caller's exception. The one
-          # way this raises is a connection already in an aborted
-          # transaction — which needs a HOST that wraps the action in one,
-          # since the gem's controller does not — and there the unlock
-          # cannot run at all, so this rescue buys the real error message
-          # back and NOT the release: the lock stays held until that
-          # backend goes away. Being loud about it is the most this layer
-          # can do; see CLAUDE.md's pause bullet for what a held lock does.
+          # Do not let the release replace the caller's exception.
+          #
+          # The case this was written for is a connection already in an
+          # aborted transaction — which needs a HOST that wraps the action
+          # in one, since the gem's controller does not — and there the
+          # unlock cannot run at all: this rescue buys the real error
+          # message back and NOT the release, so the lock stays held until
+          # that backend goes away. It is not the only way to get here
+          # (a dropped connection, a statement timeout, a shutdown mid-
+          # request will do), and in some of those the lock is already
+          # gone with the session. The log says what it costs IF it is
+          # still held, because this layer cannot tell the two apart.
           DispatchPolicy.config.logger&.error(
             "[dispatch_policy] could not release the pause lock for #{policy_name}: " \
             "#{e.class}: #{e.message}. Pause/resume for this policy will be refused on " \
@@ -1395,6 +1399,49 @@ module DispatchPolicy
         oldest_age_seconds: row["oldest_age_seconds"]&.to_f,
         p50_age_seconds:    row["p50_age_seconds"]&.to_f,
         p95_age_seconds:    row["p95_age_seconds"]&.to_f
+      }
+    end
+
+    # The four clock-dependent facts the partition page renders, computed
+    # BY THE DATABASE.
+    #
+    # Three of them read Postgres-written columns — `next_eligible_at`,
+    # `last_checked_at` and `decayed_admits_at` — and the page used to
+    # compare all three against `Time.current`. That is the A10/A11
+    # crossing, and it survived the fix that removed the identical
+    # expression from `Tick#fairness_elapsed`, because a Rails view is
+    # unreachable from this suite: nothing could go red. Measured east of
+    # UTC on a skewed session, the page rendered a decayed-admits EWMA of
+    # 10.00 where the Tick's own sort key was 0.0098, reported a
+    # round-trip age of minus ten hours, and showed no backoff for a
+    # partition the tick provably would not claim for another five minutes.
+    # It is the operator's only view of the numbers admission actually
+    # sorts by.
+    #
+    # `scheduled_eligible_at` is application-written, so it is the one the
+    # view may still compare in Ruby — and it is left there deliberately,
+    # as the reminder that which side a column belongs on is a property of
+    # who WRITES it, not of where it is read.
+    def partition_clock_facts(policy_name:, partition_key:)
+      row = connection.exec_query(
+        <<~SQL.squish,
+          SELECT
+            (next_eligible_at IS NOT NULL AND next_eligible_at > now())      AS in_backoff,
+            EXTRACT(EPOCH FROM (now() - last_checked_at))::float             AS age_seconds,
+            EXTRACT(EPOCH FROM (now() - decayed_admits_at))::float           AS decay_elapsed_seconds,
+            decayed_admits_at IS NOT NULL                                    AS has_decay_stamp
+          FROM #{PARTITIONS_TABLE}
+          WHERE policy_name = $1 AND partition_key = $2
+        SQL
+        "partition_clock_facts",
+        [policy_name, partition_key]
+      ).first || {}
+
+      {
+        in_backoff:            row["in_backoff"] == true || row["in_backoff"] == "t",
+        age_seconds:           row["age_seconds"]&.to_f,
+        decay_elapsed_seconds: row["decay_elapsed_seconds"]&.to_f,
+        has_decay_stamp:       row["has_decay_stamp"] == true || row["has_decay_stamp"] == "t"
       }
     end
 

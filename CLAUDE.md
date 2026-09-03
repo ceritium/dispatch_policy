@@ -154,9 +154,15 @@ dispatch_policy_policy_settings               one row per policy — pause flag
   `decayed_admits_at` means the DATABASE computes the elapsed time the
   Tick's fairness reorder decays by (`claim_partitions` returns it as
   `decay_elapsed_seconds`). Subtracting it from `Time.current` inverted the
-  fairness order under a skewed session, and was the last instance of this
-  bug found: the list above is only worth having if every entry on it has
-  been checked, and this column was missing from it entirely. Application-written ones —
+  fairness order under a skewed session. The list above is only worth
+  having if every entry on it has been checked — this column was missing
+  from it entirely, and the fix for it was then found HALF-APPLIED: the
+  same three columns were still being subtracted from `Time.current` in
+  `partitions/show.html.erb`, where no test can reach them. Anything a
+  view needs from these columns is computed in
+  `Repository#partition_clock_facts` for that reason. A Rails view is
+  unreachable from this suite, so "we fixed the crossing" is a claim about
+  the files somebody looked at, never about the codebase. Application-written ones —
   `staged_jobs.scheduled_at`, the `scheduled_eligible_at` horizon derived
   from it, and `tick_samples.sampled_at` — are bound from Ruby and
   serialized by `quoted_date`,
@@ -534,9 +540,16 @@ dispatch_policy_policy_settings               one row per policy — pause flag
      the sweeper needs a `pending_count` of 0 an unclaimable partition
      cannot reach. Measured at 5 corrupt runs in 6 with the clicks 2ms
      apart. It is `try`, not a wait, because this is a web request; the
-     second operator is told to try again. The lock is SESSION-scoped, so
-     the release in `ensure` is not optional — leak it and the button
-     refuses every later click on that connection.
+     second operator is told to try again. The lock is SESSION-scoped, and a leak
+     fails in the opposite direction to the obvious guess: advisory locks
+     are RE-ENTRANT within a session, so the connection that leaked it
+     keeps getting `true` and its button keeps working, while every OTHER
+     pooled connection is refused until that backend dies. Someone
+     debugging by clicking again on the same connection concludes nothing
+     is wrong. That is why the release in `ensure` is not optional — and
+     why it is wrapped, since on a connection already in an aborted
+     transaction the unlock cannot run and must at least not replace the
+     caller's exception.
 - **`claim_staged_jobs!` requires `limit > 0`** (it's now the
   admit-only path). The pure-deny path goes through
   `Repository.bulk_record_partition_denies!`: the Tick accumulates

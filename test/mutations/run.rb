@@ -83,7 +83,19 @@ module DispatchPolicy
       # backend with SIGKILL makes the postmaster assume shared memory is
       # corrupt and reset every connection. Address the group we spawned.
       def kill_process_group(pid)
-        Process.kill("KILL", -Process.getpgid(pid))
+        pgid = Process.getpgid(pid)
+        # ONLY when it is genuinely its own group. `pgroup: true` is what
+        # puts it there, and if that ever fails to apply — an older Ruby, a
+        # platform that ignores it — `getpgid` hands back OUR group and
+        # `kill(-pgid)` SIGKILLs the runner, the rake process and the
+        # shell that started them. Demonstrated: without `pgroup: true` the
+        # child's pgid IS the runner's, and the negative kill takes the
+        # whole run down mid-battery with no output.
+        if pgid != Process.getpgrp
+          Process.kill("KILL", -pgid)
+        else
+          Process.kill("KILL", pid)
+        end
       rescue StandardError
         begin
           Process.kill("KILL", pid)
@@ -178,12 +190,33 @@ module DispatchPolicy
                         chdir: tree, pgroup: true) do |stdin, oe, wait|
             stdin.close
             reader = Thread.new { out << oe.read }
-            if wait.join(TIMEOUT)
-              reader.join
-            else
-              timed_out = true
-              kill_process_group(wait.pid)
-              reader.kill
+            # Its own group is what makes the timeout able to kill the whole
+            # tree, and it is also what stops Ctrl-C reaching it: the
+            # terminal sends SIGINT to the FOREGROUND group only, so an
+            # operator interrupting a hung mutation would kill the runner
+            # and leave the suite, its children and its backends running —
+            # the debris this whole method exists to prevent, arriving by
+            # the one route people actually use. Forward it by hand.
+            previous = {}
+            %w[INT TERM].each do |sig|
+              previous[sig] = trap(sig) do
+                kill_process_group(wait.pid)
+                reap_database_backends!
+                trap(sig, previous[sig] || "DEFAULT")
+                Process.kill(sig, Process.pid)
+              end
+            end
+
+            begin
+              if wait.join(TIMEOUT)
+                reader.join
+              else
+                timed_out = true
+                kill_process_group(wait.pid)
+                reader.kill
+              end
+            ensure
+              previous.each { |sig, handler| trap(sig, handler || "DEFAULT") }
             end
           end
         end

@@ -262,6 +262,41 @@ class PauseLockOrderTest < DispatchPolicy::IntegrationTest
                  "connection is refused for the life of the process"
   end
 
+  # The release can itself fail, and when it does it must not eat the
+  # caller's exception. The case: a HOST that wraps the action in its own
+  # transaction (an `around_action`, or a request test with
+  # `use_transactional_tests`), and a statement inside the block that
+  # aborts it. The `ensure`'s unlock then raises
+  # PG::InFailedSqlTransaction, and unguarded that is what the operator
+  # sees instead of what actually went wrong.
+  #
+  # It does NOT release the lock — nothing can, on an aborted connection.
+  # What it buys is the real error message, which is the difference between
+  # debugging the failure and debugging the cleanup.
+  def test_a_failing_release_does_not_replace_the_callers_exception
+    conn = DispatchPolicy::Repository.connection
+
+    error = assert_raises(RuntimeError) do
+      conn.transaction do
+        DispatchPolicy::Repository.with_policy_pause_lock(policy_name: POLICY) do
+          begin
+            conn.execute("SELECT 1/0")
+          rescue ActiveRecord::StatementInvalid
+            raise "the failure the operator needs to see"
+          end
+        end
+      end
+    end
+
+    assert_equal "the failure the operator needs to see", error.message,
+                 "the release's own failure must not stand in for the caller's"
+  ensure
+    # The lock really is still held on this connection; take it back so the
+    # rest of this case, and every later run against this database, is not
+    # blocked by it.
+    DispatchPolicy::Repository.connection.execute("SELECT pg_advisory_unlock_all()")
+  end
+
   private
 
   # Queue#pop(timeout:) is Ruby 3.2 and the gemspec floor is 3.1. A bare

@@ -209,6 +209,36 @@ class ScheduledClockTest < DispatchPolicy::IntegrationTest
     )
   end
 
+  # The same three columns the partition page renders. A Rails view is
+  # unreachable from this suite — which is exactly why the crossing
+  # survived there after being removed from the Tick — so the computation
+  # lives in the Repository, where a test can reach it, and the view only
+  # reads the result.
+  def test_the_partition_page_facts_are_computed_on_the_writing_clock
+    session_timezone(EAST)
+    stage!(scheduled_at: nil)
+    DispatchPolicy::Repository.connection.exec_query(
+      "UPDATE dispatch_policy_partitions SET decayed_admits = 10.0, " \
+      "decayed_admits_at = now() - interval '600 seconds', " \
+      "last_checked_at   = now() - interval '30 seconds', " \
+      "next_eligible_at  = now() + interval '300 seconds' " \
+      "WHERE policy_name = $1 AND partition_key = $2",
+      "seed_facts", [POLICY, KEY]
+    )
+
+    facts = DispatchPolicy::Repository.partition_clock_facts(
+      policy_name: POLICY, partition_key: KEY
+    )
+
+    assert facts[:in_backoff],
+           "the tick will not claim this partition for another five minutes"
+    assert_in_delta 30, facts[:age_seconds], 5,
+                    "read on the worker's clock this renders as minus ten hours"
+    assert_in_delta 600, facts[:decay_elapsed_seconds], 5,
+                    "the page's EWMA is the Tick's own sort key; on the wrong clock it " \
+                    "renders 10.00 where the Tick sees 0.0098"
+  end
+
   # `defer_partition_to_next_scheduled!` reads the same column from both
   # ends: MIN over rows still in the future, and a NOT EXISTS guard over
   # rows already due. On a skewed session both answers move together — the

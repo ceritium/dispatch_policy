@@ -809,16 +809,23 @@ module DispatchPolicy
   },
   {
     id:    '59',
-    label: 'pause lock: released, but nothing checks the database',
-    # Advisory locks are RE-ENTRANT within a session, so a test that just clicks
-    # again passes with the unlock deleted — the same pooled connection
-    # re-acquires its own leaked lock. Only asking the database catches it.
+    label: 'pause lock: the release is unguarded again',
+    # An unlock on a connection already in an aborted transaction raises, and
+    # unguarded that replaces the caller's exception — the operator debugs the
+    # cleanup instead of the failure. 46 covers the unlock going missing; this
+    # covers it going unguarded, and the two are different claims.
     caught_by: 'pause_lock_order_test',
     file:  'lib/dispatch_policy/repository.rb',
-    find:  '          connection.select_value(' + "\n" +
+    find:  '        begin' + "\n" +
+           '          connection.select_value(' + "\n" +
            '            "SELECT pg_advisory_unlock(#{Integer(PAUSE_LOCK_CLASS)}, #{Integer(objid)})"' + "\n" +
-           '          )',
-    replace: '          nil'
+           '          )' + "\n" +
+           '        rescue StandardError => e',
+    replace: '        begin' + "\n" +
+             '          connection.select_value(' + "\n" +
+             '            "SELECT pg_advisory_unlock(#{Integer(PAUSE_LOCK_CLASS)}, #{Integer(objid)})"' + "\n" +
+             '          )' + "\n" +
+             '        rescue NoMethodError => e'
   },
   {
     id:    '60',
@@ -867,6 +874,36 @@ module DispatchPolicy
              '            EXTRACT(EPOCH FROM (now() - PERCENTILE_DISC(0.05) WITHIN GROUP (ORDER BY p.last_checked_at) FILTER (WHERE $1::timestamp IS NOT NULL)))::float AS p95_age_seconds' + "\n" +
              '          FROM #{PARTITIONS_TABLE} p' + "\n" +
              "          WHERE p.status = 'active' AND p.pending_count > 0"
+  },
+  {
+    id:    '63',
+    label: 'partition page: clock facts back on the worker clock',
+    # The half of the fairness fix that a view hid. `next_eligible_at`,
+    # `last_checked_at` and `decayed_admits_at` are Postgres-written; subtracted
+    # from the app's clock the page rendered an EWMA of 10.00 where the Tick's
+    # own sort key was 0.0098, and a round-trip age of minus ten hours.
+    caught_by: 'scheduled_clock_test',
+    file:  'lib/dispatch_policy/repository.rb',
+    find:  [
+      '            EXTRACT(EPOCH FROM (now() - last_checked_at))::float             AS age_seconds,',
+      '            EXTRACT(EPOCH FROM (now() - decayed_admits_at))::float           AS decay_elapsed_seconds,',
+      '            decayed_admits_at IS NOT NULL                                    AS has_decay_stamp',
+      '          FROM #{PARTITIONS_TABLE}',
+      '          WHERE policy_name = $1 AND partition_key = $2',
+      '        SQL',
+      '        "partition_clock_facts",',
+      '        [policy_name, partition_key]'
+    ].join("\n"),
+    replace: [
+      '            EXTRACT(EPOCH FROM ($3::timestamp - last_checked_at))::float     AS age_seconds,',
+      '            EXTRACT(EPOCH FROM ($3::timestamp - decayed_admits_at))::float   AS decay_elapsed_seconds,',
+      '            decayed_admits_at IS NOT NULL                                    AS has_decay_stamp',
+      '          FROM #{PARTITIONS_TABLE}',
+      '          WHERE policy_name = $1 AND partition_key = $2',
+      '        SQL',
+      '        "partition_clock_facts",',
+      '        [policy_name, partition_key, app_clock]'
+    ].join("\n")
   },
     ].freeze
   end
