@@ -3,7 +3,7 @@
 ```bash
 bundle exec rake mutations:list          # the catalogue, no work done
 bundle exec rake mutations:check         # do the find-strings still match? (seconds)
-bundle exec rake mutations:all           # 61 mutations, 60 must be caught (slow: one suite each)
+bundle exec rake mutations:all           # 62 mutations, 61 must be caught (slow: one suite each)
 FILTER=19 bundle exec rake mutations:all # one mutation
 FILTER=forwarder bundle exec rake mutations:all
 ```

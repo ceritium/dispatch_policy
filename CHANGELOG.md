@@ -89,6 +89,17 @@
   skips the rest of that pass (partition GC, tick-sample GC and
   adaptive-stat GC).
 
+- **The partition page reads the clock that writes what it shows.**
+  Backoff, round-trip age and the decayed-admits EWMA all read
+  Postgres-written columns and were subtracted from `Time.current` in the
+  view. Measured on a session east of UTC, the page rendered an EWMA of
+  10.00 where the tick's own sort key was 0.0098 — a thousandfold
+  overstatement, on the operator's only view of the number admission sorts
+  by — and a round-trip age of minus ten hours. The four facts are computed
+  in `Repository#partition_clock_facts` now, where a test can reach them; a
+  Rails view is unreachable from this suite, which is why the identical
+  expression survived there after being removed from the tick.
+
 - **The dashboard's metrics windows read the clock that writes them.**
   `tick_samples.sampled_at` was written by Postgres `now()` while all five
   of its readers — the 1m/5m/15m summaries, the sparkline, the denial
