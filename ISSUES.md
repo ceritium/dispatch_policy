@@ -196,6 +196,31 @@ that cannot help — and their frozen `last_checked_at` dragged the
 round-trip percentiles toward infinity. They are excluded from both and
 reported on their own as `schedule_parked`.
 
+## A13 — the dashboard renders naive timestamps as if they were UTC
+
+Open, and larger than it looks. `format_time` is `time.utc.strftime`, and
+every datetime column the gem owns is `timestamp WITHOUT time zone`. On a
+session whose TimeZone is not UTC — the `variables: { timezone: … }`
+install this whole branch exists for — Postgres writes local wall clock
+into those columns, ActiveRecord reads them back as UTC, and every
+rendered timestamp on every page is off by the session's offset.
+
+Found by a reviewer after the partition page's COMPARISONS were moved onto
+the writing clock: the page now decides correctly and prints the decision
+next to a timestamp that disagrees with it. "Backoff until 17:00:39" beside
+a footer reading "now: 21:00:38" is the visible shape.
+
+Not fixed here for one reason: it is not this page. `format_time` is used
+by every view in the engine, on Postgres-written and application-written
+columns alike, and getting it right means deciding — once, for the whole
+dashboard — whether the gem renders in UTC, in the session's zone, or in
+the operator's, and then knowing which of the two kinds each column is at
+the call site. That is a UI change with its own design, and bolting a
+per-call fix onto one page would leave the dashboard internally
+inconsistent, which is worse than uniformly offset.
+
+The comparisons are what admission depends on, and those are correct.
+
 ## A9 — left open, deliberately
 
 The pending sparkline drops periods with no tick samples, so a tick loop

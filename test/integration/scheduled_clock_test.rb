@@ -209,34 +209,66 @@ class ScheduledClockTest < DispatchPolicy::IntegrationTest
     )
   end
 
-  # The same three columns the partition page renders. A Rails view is
-  # unreachable from this suite — which is exactly why the crossing
-  # survived there after being removed from the Tick — so the computation
-  # lives in the Repository, where a test can reach it, and the view only
-  # reads the result.
-  def test_the_partition_page_facts_are_computed_on_the_writing_clock
+  # The same three columns the partition page renders. A Rails view is not
+  # unreachable from this suite — a reviewer drove one in twenty lines with
+  # rails runner and Rack::Test — but the computation still belongs in the
+  # Repository, where a mutation can reach it and where the page and the
+  # Tick are guaranteed to agree by construction.
+  #
+  # BOTH directions, because the columns fail in opposite ones and a test
+  # pointed at only one is decorative for the others. East of UTC the
+  # stored value reads as being in the FUTURE: the age goes negative, the
+  # decay is skipped, and a backoff that expired hours ago still reports as
+  # active — so `in_backoff` is TRUE there whether or not the bug is
+  # present, and asserting it east proves nothing. West of UTC is where a
+  # live backoff reads as none. The first version of this test asserted all
+  # three facts under EAST and stayed green with the backoff comparison put
+  # back on the app clock.
+  { "east" => EAST, "west" => WEST }.each do |direction, zone|
+    define_method("test_the_partition_page_facts_are_computed_on_the_writing_clock_#{direction}") do
+      session_timezone(zone)
+      stage!(scheduled_at: nil)
+      DispatchPolicy::Repository.connection.exec_query(
+        "UPDATE dispatch_policy_partitions SET decayed_admits = 10.0, " \
+        "decayed_admits_at = now() - interval '600 seconds', " \
+        "last_checked_at   = now() - interval '30 seconds', " \
+        "next_eligible_at  = now() + interval '300 seconds' " \
+        "WHERE policy_name = $1 AND partition_key = $2",
+        "seed_facts", [POLICY, KEY]
+      )
+
+      facts = DispatchPolicy::Repository.partition_clock_facts(
+        policy_name: POLICY, partition_key: KEY
+      )
+
+      assert facts[:in_backoff],
+             "#{direction.upcase}: the tick will not claim this partition for another five " \
+             "minutes. Read on the app clock, WEST reports no backoff at all"
+      assert_in_delta 30, facts[:age_seconds], 5,
+                      "#{direction.upcase}: read on the worker's clock this is off by the offset " \
+                      "in whichever direction the session points"
+      assert_in_delta 600, facts[:decay_elapsed_seconds], 5,
+                      "#{direction.upcase}: the page's EWMA is the Tick's own sort key; skewed it " \
+                      "renders 10.00 east and 0.00 west, against a true 0.0098"
+    end
+  end
+
+  # An expired backoff must read as expired. This is the assertion the
+  # `in_backoff` fact needs and the one above cannot make: east of UTC a
+  # live backoff reads as live even with the bug, so only a backoff in the
+  # PAST discriminates there.
+  def test_an_expired_backoff_does_not_read_as_active_under_skew
     session_timezone(EAST)
     stage!(scheduled_at: nil)
     DispatchPolicy::Repository.connection.exec_query(
-      "UPDATE dispatch_policy_partitions SET decayed_admits = 10.0, " \
-      "decayed_admits_at = now() - interval '600 seconds', " \
-      "last_checked_at   = now() - interval '30 seconds', " \
-      "next_eligible_at  = now() + interval '300 seconds' " \
+      "UPDATE dispatch_policy_partitions SET next_eligible_at = now() - interval '300 seconds' " \
       "WHERE policy_name = $1 AND partition_key = $2",
-      "seed_facts", [POLICY, KEY]
+      "seed_expired", [POLICY, KEY]
     )
 
-    facts = DispatchPolicy::Repository.partition_clock_facts(
+    refute DispatchPolicy::Repository.partition_clock_facts(
       policy_name: POLICY, partition_key: KEY
-    )
-
-    assert facts[:in_backoff],
-           "the tick will not claim this partition for another five minutes"
-    assert_in_delta 30, facts[:age_seconds], 5,
-                    "read on the worker's clock this renders as minus ten hours"
-    assert_in_delta 600, facts[:decay_elapsed_seconds], 5,
-                    "the page's EWMA is the Tick's own sort key; on the wrong clock it " \
-                    "renders 10.00 where the Tick sees 0.0098"
+    )[:in_backoff], "the backoff expired five minutes ago; the tick can claim this now"
   end
 
   # `defer_partition_to_next_scheduled!` reads the same column from both

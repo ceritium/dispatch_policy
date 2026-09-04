@@ -905,6 +905,50 @@ module DispatchPolicy
       '        [policy_name, partition_key, app_clock]'
     ].join("\n")
   },
+  {
+    id:    '64',
+    label: 'partition page: parked compares against a raw config.now',
+    # `config.clock` may return an epoch Float — public API, pinned by mutation 51.
+    # A TimeWithZone compared against a Float does not raise: it compares an
+    # astronomical Julian day against an epoch and answers false for every real
+    # timestamp, so a parked partition renders "Scheduled —" beside a non-zero
+    # pending count. Introduced by the commit that fixed the crossings around it.
+    caught_by: 'partition_view_test',
+    file:  'app/views/dispatch_policy/partitions/show.html.erb',
+    find:  '            @partition.scheduled_eligible_at > DispatchPolicy::Repository.app_clock %>',
+    replace: '            @partition.scheduled_eligible_at > DispatchPolicy.config.now %>'
+  },
+  {
+    id:    '65',
+    label: 'partition page: in_backoff back on the app clock',
+    # The one fact of the four whose failure direction is WEST: a live backoff
+    # reads as none. 63 mutates the other two columns and leaves this one, and the
+    # first version of its test asserted it EAST, where the bug cannot show.
+    caught_by: 'scheduled_clock_test',
+    file:  'lib/dispatch_policy/repository.rb',
+    find:  [
+      '            (next_eligible_at IS NOT NULL AND next_eligible_at > now())      AS in_backoff,',
+      '            EXTRACT(EPOCH FROM (now() - last_checked_at))::float             AS age_seconds,',
+      '            EXTRACT(EPOCH FROM (now() - decayed_admits_at))::float           AS decay_elapsed_seconds,',
+      '            decayed_admits_at IS NOT NULL                                    AS has_decay_stamp',
+      '          FROM #{PARTITIONS_TABLE}',
+      '          WHERE policy_name = $1 AND partition_key = $2',
+      '        SQL',
+      '        "partition_clock_facts",',
+      '        [policy_name, partition_key]'
+    ].join("\n"),
+    replace: [
+      '            (next_eligible_at IS NOT NULL AND next_eligible_at > $3::timestamp) AS in_backoff,',
+      '            EXTRACT(EPOCH FROM (now() - last_checked_at))::float             AS age_seconds,',
+      '            EXTRACT(EPOCH FROM (now() - decayed_admits_at))::float           AS decay_elapsed_seconds,',
+      '            decayed_admits_at IS NOT NULL                                    AS has_decay_stamp',
+      '          FROM #{PARTITIONS_TABLE}',
+      '          WHERE policy_name = $1 AND partition_key = $2',
+      '        SQL',
+      '        "partition_clock_facts",',
+      '        [policy_name, partition_key, app_clock]'
+    ].join("\n")
+  },
     ].freeze
   end
 end

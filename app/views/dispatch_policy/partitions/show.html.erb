@@ -12,7 +12,15 @@
     application-written column of the four, so it stays in Ruby. %>
 <% in_backoff  = @clock_facts[:in_backoff] %>
 <% age_seconds = @clock_facts[:age_seconds] %>
-<% parked = @partition.scheduled_eligible_at && @partition.scheduled_eligible_at > DispatchPolicy.config.now %>
+<%# app_clock, not config.now: `config.clock` may return an epoch Float (public
+    API, pinned by scheduled_clock_test and mutation 51), and comparing a
+    TimeWithZone against a Float does not raise — it compares an astronomical
+    Julian day against an epoch, so it answers false for every real timestamp.
+    A parked partition would then render "Scheduled —" beside a non-zero
+    pending count, which is the stall-looking reading this stat exists to
+    prevent. Introduced by the commit that fixed the crossings above. %>
+<% parked = @partition.scheduled_eligible_at &&
+            @partition.scheduled_eligible_at > DispatchPolicy::Repository.app_clock %>
 <% half_life = (DispatchPolicy.registry.fetch(@partition.policy_name)&.fairness_half_life_seconds || DispatchPolicy.config.fairness_half_life_seconds).to_f %>
 <%
   decayed_now =

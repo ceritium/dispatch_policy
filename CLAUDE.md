@@ -19,7 +19,7 @@ See `README.md` for the API and examples.
 v0.1 (on master). The whole main flow is implemented and tested.
 What's pending lives in `IDEAS.md` with the rationale.
 
-342 runs / 856 assertions. `bundle exec rake test` from the root.
+346 runs / 863 assertions. `bundle exec rake test` from the root.
 A mutation battery guards the tests themselves: `bundle exec rake
 mutations:all` (see `test/mutations/README.md`, and "Fixing a defect"
 below).
@@ -158,11 +158,20 @@ dispatch_policy_policy_settings               one row per policy — pause flag
   having if every entry on it has been checked — this column was missing
   from it entirely, and the fix for it was then found HALF-APPLIED: the
   same three columns were still being subtracted from `Time.current` in
-  `partitions/show.html.erb`, where no test can reach them. Anything a
-  view needs from these columns is computed in
-  `Repository#partition_clock_facts` for that reason. A Rails view is
-  unreachable from this suite, so "we fixed the crossing" is a claim about
-  the files somebody looked at, never about the codebase. Application-written ones —
+  `partitions/show.html.erb`. Every COMPARISON a view makes on these
+  columns is computed in `Repository#partition_clock_facts` for that
+  reason, and `test/integration/partition_view_test.rb` renders the
+  template's own logic — "a Rails view is unreachable from this suite"
+  stood here for one commit and is wrong: Rails does not boot, but ERB is
+  just a template, and binding the controller's locals and rendering it
+  takes twenty lines.
+  What is NOT fixed, and is recorded in ISSUES.md rather than
+  papered over: DISPLAY. `format_time` renders a naive timestamp with
+  `.utc.strftime`, so on a skewed session every Postgres-written timestamp
+  on every page is shown off by the session's offset. That is the whole
+  dashboard, not this page, and it is a different change. "We fixed the
+  crossing" is a claim about the files somebody looked at, never about the
+  codebase — this bullet has now been wrong twice, in the same direction. Application-written ones —
   `staged_jobs.scheduled_at`, the `scheduled_eligible_at` horizon derived
   from it, and `tick_samples.sampled_at` — are bound from Ruby and
   serialized by `quoted_date`,
@@ -593,7 +602,7 @@ http://localhost:3000/                       # forms to enqueue
 http://localhost:3000/dispatch_policy        # dashboard
 
 # Tests
-bundle exec rake test                        # 342 runs / 856 assertions
+bundle exec rake test                        # 346 runs / 863 assertions
 # DB_NAME picks the database (default dispatch_policy_test). Use it whenever
 # anything else might be running the suite: every integration case TRUNCATEs
 # the gem's tables in setup, so two runs on one database produce failures
@@ -604,7 +613,7 @@ bundle exec rake test                        # 342 runs / 856 assertions
 # notices. Slow (one full suite per mutation). See test/mutations/README.md.
 bundle exec rake mutations:list              # the catalogue, no work done
 bundle exec rake mutations:check             # do the find-strings still match? (seconds)
-bundle exec rake mutations:all               # 62 mutations, 61 must be caught
+bundle exec rake mutations:all               # 64 mutations, 63 must be caught
 FILTER=19 bundle exec rake mutations:all     # one of them
 
 # When you add a column or table:

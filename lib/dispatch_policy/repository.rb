@@ -1410,11 +1410,19 @@ module DispatchPolicy
     # compare all three against `Time.current`. That is the A10/A11
     # crossing, and it survived the fix that removed the identical
     # expression from `Tick#fairness_elapsed`, because a Rails view is
-    # unreachable from this suite: nothing could go red. Measured east of
-    # UTC on a skewed session, the page rendered a decayed-admits EWMA of
-    # 10.00 where the Tick's own sort key was 0.0098, reported a
-    # round-trip age of minus ten hours, and showed no backoff for a
-    # partition the tick provably would not claim for another five minutes.
+    # unreachable from this suite: nothing could go red.
+    #
+    # Measured, and the DIRECTION differs per column, which is why the test
+    # covers both. East of UTC (the stored value reads as being in the
+    # future) the page rendered a decayed-admits EWMA of 10.00 where the
+    # Tick's own sort key was 0.0098, and a round-trip age of minus ten
+    # hours; it also reported backoff for partitions whose backoff had
+    # expired hours earlier. West of UTC it reported NO backoff for a
+    # partition the tick provably would not claim for another five
+    # minutes, and every EWMA as 0.00. A comment here once attributed the
+    # no-backoff symptom to the eastward skew, which sent the reader to
+    # reproduce it in the one direction where it cannot happen.
+    #
     # It is the operator's only view of the numbers admission actually
     # sorts by.
     #
