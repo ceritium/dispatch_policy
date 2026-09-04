@@ -15,6 +15,20 @@ mutation already breaks stales that entry silently, and a stale entry
 proves nothing while reading exactly like a passing one. Four went stale
 in one sitting on the branch that added this task.
 
+**Run it on a quiet machine.** Several assertions in the suite are
+time-sensitive by nature — the throttle bucket refills with wall time, the
+fairness counter decays with it — so under heavy load the elapsed time
+between seeding a row and asserting on it stops being negligible and they
+fail. Measured here while ~18 other processes were saturating the machine
+and Postgres: `348 runs, 836 assertions, 18 failures`, concentrated in
+ManualAdmissionTest (`150 jobs against a bucket of 100 is a debt of 50` —
+the bucket had refilled 56 tokens, i.e. ~33s of wall time passed inside
+the test), plus two mutations scoring NO RESULT on the 300s per-suite
+timeout. Idle, the same tree and the same seed: `348 runs, 868 assertions,
+0 failures`, and both mutations CAUGHT. Nothing was wrong with the code or
+the database. If you see this shape, check the load before you start
+bisecting.
+
 Two ways a mutation can look fine and mean nothing, both of which have
 happened here:
 
