@@ -183,7 +183,28 @@ class PartitionViewTest < DispatchPolicy::IntegrationTest
                     "skipped and the page renders 10.00"
     assert_equal rendered[:facts][:age_seconds].round(3), rendered[:age_seconds].round(3),
                  "the page must show exactly what the database computed"
-    assert rendered[:in_backoff]
+    assert_equal rendered[:facts][:in_backoff], rendered[:in_backoff],
+                 "the page must show the database's backoff answer, not its own"
+  end
+
+  # `in_backoff` needs its own case, because the one above cannot
+  # discriminate it: EAST of UTC a live backoff reads as live whether the
+  # page recomputes it or reads it, so `assert rendered[:in_backoff]` there
+  # passes against the bug — which is exactly the defect this branch fixed
+  # in scheduled_clock_test and then reproduced here. A backoff that has
+  # EXPIRED is the shape that separates them: recomputed east, it still
+  # reads as active.
+  def test_an_expired_backoff_does_not_render_as_active
+    session_timezone("Etc/GMT-10")
+    DispatchPolicy::Repository.connection.exec_query(
+      "UPDATE dispatch_policy_partitions SET next_eligible_at = now() - interval '300 seconds' " \
+      "WHERE policy_name = $1 AND partition_key = $2",
+      "expired", [POLICY, KEY]
+    )
+
+    refute render_header(partition_row)[:in_backoff],
+           "the backoff expired five minutes ago; recomputed on the app clock the page " \
+           "still shows it as active"
   end
 
   private

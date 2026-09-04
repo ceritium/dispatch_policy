@@ -19,7 +19,7 @@ See `README.md` for the API and examples.
 v0.1 (on master). The whole main flow is implemented and tested.
 What's pending lives in `IDEAS.md` with the rationale.
 
-348 runs / 868 assertions. `bundle exec rake test` from the root.
+349 runs / 869 assertions. `bundle exec rake test` from the root.
 A mutation battery guards the tests themselves: `bundle exec rake
 mutations:all` (see `test/mutations/README.md`, and "Fixing a defect"
 below).
@@ -603,7 +603,7 @@ http://localhost:3000/                       # forms to enqueue
 http://localhost:3000/dispatch_policy        # dashboard
 
 # Tests
-bundle exec rake test                        # 348 runs / 868 assertions
+bundle exec rake test                        # 349 runs / 869 assertions
 # DB_NAME picks the database (default dispatch_policy_test). Use it whenever
 # anything else might be running the suite: every integration case TRUNCATEs
 # the gem's tables in setup, so two runs on one database produce failures
@@ -614,7 +614,7 @@ bundle exec rake test                        # 348 runs / 868 assertions
 # notices. Slow (one full suite per mutation). See test/mutations/README.md.
 bundle exec rake mutations:list              # the catalogue, no work done
 bundle exec rake mutations:check             # do the find-strings still match? (seconds)
-bundle exec rake mutations:all               # 65 mutations, 64 must be caught
+bundle exec rake mutations:all               # 66 mutations, 65 must be caught
 FILTER=19 bundle exec rake mutations:all     # one of them
 
 # When you add a column or table:

@@ -962,6 +962,17 @@ module DispatchPolicy
     find:  '<% age_seconds = @clock_facts[:age_seconds] %>',
     replace: '<% age_seconds = @partition.last_checked_at && (Time.current - @partition.last_checked_at) %>'
   },
+  {
+    id:    '67',
+    label: 'partition page: in_backoff recomputed instead of read',
+    # The fourth of the four header values, and the one a bare `assert` could not
+    # discriminate: east of UTC a live backoff reads as live either way. Only an
+    # EXPIRED backoff separates reading from recomputing.
+    caught_by: 'partition_view_test',
+    file:  'app/views/dispatch_policy/partitions/show.html.erb',
+    find:  '<% in_backoff  = @clock_facts[:in_backoff] %>',
+    replace: '<% in_backoff  = @partition.next_eligible_at && @partition.next_eligible_at > Time.current %>'
+  },
     ].freeze
   end
 end

@@ -3,7 +3,7 @@
 ```bash
 bundle exec rake mutations:list          # the catalogue, no work done
 bundle exec rake mutations:check         # do the find-strings still match? (seconds)
-bundle exec rake mutations:all           # 65 mutations, 64 must be caught (slow: one suite each)
+bundle exec rake mutations:all           # 66 mutations, 65 must be caught (slow: one suite each)
 FILTER=19 bundle exec rake mutations:all # one mutation
 FILTER=forwarder bundle exec rake mutations:all
 ```
@@ -15,19 +15,27 @@ mutation already breaks stales that entry silently, and a stale entry
 proves nothing while reading exactly like a passing one. Four went stale
 in one sitting on the branch that added this task.
 
-**Run it on a quiet machine.** Several assertions in the suite are
-time-sensitive by nature — the throttle bucket refills with wall time, the
-fairness counter decays with it — so under heavy load the elapsed time
-between seeding a row and asserting on it stops being negligible and they
-fail. Measured here while ~18 other processes were saturating the machine
-and Postgres: `348 runs, 836 assertions, 18 failures`, concentrated in
-ManualAdmissionTest (`150 jobs against a bucket of 100 is a debt of 50` —
-the bucket had refilled 56 tokens, i.e. ~33s of wall time passed inside
-the test), plus two mutations scoring NO RESULT on the 300s per-suite
-timeout. Idle, the same tree and the same seed: `348 runs, 868 assertions,
-0 failures`, and both mutations CAUGHT. Nothing was wrong with the code or
-the database. If you see this shape, check the load before you start
-bisecting.
+**One process per database, and the runner now enforces it.** Every
+integration case TRUNCATEs all six tables in `setup`, so two suites on one
+database wipe each other's rows mid-test — and the symptom does not look
+like concurrency at all. Measured while a battery was running and a plain
+`rake test` was pointed at the same database:
+`348 runs, 836 assertions, 18 failures`, concentrated in
+ManualAdmissionTest, whose cases all assert on global state for one fixed
+partition (`150 jobs against a bucket of 100 is a debt of 50` came back as
+a credit of 6), plus two mutations scoring NO RESULT on the per-suite
+timeout — because under contention the suite does not merely fail, it
+HANGS: a TRUNCATE takes ACCESS EXCLUSIVE and queues behind another
+process's `SELECT … FOR UPDATE`, and with a Ruby thread in the wait chain
+Postgres's deadlock detector never breaks it.
+
+I first wrote this paragraph blaming machine load, which was wrong and is
+worth recording: a byte-for-byte clone of the "bad" database runs green in
+13.6s, and two concurrent suites on ONE database reproduce the reported
+failures verbatim. The state was innocent; the second process was not.
+`Runner.run` refuses to start when anything else is connected to
+`MUTATION_DB`, and the "control run is not usable" abort now says so
+instead of telling you to fix a suite that is fine.
 
 Two ways a mutation can look fine and mean nothing, both of which have
 happened here:

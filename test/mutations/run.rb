@@ -64,10 +64,18 @@ module DispatchPolicy
           copy_tree(tree)
           ensure_database
 
+          busy = other_backends_on_database
+          if busy.positive?
+            abort "#{busy} other connection(s) are using #{DB}. Two suites on one " \
+                  "database TRUNCATE each other mid-test; the failures that produces " \
+                  "look like defects and are not. Set MUTATION_DB to a private name."
+          end
+
           say "control run (#{selected.size} mutation(s) selected)"
           control = suite(tree)
           unless control[:ran] && control[:green]
-            abort "the control run is not usable (#{control[:summary]}). " \
+            hint = other_backends_on_database.positive? ? " Another process is on #{DB}." : ""
+            abort "the control run is not usable (#{control[:summary]}).#{hint} " \
                   "Fix the suite before reading anything into a mutation."
           end
           say "control: #{control[:summary]}"
@@ -257,6 +265,29 @@ module DispatchPolicy
 
       def ensure_database
         Open3.capture3("createdb", DB) # already there is fine
+      end
+
+      # Refuse to start if anything else is on this database.
+      #
+      # Every integration case TRUNCATEs all six tables in setup, so a
+      # second suite on the same database wipes this one's rows mid-test.
+      # The symptom does not look like concurrency: it looks like a dozen
+      # assertions about token buckets and fairness counters going wrong,
+      # and like mutations timing out — under contention the suite HANGS,
+      # because a TRUNCATE takes ACCESS EXCLUSIVE and queues behind another
+      # process's `SELECT … FOR UPDATE`, with a Ruby thread in the wait
+      # chain that Postgres's deadlock detector will not break. That cost
+      # an investigation, and the first explanation reached for was a
+      # corrupt database, which a clone disproved in thirteen seconds.
+      def other_backends_on_database
+        out, _err, status = Open3.capture3(
+          "psql", "-d", DB, "-tAc",
+          "SELECT count(*) FROM pg_stat_activity " \
+          "WHERE datname = current_database() AND pid <> pg_backend_pid()"
+        )
+        status.success? ? out.strip.to_i : 0
+      rescue StandardError
+        0 # no psql, or no permission: not a reason to refuse to run
       end
 
       def root

@@ -1409,8 +1409,8 @@ module DispatchPolicy
     # `last_checked_at` and `decayed_admits_at` — and the page used to
     # compare all three against `Time.current`. That is the A10/A11
     # crossing, and it survived the fix that removed the identical
-    # expression from `Tick#fairness_elapsed`, because a Rails view is
-    # nothing in the suite looked at it. ("A Rails view is unreachable from
+    # expression from `Tick#fairness_elapsed`, because nothing in the suite
+    # looked at it. ("A Rails view is unreachable from
     # this suite" was the excuse written here, and it is false: Rails does
     # not boot, but ERB is a template — `partition_view_test.rb` renders
     # this one's own logic. The excuse outlived the belief by one commit,
