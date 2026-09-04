@@ -96,9 +96,10 @@
   10.00 where the tick's own sort key was 0.0098 — a thousandfold
   overstatement, on the operator's only view of the number admission sorts
   by — and a round-trip age of minus ten hours. The four facts are computed
-  in `Repository#partition_clock_facts` now, where a test can reach them; a
-  Rails view is unreachable from this suite, which is why the identical
-  expression survived there after being removed from the tick.
+  in `Repository#partition_clock_facts` now, where a mutation can reach
+  them, and `partition_view_test.rb` renders the template's own logic so
+  the view half is guarded too — the identical expression survived there
+  after being removed from the tick only because nothing was looking.
 
 - **The dashboard's metrics windows read the clock that writes them.**
   `tick_samples.sampled_at` was written by Postgres `now()` while all five

@@ -949,6 +949,19 @@ module DispatchPolicy
       '        [policy_name, partition_key, app_clock]'
     ].join("\n")
   },
+  {
+    id:    '66',
+    label: 'partition page: recomputes the facts instead of reading them',
+    # The whole point of the change, and for two commits nothing pinned it: a
+    # wholesale revert of the template to the pre-fix version left the entire
+    # suite green, because the only view test checked `parked` — which the old
+    # version computed correctly, since Time.current is independent of the
+    # clock shape it was guarding against.
+    caught_by: 'partition_view_test',
+    file:  'app/views/dispatch_policy/partitions/show.html.erb',
+    find:  '<% age_seconds = @clock_facts[:age_seconds] %>',
+    replace: '<% age_seconds = @partition.last_checked_at && (Time.current - @partition.last_checked_at) %>'
+  },
     ].freeze
   end
 end

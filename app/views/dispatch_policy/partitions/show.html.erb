@@ -8,7 +8,8 @@
     database computes them (@clock_facts, from Repository#partition_clock_facts);
     comparing them against Time.current here is the A10/A11 crossing, and it
     survived the fix that removed the identical expression from the Tick
-    because a view is unreachable from the test suite. `parked` is the one
+    because nothing in the suite looked at it — partition_view_test.rb now
+    renders this logic, so it can. `parked` is the one
     application-written column of the four, so it stays in Ruby. %>
 <% in_backoff  = @clock_facts[:in_backoff] %>
 <% age_seconds = @clock_facts[:age_seconds] %>

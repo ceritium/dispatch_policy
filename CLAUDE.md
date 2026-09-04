@@ -19,7 +19,7 @@ See `README.md` for the API and examples.
 v0.1 (on master). The whole main flow is implemented and tested.
 What's pending lives in `IDEAS.md` with the rationale.
 
-346 runs / 863 assertions. `bundle exec rake test` from the root.
+348 runs / 868 assertions. `bundle exec rake test` from the root.
 A mutation battery guards the tests themselves: `bundle exec rake
 mutations:all` (see `test/mutations/README.md`, and "Fixing a defect"
 below).
@@ -167,9 +167,10 @@ dispatch_policy_policy_settings               one row per policy — pause flag
   takes twenty lines.
   What is NOT fixed, and is recorded in ISSUES.md rather than
   papered over: DISPLAY. `format_time` renders a naive timestamp with
-  `.utc.strftime`, so on a skewed session every Postgres-written timestamp
-  on every page is shown off by the session's offset. That is the whole
-  dashboard, not this page, and it is a different change. "We fixed the
+  `.utc.strftime`, so on a skewed session Postgres-written timestamps are
+  shown off by the session's offset while application-written ones are
+  right — adjacently, on the same page. That is the whole dashboard, not
+  this page, and it is a different change. "We fixed the
   crossing" is a claim about the files somebody looked at, never about the
   codebase — this bullet has now been wrong twice, in the same direction. Application-written ones —
   `staged_jobs.scheduled_at`, the `scheduled_eligible_at` horizon derived
@@ -602,7 +603,7 @@ http://localhost:3000/                       # forms to enqueue
 http://localhost:3000/dispatch_policy        # dashboard
 
 # Tests
-bundle exec rake test                        # 346 runs / 863 assertions
+bundle exec rake test                        # 348 runs / 868 assertions
 # DB_NAME picks the database (default dispatch_policy_test). Use it whenever
 # anything else might be running the suite: every integration case TRUNCATEs
 # the gem's tables in setup, so two runs on one database produce failures
@@ -613,7 +614,7 @@ bundle exec rake test                        # 346 runs / 863 assertions
 # notices. Slow (one full suite per mutation). See test/mutations/README.md.
 bundle exec rake mutations:list              # the catalogue, no work done
 bundle exec rake mutations:check             # do the find-strings still match? (seconds)
-bundle exec rake mutations:all               # 64 mutations, 63 must be caught
+bundle exec rake mutations:all               # 65 mutations, 64 must be caught
 FILTER=19 bundle exec rake mutations:all     # one of them
 
 # When you add a column or table:

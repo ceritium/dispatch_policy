@@ -1410,7 +1410,11 @@ module DispatchPolicy
     # compare all three against `Time.current`. That is the A10/A11
     # crossing, and it survived the fix that removed the identical
     # expression from `Tick#fairness_elapsed`, because a Rails view is
-    # unreachable from this suite: nothing could go red.
+    # nothing in the suite looked at it. ("A Rails view is unreachable from
+    # this suite" was the excuse written here, and it is false: Rails does
+    # not boot, but ERB is a template — `partition_view_test.rb` renders
+    # this one's own logic. The excuse outlived the belief by one commit,
+    # which is how it kept working.)
     #
     # Measured, and the DIRECTION differs per column, which is why the test
     # covers both. East of UTC (the stored value reads as being in the

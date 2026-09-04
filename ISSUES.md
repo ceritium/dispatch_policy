@@ -198,26 +198,39 @@ reported on their own as `schedule_parked`.
 
 ## A13 — the dashboard renders naive timestamps as if they were UTC
 
-Open, and larger than it looks. `format_time` is `time.utc.strftime`, and
-every datetime column the gem owns is `timestamp WITHOUT time zone`. On a
-session whose TimeZone is not UTC — the `variables: { timezone: … }`
-install this whole branch exists for — Postgres writes local wall clock
-into those columns, ActiveRecord reads them back as UTC, and every
-rendered timestamp on every page is off by the session's offset.
+Open. `format_time` is `time.utc.strftime`, and every datetime column the
+gem owns is `timestamp WITHOUT time zone`. On a session whose TimeZone is
+not UTC — the `variables: { timezone: … }` install this whole branch
+exists for — Postgres writes local wall clock into those columns and
+ActiveRecord reads them back as UTC.
 
-Found by a reviewer after the partition page's COMPARISONS were moved onto
-the writing clock: the page now decides correctly and prints the decision
-next to a timestamp that disagrees with it. "Backoff until 17:00:39" beside
-a footer reading "now: 21:00:38" is the visible shape.
+**It is exactly half the columns, and which half matters.**
+Postgres-written ones (`next_eligible_at`, `last_checked_at`,
+`last_admit_at`, `last_enqueued_at`, `context_updated_at`,
+`staged_jobs.enqueued_at`, `failed_at`) render offset by the session's
+UTC offset. Application-written ones (`staged_jobs.scheduled_at` and the
+`scheduled_eligible_at` horizon derived from it) render CORRECTLY — they
+were bound from Ruby as UTC and come back as the UTC they were written in.
+An earlier version of this entry said "every rendered timestamp on every
+page", which would send whoever fixes it to apply a blanket offset and
+break the half that is right.
 
-Not fixed here for one reason: it is not this page. `format_time` is used
-by every view in the engine, on Postgres-written and application-written
-columns alike, and getting it right means deciding — once, for the whole
-dashboard — whether the gem renders in UTC, in the session's zone, or in
-the operator's, and then knowing which of the two kinds each column is at
-the call site. That is a UI change with its own design, and bolting a
-per-call fix onto one page would leave the dashboard internally
-inconsistent, which is worse than uniformly offset.
+So the dashboard is ALREADY internally inconsistent, and adjacently:
+`partitions/show.html.erb` puts "Next eligible" (offset) and "Scheduled
+horizon" (correct) on neighbouring `<li>`s; `staged_jobs/show.html.erb`
+does the same with `enqueued_at` and `scheduled_at`. "A per-call fix would
+make it inconsistent, which is worse than uniformly offset" was the
+deferral reason written here, and it is false in both halves — it is not
+uniform, and it is already inconsistent.
+
+The real reason to defer is smaller and honest: fixing it means deciding
+once, for the whole engine, whether it renders in UTC, in the session's
+zone or in the operator's, and then knowing at every call site which kind
+of column it holds. That is a UI change with its own design, and this
+branch is about admission. Found by a reviewer after the partition page's
+COMPARISONS were moved onto the writing clock: the page now decides
+correctly and prints the decision beside a timestamp that disagrees with
+it — "Backoff until 17:00:39" over a footer reading "now: 21:00:38".
 
 The comparisons are what admission depends on, and those are correct.
 
