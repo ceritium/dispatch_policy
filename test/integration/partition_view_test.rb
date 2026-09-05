@@ -168,7 +168,6 @@ class PartitionViewTest < DispatchPolicy::IntegrationTest
   # East of UTC, a Postgres-written timestamp reads as being in the future
   # on the app clock: the age goes negative and the decay is skipped.
   def test_the_template_reads_the_database_facts_rather_than_recomputing_them
-    session_timezone("Etc/GMT-10")
     DispatchPolicy::Repository.connection.exec_query(
       "UPDATE dispatch_policy_partitions SET decayed_admits = 10.0, " \
       "decayed_admits_at = #{UTC} - interval '600 seconds', " \
@@ -178,7 +177,12 @@ class PartitionViewTest < DispatchPolicy::IntegrationTest
       "seed", [POLICY, KEY]
     )
 
-    rendered = render_header(partition_row)
+    # Host clock drift, not a skewed session: every column is stored in UTC
+    # now, so a skewed session no longer makes Ruby and Postgres disagree
+    # about a stored value — that version of this test SURVIVED its own
+    # mutation once A13 was fixed. What the database-side computation buys
+    # is independence from THIS process's clock.
+    rendered = travel_to(Time.now.utc - (10 * 3600)) { render_header(partition_row) }
 
     assert_in_delta 30, rendered[:age_seconds], 5,
                     "recomputed from Time.current this renders as minus ten hours"
@@ -199,16 +203,17 @@ class PartitionViewTest < DispatchPolicy::IntegrationTest
   # EXPIRED is the shape that separates them: recomputed east, it still
   # reads as active.
   def test_an_expired_backoff_does_not_render_as_active
-    session_timezone("Etc/GMT-10")
     DispatchPolicy::Repository.connection.exec_query(
       "UPDATE dispatch_policy_partitions SET next_eligible_at = #{UTC} - interval '300 seconds' " \
       "WHERE policy_name = $1 AND partition_key = $2",
       "expired", [POLICY, KEY]
     )
 
-    refute render_header(partition_row)[:in_backoff],
-           "the backoff expired five minutes ago; recomputed on the app clock the page " \
-           "still shows it as active"
+    rendered = travel_to(Time.now.utc - (10 * 3600)) { render_header(partition_row) }
+
+    refute rendered[:in_backoff],
+           "the backoff expired five minutes ago; recomputed on this process's clock the " \
+           "page still shows it as active"
   end
 
   private
