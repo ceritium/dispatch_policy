@@ -53,11 +53,18 @@
     last_checked_at       = last_checked_at       AT TIME ZONE '<your zone>' AT TIME ZONE 'UTC',
     last_admit_at         = last_admit_at         AT TIME ZONE '<your zone>' AT TIME ZONE 'UTC',
     last_enqueued_at      = last_enqueued_at      AT TIME ZONE '<your zone>' AT TIME ZONE 'UTC',
-    context_updated_at    = context_updated_at    AT TIME ZONE '<your zone>' AT TIME ZONE 'UTC';
+    context_updated_at    = context_updated_at    AT TIME ZONE '<your zone>' AT TIME ZONE 'UTC',
+    created_at            = created_at            AT TIME ZONE '<your zone>' AT TIME ZONE 'UTC',
+    updated_at            = updated_at            AT TIME ZONE '<your zone>' AT TIME ZONE 'UTC';
   ```
 
-  (`scheduled_eligible_at` is application-written and already UTC — leave
-  it alone.) The other tables can be shifted the same way or left to age
+  `created_at` is in that list for the same reason as `next_eligible_at`
+  and not for tidiness: the partition sweeper ages rows on
+  `COALESCE(last_admit_at, created_at)`, so east of UTC a pre-upgrade
+  partition looks newer than it is by your offset and is not collected
+  until real time catches up. (`scheduled_eligible_at` is
+  application-written and already UTC — leave it alone; it is the one
+  timestamp on this table that must NOT be shifted.) The other tables can be shifted the same way or left to age
   out; the visible cost of leaving them is scheduled work staged before
   the upgrade keeping its old due time, a stale-looking `heartbeat_at`
   whose row is swept and re-created, and a step in the metrics windows.
