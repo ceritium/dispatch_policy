@@ -79,6 +79,24 @@ class DenyLockOrderTest < DispatchPolicy::IntegrationTest
                              .reject { |v| v == POLICY }
     assert_equal %w[Acme acct:10 acct:1:eu], keys,
                  "the order has to match what stage_many! sorts by, or the two still cross"
+
+    # And that the lock and the UPDATE share a TRANSACTION. Postgres holds
+    # row locks only to end of transaction, so without it the
+    # `SELECT … FOR UPDATE` autocommits and every lock is gone before the
+    # UPDATE runs — the byte order is still there, in the right statement,
+    # in the right place, and the entire A1 fix does nothing. Verified: the
+    # whole suite stays green with the transaction removed, and the
+    # deadlock comes straight back. The two multi-row writers this project
+    # added later both pin their shape; the original did not.
+    shape = seen.filter_map do |p|
+      next p[:sql].strip[0, 6] if p[:name] == "TRANSACTION"
+      next "LOCK" if p[:name] == "lock_partitions_for_deny"
+
+      "UPDATE" if p[:name] == "bulk_record_partition_denies"
+    end
+    assert_equal %w[BEGIN LOCK UPDATE COMMIT], shape,
+                 "the lock and the UPDATE must be in one transaction, or the lock is released " \
+                 "before the UPDATE it exists to order"
   end
 
   # The ordering must not have changed what the flush actually records.
@@ -122,6 +140,62 @@ class DenyLockOrderTest < DispatchPolicy::IntegrationTest
     refute_nil lock, "without an explicit ordered lock this deadlocks against stage_many!"
     assert_match(/ORDER BY policy_name COLLATE "C", partition_key COLLATE "C"/, lock[:sql])
   end
+  # The partition sweeper's DELETE writes many partition rows too. A bare
+  # `DELETE … WHERE` locks in whatever order the plan produces — an index
+  # scan on idx_dp_partitions_scheduled_order tie-breaks equal keys by
+  # ctid, i.e. heap order — which is the A1 hazard, and this was the last
+  # multi-row writer of the table still carrying it. No deadlock was
+  # actually reproduced for this one (0 in a 20s stress run on an isolated
+  # database, before and after); it is pinned because the guarantee is
+  # meant to be structural, and because Postgres usually picks the sweep as
+  # the victim, whose blanket rescue then silently skips the rest of that
+  # pass — partition GC, tick-sample GC and adaptive-stat GC.
+  def test_the_partition_sweep_takes_its_locks_in_the_same_order
+    seen = capture_sql do
+      DispatchPolicy::Repository.sweep_inactive_partitions!(cutoff_seconds: 0, policy_name: POLICY)
+    end
+
+    sweep = seen.find { |p| p[:name] == "sweep_inactive_partitions" }
+    refute_nil sweep
+    assert_match(/ORDER BY p.policy_name COLLATE "C", p.partition_key COLLATE "C"/, sweep[:sql],
+                 "without it the DELETE locks in heap order and crosses stage_many!")
+    assert_match(/FOR UPDATE OF p SKIP LOCKED/, sweep[:sql],
+                 "a periodic best-effort sweep must skip rows somebody is writing, not wait on them")
+  end
+
+  # …and still deletes what it is supposed to.
+  def test_the_partition_sweep_still_collects_a_drained_partition
+    DispatchPolicy::Repository.connection.execute(
+      "UPDATE dispatch_policy_partitions SET pending_count = 0, " \
+      "created_at = now() - interval '2 hours', last_admit_at = NULL"
+    )
+
+    DispatchPolicy::Repository.sweep_inactive_partitions!(cutoff_seconds: 60, policy_name: POLICY)
+
+    assert_equal 0, DispatchPolicy::Partition.for_policy(POLICY).count
+  end
+
+  # The ordered CTE introduced a failure the single `DELETE … WHERE` could
+  # not have: a wrong or incomplete join back to the victims. Dropping
+  # `AND d.partition_key = v.partition_key` makes the sweep delete EVERY
+  # partition of the policy as soon as ONE of them is collectable —
+  # destroying the token buckets and pending counts of partitions that
+  # still hold work, which is M11's quota reset with a bigger blast
+  # radius. Nothing else in the suite exercises the join.
+  def test_the_sweep_deletes_only_the_partitions_it_selected
+    DispatchPolicy::Repository.connection.execute(
+      "UPDATE dispatch_policy_partitions SET pending_count = 0, " \
+      "created_at = now() - interval '2 hours', last_admit_at = NULL " \
+      "WHERE partition_key = 'Acme'"
+    )
+
+    DispatchPolicy::Repository.sweep_inactive_partitions!(cutoff_seconds: 60, policy_name: POLICY)
+
+    assert_equal %w[acct:10 acct:1:eu],
+                 DispatchPolicy::Partition.for_policy(POLICY).order(:partition_key).pluck(:partition_key),
+                 "only the drained partition was collectable; the other two still hold work"
+  end
+
   # One bind per held partition and one transaction over all of them:
   # Postgres caps parameters at 65,535, and holding FOR UPDATE on every
   # row for the whole loop was measured at ~0.5s on 2,500 partitions with

@@ -55,6 +55,133 @@
   after which the tick re-parks it in the new column.
 ### Fixed
 
+- **Pausing a policy no longer deadlocks against ordinary enqueues, and
+  two overlapping clicks can no longer wedge it.**
+  `PoliciesController#pause` / `#resume` wrote every partition row of the
+  policy with one `update_all` inside a transaction, which has no lock
+  order of its own — a seq scan locks in heap order, an index scan in the
+  database's collation, and neither is the byte order `stage_many!` sorts
+  by. Against one bulk-enqueuing process that deadlocked 5 times in 12
+  clicks, and it landed in the worst possible place: the click happens
+  during the load that made the operator want to pause, Postgres kills the
+  transaction, so the policy is NOT paused, the tick keeps admitting, and
+  the request answers 500 with nothing saying the pause failed. The flip
+  now takes its row locks in the canonical `COLLATE "C"` order, sliced so
+  a large policy never holds every lock at once, and the controller writes
+  the policy-level flag first on pause and last on resume so any partial
+  state fails closed. Because the flip no longer shares a transaction with
+  the flag, the two actions are serialized against each OTHER by a
+  `pg_try_advisory_lock` per policy — without it a resume overlapping a
+  pause left `paused = false` with every partition still marked paused,
+  which admits nothing, says so nowhere, and never heals (measured at 5
+  corrupt runs in 6). A second click while one is running is refused with
+  "try again in a moment" rather than queued behind it.
+
+- **The partition sweeper takes its row locks in the same order as
+  everything else.** `sweep_inactive_partitions!` was the last multi-row
+  writer of `dispatch_policy_partitions` with no lock order of its own —
+  its `DELETE` planned as an index scan that tie-breaks by ctid, i.e. heap
+  order, which is the deadlock shape fixed in A1. An ordered
+  `FOR UPDATE … SKIP LOCKED` CTE now picks the victims: 8-10 deadlocks per
+  20-second run before, 0 after, against one process holding a byte-ordered
+  transaction over 40 partitions — which is what `stage_many!` does.
+  Postgres usually kills the sweep, whose blanket rescue then silently
+  skips the rest of that pass (partition GC, tick-sample GC and
+  adaptive-stat GC).
+
+- **The partition page reads the clock that writes what it shows.**
+  Backoff, round-trip age and the decayed-admits EWMA all read
+  Postgres-written columns and were subtracted from `Time.current` in the
+  view. Measured on a session east of UTC, the page rendered an EWMA of
+  10.00 where the tick's own sort key was 0.0098 — a thousandfold
+  overstatement, on the operator's only view of the number admission sorts
+  by — and a round-trip age of minus ten hours. The four facts are computed
+  in `Repository#partition_clock_facts` now, where a mutation can reach
+  them, and `partition_view_test.rb` renders the template's own logic so
+  the view half is guarded too — the identical expression survived there
+  after being removed from the tick only because nothing was looking.
+
+- **The dashboard's metrics windows read the clock that writes them.**
+  `tick_samples.sampled_at` was written by Postgres `now()` while all five
+  of its readers — the 1m/5m/15m summaries, the sparkline, the denial
+  breakdown and the retention sweep — bound on a Ruby `Time`. The same
+  mismatch as the scheduled-work one, in mirror image: on a session west
+  of UTC every sample lands hours in the past and the dashboard shows an
+  idle tick loop; east of it, samples never age out.
+
+- **`StagedJob.due` reads the same clock as the claim.** It is the scope
+  the drain button counts what is left with, and on a session whose
+  TimeZone is not what Rails wrote with, it counted rows the claim will
+  not take — so the flash said "N still pending — click drain again"
+  forever.
+
+- **Scheduled work is compared on the clock it was written with.**
+  `scheduled_at` and the `scheduled_eligible_at` horizon are
+  application-written timestamps in `timestamp WITHOUT time zone`
+  columns; the comparisons that decided whether they were due used
+  Postgres `now()`, a timestamptz, so the stored value was reinterpreted
+  in the session TimeZone. Rails keeps that at UTC by default, which is
+  why it hid — but a host that sets `variables: { timezone: … }` in
+  `database.yml` got every `set(wait:)` job off by the offset: early on a
+  zone east of UTC, late by it on one west, with no trace in any metric.
+  Those comparisons now bind the application clock, so both sides go
+  through the same serialization the write did (via
+  `Repository.app_clock`, which coerces — `config.clock` is public API and
+  may return an epoch Float, which every other reader accepts and Postgres
+  rejects as a timestamp). `next_eligible_at`, which Postgres
+  writes, stays on `now()` for the same reason.
+
+- **The adaptive gate's feedback signal is measured on one clock.**
+  `queue_lag` was `Time.current` (the worker's clock) minus `admitted_at`
+  (written by Postgres on the tick's connection). That difference is the
+  AIMD controller's entire input: a worker running fast against
+  `target_lag_ms` reads every job as late, shrinks `current_max` on every
+  observation and never grows it back, so the cap collapses to `min` and
+  stays there with nothing reporting a clock problem. The lag is now
+  computed by the database in the same statement that reads the admission
+  row.
+
+- **One heartbeat thread per process instead of one per running job.**
+  Each tracked job spawned a thread that checked out its own connection,
+  against a pool the Rails default sizes to the worker's thread count —
+  while every performing job holds one for the length of its perform. A
+  saturated worker therefore had its beats queued behind
+  `checkout_timeout`, and a beat that never lands is a `heartbeat_at`
+  that stops advancing, which is exactly what the stale sweeper reaps: it
+  deletes the inflight row of a job that is still running and the
+  concurrency gate re-admits against an occupied slot. The heartbeat is
+  now one process-wide thread (named `dispatch_policy.heartbeat`) beating
+  every running job in a single statement, so its connection demand is a
+  constant 1 rather than proportional to concurrency — it fits the spare
+  connection the adapters already ask for. The interval is re-read every
+  cycle, so changing `inflight_heartbeat_interval` (0 to disable) takes
+  effect without restarting the process, and the registry is dropped when
+  the process id changes so a forked child does not keep the inflight rows
+  of its parent's jobs alive. The registry counts EXECUTIONS rather than
+  job ids — ActiveJob reuses the job_id across retries, and at-least-once
+  delivery can put two deliveries of one job on one worker — and the loop
+  survives a failing cycle instead of exiting, since with one thread an
+  uncaught error costs every running job in the process rather than one.
+
+  **This needs one connection in the pool above the worker's thread
+  count**, and that is now stated as a requirement rather than as
+  headroom: with the Rails default sizing (pool and threads both from
+  `RAILS_MAX_THREADS`) a saturated worker leaves nothing for the beat, and
+  the same end-to-end failure still reproduces — measured with pool=3 and
+  3 running jobs, every beat raised `ConnectionTimeoutError` and the
+  sweeper deleted all three inflight rows while the jobs ran on. With
+  pool=4 the same run kept every row. That one timeout is now logged at
+  error level naming the sizing, instead of a warning indistinguishable
+  from any other.
+
+- **The dashboard stops calling a scheduled workload a stuck tick.**
+  Partitions parked behind a future `scheduled_eligible_at` counted as
+  "never checked" and dragged the round-trip percentiles, so an ordinary
+  `set(wait:)` workload showed a permanent "the tick is not getting
+  through them — increase partition_batch_size or shard" warning and an
+  ever-growing p95. They are excluded from those figures and reported on
+  their own as **Schedule-parked**.
+
 - **The documented separate-queue-database install can admit jobs.**
   `Repository.with_connection` opened its role on `ActiveRecord::Base`,
   which swaps the role for every class in that hierarchy — the host's own

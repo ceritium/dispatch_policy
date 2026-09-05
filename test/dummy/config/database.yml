@@ -1,7 +1,14 @@
 default: &default
   adapter: postgresql
   encoding: unicode
-  pool: <%= ENV.fetch("DB_POOL", 5) %>
+  # One ABOVE the worker's thread count (dummy.rake starts good_job with
+  # --max-threads=5). The gem's heartbeat thread needs a connection while
+  # every worker thread is holding one for the length of its perform, and
+  # at pool == threads it cannot get one: every beat raises
+  # ConnectionTimeoutError and the stale sweeper then deletes the inflight
+  # rows of jobs that are still running. config.rb states this as a
+  # requirement; the demo app shipped at exactly the boundary that fails.
+  pool: <%= ENV.fetch("DB_POOL", 6) %>
   host: <%= ENV.fetch("DB_HOST", "localhost") %>
   username: <%= ENV.fetch("DB_USER", ENV["USER"]) %>
   password: <%= ENV.fetch("DB_PASS", "") %>

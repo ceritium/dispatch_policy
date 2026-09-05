@@ -87,6 +87,13 @@ module DispatchPolicy
       # is 'active' (it was created after the pause). claim_partitions skips
       # the policy regardless, so surface the effective state.
       @policy_paused = PolicySetting.for_policy(@partition.policy_name).pick(:paused) || false
+      # Backoff, round-trip age and the decay elapsed time all read
+      # Postgres-written columns, so the database computes them rather than
+      # the view subtracting them from Time.current. See
+      # Repository#partition_clock_facts.
+      @clock_facts = Repository.partition_clock_facts(
+        policy_name: @partition.policy_name, partition_key: @partition.partition_key
+      )
     end
 
     def admit

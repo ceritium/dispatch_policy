@@ -138,9 +138,9 @@ class LivePolicyEditTest < DispatchPolicy::IntegrationTest
       policy_name: "adaptive_edit", partition_key: "acct:1", active_job_id: "aj-1"
     }])
 
-    admitted_at, key = DispatchPolicy::InflightTracker.lookup_admission("aj-1")
+    queue_lag_ms, key = DispatchPolicy::InflightTracker.lookup_admission("aj-1")
 
-    refute_nil admitted_at
+    refute_nil queue_lag_ms
     assert_equal "acct:1", key,
                  "recomputing gives tenant:1, which is not where the gate reads"
   end

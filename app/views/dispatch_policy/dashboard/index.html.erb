@@ -53,6 +53,7 @@
       <div class="dp-stats">
         <div class="dp-stat"><span class="dp-stat-label">Active w/ pending</span><span class="dp-stat-value"><%= format_count(@round_trip[:active_partitions]) %></span></div>
         <div class="dp-stat"><span class="dp-stat-label">Never checked</span><span class="dp-stat-value <%= "dp-warn" if @round_trip[:never_checked].positive? %>"><%= format_count(@round_trip[:never_checked]) %></span></div>
+        <div class="dp-stat"><span class="dp-stat-label">Schedule-parked</span><span class="dp-stat-value"><%= format_count(@round_trip[:schedule_parked]) %></span></div>
         <div class="dp-stat"><span class="dp-stat-label">In backoff</span><span class="dp-stat-value"><%= format_count(@round_trip[:in_backoff]) %></span></div>
         <div class="dp-stat"><span class="dp-stat-label">Oldest age</span><span class="dp-stat-value"><%= format_duration_seconds(@round_trip[:oldest_age_seconds]) %></span></div>
         <div class="dp-stat"><span class="dp-stat-label">P50 age</span><span class="dp-stat-value"><%= format_duration_seconds(@round_trip[:p50_age_seconds]) %></span></div>

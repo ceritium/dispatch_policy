@@ -6,6 +6,247 @@ are as of the commit named in the audit heading.
 
 ---
 
+# Follow-up pass 2026-09-02 — A1's lock order on the pause button, and A8/A10/A11/A12
+
+The fourth audit fixed A1 where it was measured — the deny flush — and
+CLAUDE.md recorded, as a known gap, that two other multi-row writers of
+`dispatch_policy_partitions` still had no lock order. One of them is the
+pause button. That one is fixed here, together with the four low findings
+whose common shape turned out to be the same as A10's and A11's: **a
+comparison whose two sides come from different clocks.**
+
+## Review round on this branch — three of the six fixes were defective
+
+Same discipline as the fourth audit's fix branch, same result, which is
+why it is recorded rather than quietly corrected. Three independent
+adversarial reviewers, each required to reproduce every claim by running
+something. What they found was again **in the fixes, not in the audit**:
+
+- **The pause fix introduced a worse bug than the one it fixed.** Dropping
+  the transaction made the two writes non-atomic against a CONCURRENT
+  click, not just against a crash. Resume clears the flag while pause is
+  still walking its slices, pause's remaining slices land afterwards, and
+  the policy ends with `paused = false` and every partition
+  `status = 'paused'`: nothing admits, the dashboard says the policy is
+  running, and it never heals — `upsert_partition!` does not write
+  `status`, and the sweeper needs a `pending_count` of 0 that an
+  unclaimable partition never reaches. 5 corrupt runs in 6 with the clicks
+  2ms apart; master's single transaction: 0 in 6. Fixed with a
+  `pg_try_advisory_lock` per policy, which serializes the clicks without
+  putting a row lock near the enqueue path.
+- **The A12 fix did not fix A12 at the sizing A12 names.** Demand went
+  from `2N` to 1, but at `pool == threads` the supply is 0 either way:
+  with pool=3 and 3 running jobs every beat still raised
+  `ConnectionTimeoutError` and the gem's own sweeper deleted all three
+  inflight rows while the jobs ran on. The fix is real but conditional on
+  `pool >= threads + 1`, which is now stated as a requirement in
+  `config.rb`, the CHANGELOG and CLAUDE.md, and the one timeout that says
+  so is logged at error level instead of as an indistinguishable warning.
+- **Two of the new tests were decorative**, and the mutation battery found
+  one of them only in a FULL run: counting the heartbeat's statements
+  races the loop, so mutation 44 was CAUGHT alone and SURVIVED among 43.
+  The other was an upper-bound assertion on the adaptive lag, which the
+  failure mode itself satisfies — an unknown wait is recorded as 0, and 0
+  is less than any bound. Both replaced with assertions that have no
+  window: the contents of the first beat, and a two-sided range.
+
+Three further defects the reviewers reproduced and this branch also fixes:
+the partition sweeper's DELETE was the last unordered multi-row writer of
+`partitions` (8-10 deadlocks per 20s against one byte-ordered transaction
+over 40 partitions, 0 after — see the retraction-of-a-retraction below);
+`StagedJob.due` — the scope the drain
+button counts with — was still on the session clock; and a forked child
+inherited the heartbeat registry and beat its parent's jobs, keeping rows
+fresh that nothing would ever release.
+
+Two gaps they found in the tests rather than the code are closed with
+mutations 45-51, and one they found in the reasoning is recorded above:
+`clock_timestamp()` vs `now()` was unpinned by any test even after the
+range fix, because the range closed the "measured after the block" half
+and not the "transaction timestamp" half.
+
+**A second and third round on the same branch** found five more, and all
+of the code ones are the price of collapsing N heartbeat threads into one
+— a price the first fix had not paid:
+
+- an uncaught error EXITED the loop, so one bad cycle stopped every
+  running job in the process being heartbeated, and only a NEW
+  registration reinstalled the thread (a worker full of long jobs produces
+  none). It rescues per cycle and retries now.
+- `next if alive.nil?` was load-bearing and nothing pinned it: nil from
+  `beat!` means the database was unreachable, not that every job finished,
+  and reading it as an empty survivor list unregisters every running job
+  on ONE transient failure, permanently.
+- the registry mapped an id to `true`. ActiveJob reuses the job_id across
+  retries, so a retry registering while a beat was in flight was pruned by
+  the answer to a question about its predecessor; and two deliveries of
+  one job on one worker shared an entry, so stopping the first silenced
+  the second. It maps an id to the sequence numbers of the executions
+  under it now.
+
+Plus two in the tests. The deadlock test's gate polled
+`pg_locks WHERE NOT granted`, which is CLUSTER-wide: any backend anywhere
+satisfied it, so the enqueuer reached for the second key before the click
+was near it and the test passed against the bug. Rescoped to this
+database, this table and a backend that is not us — and that version then
+needs `pg_stat_clear_snapshot()`, because the poll runs inside the
+enqueuer's open transaction and Postgres caches pg_stat_activity for the
+life of one. With both, reverting the lock order fails the test with
+`ActiveRecord::Deadlocked`, which is what it always claimed to do. And
+`rake mutations:check` exists now: four catalogue entries went stale in a
+single sitting, each because a fix edited a line an older mutation already
+breaks, and a stale entry proves nothing while reading exactly like a
+passing one.
+
+## P1 — Pausing a policy deadlocks against an ordinary bulk enqueue
+
+`PoliciesController#pause` / `#resume` wrote every partition row of the
+policy with `Partition.for_policy(name).update_all(...)`, inside a
+transaction, with no lock order: a seq scan locks in heap order, an index
+scan in the database's collation, and neither is the byte order
+`stage_many!` sorts by. Reproduced deterministically (two connections, the
+enqueue side holding the byte-lowest key and reaching for the highest only
+once the click is provably blocked on a row lock):
+
+```
+MODE=old  errors: [["click", "ActiveRecord::Deadlocked", …]]
+          policy flag paused: nil     partitions marked paused: 0/2
+MODE=new  errors: []
+          policy flag paused: true    partitions marked paused: 2/2
+```
+
+That is the whole severity: the deadlock rolls back the controller's
+transaction, so the policy is **not** paused, the tick keeps admitting,
+and the request answers 500 with nothing saying the pause failed —
+during the load that made someone click pause, which is the only time
+anyone does.
+
+Fixed with an ordered `SELECT … FOR UPDATE` before the write, exactly as
+A1 was, and sliced (`PARTITION_STATUS_BATCH`) so a policy with tens of
+thousands of partitions does not hold every row lock behind one click —
+which would replace A1's deadlock with A1's lock convoy. Slicing costs
+all-or-nothing, so the controller orders its two writes to fail closed
+instead: the policy-level flag (the source of truth the tick reads) is
+written first on pause and last on resume, and every partial state is
+"more paused", never "the UI says paused while admission runs".
+
+## A11 — Scheduled work read on the database session's clock
+
+Every datetime column here is `timestamp WITHOUT time zone`.
+`scheduled_at`, and the `scheduled_eligible_at` horizon derived from it,
+are written by the application and serialized by `quoted_date`; the four
+comparisons that decided whether that work was due used `now()`, a
+timestamptz, so Postgres reinterpreted the stored value in the session
+TimeZone:
+
+```
+SET timezone='America/New_York';
+SELECT timestamp '2026-09-01 22:25:58' <= now();   -- a job due in 1 minute
+ ?column?
+----------
+ f                                     -- and for the next four hours
+```
+
+Rails sets that session to UTC by default, which is why this hid: it
+needs a host that sets `variables: { timezone: … }` in `database.yml` —
+a supported knob, commonly used to make raw psql output readable. Then
+`set(wait:)` runs off by the session's UTC offset — early by it east of
+UTC, late by it west — and nothing anywhere records the difference. Fixed by binding
+`config.now` on both sides. `next_eligible_at` deliberately stays on
+`now()`: Postgres writes it, so that is the clock it must be read on.
+
+## A10 — The adaptive gate's feedback signal spanned two clocks
+
+`queue_lag = Time.current - admitted_at` subtracted the worker's clock
+from a timestamp Postgres wrote on the tick's connection. It is the AIMD
+controller's only input, so a host a few hundred milliseconds fast against
+`target_lag_ms` reads every job as late, shrinks `current_max` on every
+observation and never grows it back — the cap collapses to `min` and stays
+there. The lag is now computed by the database in the same statement that
+already reads the admission row, with `clock_timestamp()` rather than
+`now()` so a host that wraps the perform in a transaction does not report
+"time since that transaction opened".
+
+## A12 — The heartbeat competed with the workers for their own pool
+
+One thread per running job, each checking out its own connection, against
+a pool the Rails default sizes to the worker's thread count — while every
+performing job holds one for the length of its perform. Demand was
+therefore `2N` against a pool of `N`: the beats queue behind
+`checkout_timeout`, raise, get swallowed as best-effort, and
+`heartbeat_at` stops advancing. That is exactly what the stale sweeper
+reaps, so a still-running job loses its inflight row and the concurrency
+gate re-admits against an occupied slot — the cap lapses under precisely
+the load that makes it matter.
+
+Now one process-wide thread beats every running job in one statement, so
+the heartbeat's connection demand is a constant 1 instead of `N`, which
+fits the single spare connection the adapters already ask for. It does
+not make starvation impossible; it stops it scaling with concurrency. The
+beat's `RETURNING` also tells the registry which rows still exist, so an
+id whose thread was killed before `track`'s ensure is dropped rather than
+carried for the life of the process.
+
+## A8 — A scheduled workload read as a stuck tick
+
+Partitions parked behind a future horizon counted as "never checked" —
+which fires the hint "the tick is not getting through them — increase
+partition_batch_size or shard", pointing the operator at the one knob
+that cannot help — and their frozen `last_checked_at` dragged the
+round-trip percentiles toward infinity. They are excluded from both and
+reported on their own as `schedule_parked`.
+
+## A13 — the dashboard renders naive timestamps as if they were UTC
+
+Open. `format_time` is `time.utc.strftime`, and every datetime column the
+gem owns is `timestamp WITHOUT time zone`. On a session whose TimeZone is
+not UTC — the `variables: { timezone: … }` install this whole branch
+exists for — Postgres writes local wall clock into those columns and
+ActiveRecord reads them back as UTC.
+
+**It is exactly half the columns, and which half matters.**
+Postgres-written ones (`next_eligible_at`, `last_checked_at`,
+`last_admit_at`, `last_enqueued_at`, `context_updated_at`,
+`staged_jobs.enqueued_at`, `failed_at`) render offset by the session's
+UTC offset. Application-written ones (`staged_jobs.scheduled_at` and the
+`scheduled_eligible_at` horizon derived from it) render CORRECTLY — they
+were bound from Ruby as UTC and come back as the UTC they were written in.
+An earlier version of this entry said "every rendered timestamp on every
+page", which would send whoever fixes it to apply a blanket offset and
+break the half that is right.
+
+So the dashboard is ALREADY internally inconsistent, and adjacently:
+`partitions/show.html.erb` puts "Next eligible" (offset) and "Scheduled
+horizon" (correct) on neighbouring `<li>`s; `staged_jobs/show.html.erb`
+does the same with `enqueued_at` and `scheduled_at`. "A per-call fix would
+make it inconsistent, which is worse than uniformly offset" was the
+deferral reason written here, and it is false in both halves — it is not
+uniform, and it is already inconsistent.
+
+The real reason to defer is smaller and honest: fixing it means deciding
+once, for the whole engine, whether it renders in UTC, in the session's
+zone or in the operator's, and then knowing at every call site which kind
+of column it holds. That is a UI change with its own design, and this
+branch is about admission. Found by a reviewer after the partition page's
+COMPARISONS were moved onto the writing clock: the page now decides
+correctly and prints the decision beside a timestamp that disagrees with
+it — "Backoff until 17:00:39" over a footer reading "now: 21:00:38".
+
+The comparisons are what admission depends on, and those are correct.
+
+## A9 — left open, deliberately
+
+The pending sparkline drops periods with no tick samples, so a tick loop
+that dies reads as a backlog that stopped growing. The query change is
+easy and would be wrong: zero-filling the gaps asserts a pending total of
+zero for a window nobody measured, which is a different lie in the same
+place. The honest fix is a gap-aware series plus an explicit "no ticks in
+this window" signal — a UI change with its own design, not a tweak to
+`tick_samples_buckets`, and out of scope for a pass about clocks and lock
+order.
+
+---
+
 # Audit 2026-08-30 — whole-gem hunt, fourth pass (`c4c6475`)
 
 Six hunters over the ground the first three passes did not cover, each
@@ -26,7 +267,8 @@ documented multi-database install), interaction (two ordinary
 participants deadlocking), and failure (one bad row wedging a partition
 forever).
 
-> **Status:** A1-A7 fixed. A8-A12 recorded, not fixed.
+> **Status:** A1-A7 fixed. A8, A10, A11 and A12 fixed in the follow-up
+> pass below; A9 still open, with its reasoning there.
 
 ## Five review rounds on the fix branch
 
@@ -137,21 +379,24 @@ never pushed into the sort and it spills at ANY limit — 13.7 MB even at
 `LIMIT 1`. Remove the locking clause and the same query becomes a 40 kB
 top-N heapsort, which is where the "could not reproduce" came from.
 
-## Low — recorded, not fixed
+## Low — recorded
 
-- **A8** Round-trip stats count schedule-parked partitions as "never
-  checked", so a normal `set(wait:)` workload shows a red dashboard.
-- **A9** The pending sparkline averages across policies and drops empty
-  periods, so a dead tick loop reads as a falling backlog.
-- **A10** The adaptive gate's `queue_lag` subtracts the worker's clock
-  from the database's, so host skew above `target_lag_ms` shrinks the cap
-  permanently.
-- **A11** Scheduled-work comparisons mix an app-written timestamp with
-  Postgres `now()`, so a non-UTC session TimeZone runs `set(wait:)` jobs
-  early (or never).
-- **A12** The heartbeat thread contends for the same pool the worker
-  holds for the whole perform; at the Rails-default pool size a beat that
-  lands early and then starves can get a still-running job swept as stale.
+All but A9 are fixed; see the follow-up pass at the top of this file.
+
+- **A8** *(fixed)* Round-trip stats count schedule-parked partitions as
+  "never checked", so a normal `set(wait:)` workload shows a red dashboard.
+- **A9** *(open)* The pending sparkline averages across policies and drops
+  empty periods, so a dead tick loop reads as a falling backlog.
+- **A10** *(fixed)* The adaptive gate's `queue_lag` subtracts the worker's
+  clock from the database's, so host skew above `target_lag_ms` shrinks the
+  cap permanently.
+- **A11** *(fixed)* Scheduled-work comparisons mix an app-written timestamp
+  with Postgres `now()`, so a non-UTC session TimeZone runs `set(wait:)`
+  jobs early (or never).
+- **A12** *(fixed)* The heartbeat thread contends for the same pool the
+  worker holds for the whole perform; at the Rails-default pool size a beat
+  that lands early and then starves can get a still-running job swept as
+  stale.
 
 ## Verified against the real adapter
 

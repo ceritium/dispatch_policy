@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require "json"
+require "zlib"
 
 module DispatchPolicy
   # SQL access layer for staged_jobs / partitions / inflight_jobs.
@@ -34,7 +35,28 @@ module DispatchPolicy
       POLICY_SETTINGS_TABLE
     ].freeze
 
+    # "Waiting on the clock, not on the tick": the partition holds a
+    # scheduled horizon that has not arrived, so `claim_partitions` skips
+    # it on purpose and its `last_checked_at` is meant to stand still.
+    # `$1` is the bound application clock — the horizon is an app-written
+    # timestamp and `now()` would read it in the session's TimeZone; see
+    # `claim_partitions`.
+    PARKED_SQL = "(p.scheduled_eligible_at IS NOT NULL AND p.scheduled_eligible_at > $1)"
+
     module_function
+
+    # The application clock, as a Time, for binding into SQL.
+    #
+    # `config.clock` is public API and every other reader in the gem calls
+    # `.to_f` on what it returns, so a lambda handing back an epoch Float
+    # has always worked. Binding that value as a timestamp parameter does
+    # not — Postgres rejects "1788304522.524707" as a timestamp — so the
+    # coercion lives here rather than narrowing a documented contract as a
+    # side effect of moving these comparisons onto the app clock.
+    def app_clock
+      value = DispatchPolicy.config.now
+      value.is_a?(Numeric) ? Time.at(value).utc : value
+    end
 
     # The class the gem opens its connection on — which must be the class
     # the ADAPTER writes through, because the whole at-least-once
@@ -255,8 +277,36 @@ module DispatchPolicy
     # When `shard` is non-nil, only partitions on that shard are claimed —
     # this lets several tick processes work on the same policy in parallel,
     # one per shard.
+    #
+    # **`scheduled_eligible_at` is compared against a BOUND clock, not
+    # `now()`.** Both horizons in the WHERE look alike and are not:
+    # `next_eligible_at` is written by Postgres (`now() + interval`), while
+    # `scheduled_eligible_at` comes from the application — it is the
+    # `scheduled_at` ActiveJob put on the job, bound as a parameter by
+    # `upsert_partition!`. The gem's datetime columns are `timestamp
+    # WITHOUT time zone`, so comparing one against `now()` (a timestamptz)
+    # makes Postgres reinterpret the stored value in the SESSION TimeZone.
+    # Rails normally keeps that at UTC, matching what it writes — but a
+    # host that sets `variables: { timezone: … }` in database.yml (a
+    # supported knob, and a common one for readable psql output) breaks the
+    # match, and scheduled work then runs off by the offset: early on a
+    # zone east of UTC, LATE by it on one west. It always fires, at the
+    # wrong hour, and nothing records the difference.
+    # Binding the clock puts both sides of the comparison through the same
+    # `quoted_date` the write went through, so they agree under any
+    # combination of session TimeZone and `ActiveRecord.default_timezone`.
+    # `next_eligible_at` stays on `now()` for exactly the same reason: it
+    # is written on that clock, so that is the clock it must be read on.
+    #
+    # `decay_elapsed_seconds` is returned for the same rule, from the other
+    # side. `decayed_admits_at` is Postgres-written (`record_partition_admit!`
+    # sets it to `now()`), and the Tick's in-memory fairness reorder used to
+    # subtract it from `Time.current` — the A10 crossing exactly, in the one
+    # place nobody looked. Computing the elapsed time HERE, in the same
+    # statement and the same frame the column was written in, is what makes
+    # the reorder independent of the session's TimeZone.
     def claim_partitions(policy_name:, limit:, shard: nil)
-      params      = [policy_name]
+      params      = [policy_name, app_clock]
       shard_sql   = ""
       if shard
         params    << shard
@@ -271,7 +321,7 @@ module DispatchPolicy
             AND status = 'active'
             AND pending_count > 0
             AND (next_eligible_at IS NULL OR next_eligible_at <= now())
-            AND (scheduled_eligible_at IS NULL OR scheduled_eligible_at <= now())
+            AND (scheduled_eligible_at IS NULL OR scheduled_eligible_at <= $2)
             AND NOT EXISTS (
               SELECT 1 FROM #{POLICY_SETTINGS_TABLE} ps
               WHERE ps.policy_name = $1 AND ps.paused
@@ -285,7 +335,8 @@ module DispatchPolicy
         SET last_checked_at = now()
         FROM candidates
         WHERE p.id = candidates.id
-        RETURNING p.*
+        RETURNING p.*,
+          EXTRACT(EPOCH FROM (now() - p.decayed_admits_at)) AS decay_elapsed_seconds
       SQL
       result = connection.exec_query(sql, "claim_partitions", params)
       result.to_a.map { |row| normalize_partition(row) }
@@ -312,6 +363,13 @@ module DispatchPolicy
       # LEAST urgent work first and could starve an urgent job behind a
       # steady stream of default-priority ones.
       #
+      # `scheduled_at` is compared against a bound clock rather than
+      # `now()`: it is an application-written timestamp and `now()` is a
+      # timestamptz, so on a session whose TimeZone is not what Rails
+      # serialized the write with, the implicit cast shifts every due-time
+      # comparison by the offset. Same rule, and the same reason, as the
+      # horizon in `claim_partitions`.
+      #
       # (Keep comments out of the heredoc: it is `.squish`ed onto one
       # line, where a `--` would comment out the rest of the statement.)
       sql_select = <<~SQL.squish
@@ -319,7 +377,7 @@ module DispatchPolicy
           SELECT id FROM #{STAGED_TABLE}
           WHERE policy_name = $1 AND partition_key = $2
             AND failed_at IS NULL
-            AND (scheduled_at IS NULL OR scheduled_at <= now())
+            AND (scheduled_at IS NULL OR scheduled_at <= $4)
           ORDER BY priority ASC, scheduled_at NULLS FIRST, id
           LIMIT $3
           FOR UPDATE SKIP LOCKED
@@ -329,7 +387,10 @@ module DispatchPolicy
         WHERE s.id = claimed.id
         RETURNING s.*
       SQL
-      rows = connection.exec_query(sql_select, "claim_staged_jobs", [policy_name, partition_key, limit]).to_a
+      rows = connection.exec_query(
+        sql_select, "claim_staged_jobs",
+        [policy_name, partition_key, limit, app_clock]
+      ).to_a
 
       # The gate_state patch may depend on how many rows we actually
       # claimed (e.g. the throttle charges its bucket for jobs admitted,
@@ -646,6 +707,12 @@ module DispatchPolicy
     # the partition for work nothing will claim. No test pins it; nothing
     # can, by construction.
     #
+    # Both `scheduled_at` comparisons take a bound clock, not `now()` —
+    # the horizon this writes is read back by `claim_partitions` under the
+    # same rule, and a park computed on the database's session TimeZone
+    # against an app-written timestamp is the one that either wakes the
+    # partition early or never. See `claim_partitions`.
+    #
     # The NOT EXISTS is what keeps this from hiding work it cannot see.
     # This runs after the claim's DELETE and after `record_partition_admit!`
     # takes the row lock, and its own subquery only looks at rows
@@ -662,7 +729,7 @@ module DispatchPolicy
                 SELECT MIN(s.scheduled_at) FROM #{STAGED_TABLE} s
                 WHERE s.policy_name = $1 AND s.partition_key = $2
                   AND s.failed_at IS NULL
-                  AND s.scheduled_at > now()
+                  AND s.scheduled_at > $3
               ),
               updated_at = now()
           WHERE p.policy_name = $1 AND p.partition_key = $2
@@ -670,11 +737,11 @@ module DispatchPolicy
               SELECT 1 FROM #{STAGED_TABLE} d
               WHERE d.policy_name = $1 AND d.partition_key = $2
                 AND d.failed_at IS NULL
-                AND (d.scheduled_at IS NULL OR d.scheduled_at <= now())
+                AND (d.scheduled_at IS NULL OR d.scheduled_at <= $3)
             )
         SQL
         "defer_partition_to_next_scheduled",
-        [policy_name, partition_key]
+        [policy_name, partition_key, app_clock]
       )
     end
 
@@ -791,6 +858,156 @@ module DispatchPolicy
       )
     end
 
+    # Advisory-lock namespace for the pause/resume button. The TWO-INT form
+    # of pg_advisory_lock has its own key space, separate from the 64-bit
+    # form good_job takes its locks in, so a hash collision with the host's
+    # queue adapter is not possible — only with another caller using this
+    # same classid.
+    PAUSE_LOCK_CLASS = 0x64_70_00_01 # "dp" + 1, inside int4
+
+    # Serialize the pause/resume button for one policy, holding NO row lock.
+    #
+    # The two writes it guards cannot share a transaction — `set_partitions_status!`
+    # slices precisely so a large policy does not hold every partition's row
+    # lock behind one click — and without a transaction they are no longer
+    # atomic against each OTHER. Two overlapping clicks interleave: a resume
+    # clears the flag while a pause is still walking its slices, the pause's
+    # remaining slices land afterwards, and the policy ends up with
+    # `paused = false` and every partition `status = 'paused'`. Nothing
+    # admits, and the dashboard says the policy is running. It does not
+    # self-heal: `upsert_partition!` never writes `status`, and
+    # `sweep_inactive_partitions!` needs `pending_count = 0`, which a
+    # partition that can never be claimed never reaches. Measured at 5
+    # corrupt runs in 6 with two clicks 2ms apart; 0 in 6 with the single
+    # transaction this replaced.
+    #
+    # An advisory lock is what fits: it serializes the two CLICKS without
+    # putting a row lock anywhere near the enqueue path. `try` rather than
+    # a wait, because this runs in a web request — a second operator gets
+    # "try again" instead of a hung page, and the button is idempotent.
+    #
+    # Returns false when another click holds the lock, without running the
+    # block.
+    def with_policy_pause_lock(policy_name:)
+      objid = policy_lock_id(policy_name)
+      return false unless connection.select_value(
+        "SELECT pg_try_advisory_lock(#{Integer(PAUSE_LOCK_CLASS)}, #{Integer(objid)})"
+      )
+
+      begin
+        yield
+      ensure
+        begin
+          connection.select_value(
+            "SELECT pg_advisory_unlock(#{Integer(PAUSE_LOCK_CLASS)}, #{Integer(objid)})"
+          )
+        rescue StandardError => e
+          # Do not let the release replace the caller's exception.
+          #
+          # The case this was written for is a connection already in an
+          # aborted transaction — which needs a HOST that wraps the action
+          # in one, since the gem's controller does not — and there the
+          # unlock cannot run at all: this rescue buys the real error
+          # message back and NOT the release, so the lock stays held until
+          # that backend goes away. It is not the only way to get here
+          # (a dropped connection, a statement timeout, a shutdown mid-
+          # request will do), and in some of those the lock is already
+          # gone with the session. The log says what it costs IF it is
+          # still held, because this layer cannot tell the two apart.
+          DispatchPolicy.config.logger&.error(
+            "[dispatch_policy] could not release the pause lock for #{policy_name}: " \
+            "#{e.class}: #{e.message}. Pause/resume for this policy will be refused on " \
+            "every OTHER connection until this backend is gone."
+          )
+        end
+      end
+      true
+    end
+
+    # CRC32 of the policy name folded into a signed int4, which is what
+    # pg_advisory_lock's two-int form takes.
+    def policy_lock_id(policy_name)
+      [Zlib.crc32(policy_name.to_s)].pack("L").unpack1("l")
+    end
+
+    # Partitions per status-flip transaction. Same two bounds as
+    # QUARANTINE_RELEASE_BATCH: Postgres' 65,535-parameter ceiling, and the
+    # length of time a single transaction holds FOR UPDATE on every row it
+    # touches — here that would be every partition of the policy, blocking
+    # each `perform_later` for it behind an operator's click.
+    PARTITION_STATUS_BATCH = 1_000
+
+    # Flip `status` on every partition of a policy, taking the row locks in
+    # the same BYTE order `stage_many!` sorts by.
+    #
+    # This is the pause/resume button. It used to be one
+    # `Partition.for_policy(name).update_all(...)`, which writes many
+    # partition rows with no lock order of its own: an index scan locks in
+    # the DATABASE's collation and a seq scan locks in heap order, neither
+    # of which is the order a concurrent `stage_many!` uses. That is A1's
+    # deadlock in the worst possible place — the click happens during the
+    # load that made someone want to pause, the deadlock rolls the
+    # controller's transaction back, so the policy is NOT paused, the tick
+    # keeps admitting, and the request 500s with nothing saying the pause
+    # failed. Measured at 5 deadlocks in 12 clicks against one
+    # bulk-enqueuing process.
+    #
+    # `COLLATE "C"` is not decoration: a bare ORDER BY inherits the
+    # database collation, and en_US.UTF-8 — the default on RDS, Heroku, the
+    # official postgres image and Debian/Ubuntu — disagrees with byte order
+    # on ordinary keys (acct:10 vs acct:1:eu, acme vs Acme). Two writers
+    # ordering by different collations is not ordering at all.
+    #
+    # Sliced, so a policy with tens of thousands of partitions does not
+    # hold every row lock for the whole flip. That costs the all-or-nothing
+    # property the old single transaction had, which is why the CALLER
+    # orders the two writes so any partial state fails CLOSED — see
+    # PoliciesController#pause / #resume. Byte order is preserved across
+    # slices, so the invariant that matters still holds.
+    def set_partitions_status!(policy_name:, status:)
+      keys = connection.exec_query(
+        <<~SQL.squish,
+          SELECT partition_key FROM #{PARTITIONS_TABLE}
+          WHERE policy_name = $1
+          ORDER BY partition_key COLLATE "C"
+        SQL
+        "partitions_for_status_flip",
+        [policy_name]
+      ).rows.flatten
+      return 0 if keys.empty?
+
+      updated = 0
+      keys.each_slice(PARTITION_STATUS_BATCH) do |slice|
+        lock_keys   = slice.each_index.map { |i| "$#{i + 2}" }.join(", ")
+        update_keys = slice.each_index.map { |i| "$#{i + 3}" }.join(", ")
+
+        connection.transaction(requires_new: true) do
+          connection.exec_query(
+            <<~SQL.squish,
+              SELECT 1 FROM #{PARTITIONS_TABLE}
+              WHERE policy_name = $1 AND partition_key IN (#{lock_keys})
+              ORDER BY policy_name COLLATE "C", partition_key COLLATE "C"
+              FOR UPDATE
+            SQL
+            "lock_partitions_for_status",
+            [policy_name, *slice]
+          )
+
+          updated += connection.exec_query(
+            <<~SQL.squish,
+              UPDATE #{PARTITIONS_TABLE}
+              SET status = $2, updated_at = now()
+              WHERE policy_name = $1 AND partition_key IN (#{update_keys})
+              RETURNING 1
+            SQL
+            "set_partitions_status",
+            [policy_name, status, *slice]
+          ).rows.size
+        end
+      end
+      updated
+    end
+
     # ----- inflight tracking ---------------------------------------------------
 
     def insert_inflight!(rows)
@@ -833,12 +1050,31 @@ module DispatchPolicy
       )
     end
 
-    def heartbeat_inflight!(active_job_id:)
+    # Refresh the heartbeat of every job this process is running, in ONE
+    # statement. A12: there used to be a heartbeat thread per running job,
+    # each checking out its own connection, against a pool the Rails
+    # default sizes to the worker's thread count — so a saturated worker
+    # had every connection held by a performing job and the beats queued
+    # behind `checkout_timeout`. A beat that never lands is a row whose
+    # `heartbeat_at` stops advancing, which is exactly what the stale
+    # sweeper reaps: the concurrency gate then re-admits against a slot a
+    # job is still occupying. One thread, one checkout per interval, one
+    # statement for all of them. See InflightTracker.heartbeat_loop.
+    # Returns the ids that still had a row, which is how the heartbeat
+    # registry learns that a job is gone: a thread killed before `track`'s
+    # ensure never unregisters itself, and without this the process would
+    # carry that id in every beat for the rest of its life.
+    def heartbeat_inflight!(active_job_ids:)
+      ids = Array(active_job_ids)
+      return [] if ids.empty?
+
+      placeholders = ids.each_index.map { |i| "$#{i + 1}" }.join(", ")
       connection.exec_query(
-        "UPDATE #{INFLIGHT_TABLE} SET heartbeat_at = now() WHERE active_job_id = $1",
+        "UPDATE #{INFLIGHT_TABLE} SET heartbeat_at = now() " \
+        "WHERE active_job_id IN (#{placeholders}) RETURNING active_job_id",
         "heartbeat_inflight",
-        [active_job_id]
-      )
+        ids
+      ).rows.flatten
     end
 
     def count_inflight(policy_name:, partition_key:)
@@ -894,6 +1130,20 @@ module DispatchPolicy
     # Records one row per Tick.run with admission and timing aggregates so the
     # operator UI can display rates over time without sampling on the read
     # path.
+    # `sampled_at` is written from the APPLICATION clock, not `now()`.
+    #
+    # Every reader of this column is an application-supplied window —
+    # `sample_filter`, `tick_summaries_by_policy`,
+    # `top_denied_reason_by_policy`, `tick_samples_buckets`, and the
+    # retention sweep — all comparing against a Ruby `Time`. Written with
+    # `now()` it would land in the SESSION TimeZone while those bounds are
+    # serialized by `quoted_date`, so under a host that sets
+    # `variables: { timezone: … }` in database.yml the dashboard's 1m/5m/15m
+    # windows would be off by the offset: empty in one direction, and
+    # everything-for-hours in the other. Same mismatch as A11, in mirror
+    # image — there the column was app-written and read with `now()`.
+    # CLAUDE.md listed this column among the Postgres-written ones, which
+    # was simply wrong, and is what a reviewer caught.
     def record_tick_sample!(policy_name:, duration_ms:, partitions_seen:, partitions_admitted:,
                             partitions_denied:, jobs_admitted:, forward_failures:,
                             pending_total:, inflight_total:, denied_reasons:)
@@ -903,12 +1153,13 @@ module DispatchPolicy
             (policy_name, sampled_at, duration_ms, partitions_seen, partitions_admitted,
              partitions_denied, jobs_admitted, forward_failures, pending_total,
              inflight_total, denied_reasons)
-          VALUES ($1, now(), $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb)
+          VALUES ($1, $11, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb)
         SQL
         "record_tick_sample",
         [policy_name, duration_ms.to_i, partitions_seen.to_i, partitions_admitted.to_i,
          partitions_denied.to_i, jobs_admitted.to_i, forward_failures.to_i,
-         pending_total.to_i, inflight_total.to_i, JSON.dump(denied_reasons || {})]
+         pending_total.to_i, inflight_total.to_i, JSON.dump(denied_reasons || {}),
+         app_clock]
       )
     end
 
@@ -1087,12 +1338,34 @@ module DispatchPolicy
     # Round-trip statistics across active partitions: how stale is the most-
     # stale partition the tick has yet to revisit? P50/P95/oldest ages help
     # decide if partition_batch_size needs to grow or ticks need sharding.
+    # A8: partitions parked on future work are excluded from the round-trip
+    # figures and counted separately.
+    #
+    # `never_checked` feeds an operator hint that reads "the tick is not
+    # getting through them — increase partition_batch_size or shard". A
+    # partition holding nothing but `set(wait: 1.week)` jobs has
+    # `pending_count > 0` and `last_checked_at IS NULL` and is CORRECTLY
+    # never claimed — `claim_partitions` skips it until its horizon. Counted
+    # in, an ordinary scheduled workload turns that hint on permanently and
+    # points the operator at the one knob that cannot help. The age
+    # percentiles have the same problem from the other end: a parked
+    # partition's `last_checked_at` never advances, so it drags the p95
+    # round trip toward infinity while the tick is perfectly healthy.
+    #
+    # `active_partitions` still counts them — it answers "how many
+    # partitions hold work", which is true of a parked one — and
+    # `schedule_parked` says how many of those are waiting on the clock
+    # rather than on the tick.
+    #
+    # The horizon is an application-written timestamp, so it is compared
+    # against a bound clock and not `now()`; see `claim_partitions` for why
+    # that distinction is not cosmetic.
     def partition_round_trip_stats(policy_name: nil)
       filter_sql = "WHERE p.status = 'active' AND p.pending_count > 0"
-      params     = []
+      params     = [app_clock]
       if policy_name
-        filter_sql += " AND p.policy_name = $1"
         params << policy_name
+        filter_sql += " AND p.policy_name = $#{params.size}"
       end
 
       # For ages (now - last_checked_at) the percentile direction inverts:
@@ -1105,11 +1378,12 @@ module DispatchPolicy
         <<~SQL.squish,
           SELECT
             COUNT(*)::int AS active_partitions,
-            COUNT(*) FILTER (WHERE p.last_checked_at IS NULL)::int AS never_checked,
+            COUNT(*) FILTER (WHERE p.last_checked_at IS NULL AND NOT #{PARKED_SQL})::int AS never_checked,
+            COUNT(*) FILTER (WHERE #{PARKED_SQL})::int AS schedule_parked,
             COUNT(*) FILTER (WHERE p.next_eligible_at IS NOT NULL AND p.next_eligible_at > now())::int AS in_backoff,
-            EXTRACT(EPOCH FROM (now() - MIN(p.last_checked_at)))::float AS oldest_age_seconds,
-            EXTRACT(EPOCH FROM (now() - PERCENTILE_DISC(0.5)  WITHIN GROUP (ORDER BY p.last_checked_at)))::float AS p50_age_seconds,
-            EXTRACT(EPOCH FROM (now() - PERCENTILE_DISC(0.05) WITHIN GROUP (ORDER BY p.last_checked_at)))::float AS p95_age_seconds
+            EXTRACT(EPOCH FROM (now() - MIN(p.last_checked_at) FILTER (WHERE NOT #{PARKED_SQL})))::float AS oldest_age_seconds,
+            EXTRACT(EPOCH FROM (now() - PERCENTILE_DISC(0.5)  WITHIN GROUP (ORDER BY p.last_checked_at) FILTER (WHERE NOT #{PARKED_SQL})))::float AS p50_age_seconds,
+            EXTRACT(EPOCH FROM (now() - PERCENTILE_DISC(0.05) WITHIN GROUP (ORDER BY p.last_checked_at) FILTER (WHERE NOT #{PARKED_SQL})))::float AS p95_age_seconds
           FROM #{PARTITIONS_TABLE} p
           #{filter_sql}
         SQL
@@ -1120,10 +1394,66 @@ module DispatchPolicy
       {
         active_partitions:  row["active_partitions"].to_i,
         never_checked:      row["never_checked"].to_i,
+        schedule_parked:    row["schedule_parked"].to_i,
         in_backoff:         row["in_backoff"].to_i,
         oldest_age_seconds: row["oldest_age_seconds"]&.to_f,
         p50_age_seconds:    row["p50_age_seconds"]&.to_f,
         p95_age_seconds:    row["p95_age_seconds"]&.to_f
+      }
+    end
+
+    # The four clock-dependent facts the partition page renders, computed
+    # BY THE DATABASE.
+    #
+    # Three of them read Postgres-written columns — `next_eligible_at`,
+    # `last_checked_at` and `decayed_admits_at` — and the page used to
+    # compare all three against `Time.current`. That is the A10/A11
+    # crossing, and it survived the fix that removed the identical
+    # expression from `Tick#fairness_elapsed`, because nothing in the suite
+    # looked at it. ("A Rails view is unreachable from
+    # this suite" was the excuse written here, and it is false: Rails does
+    # not boot, but ERB is a template — `partition_view_test.rb` renders
+    # this one's own logic. The excuse outlived the belief by one commit,
+    # which is how it kept working.)
+    #
+    # Measured, and the DIRECTION differs per column, which is why the test
+    # covers both. East of UTC (the stored value reads as being in the
+    # future) the page rendered a decayed-admits EWMA of 10.00 where the
+    # Tick's own sort key was 0.0098, and a round-trip age of minus ten
+    # hours; it also reported backoff for partitions whose backoff had
+    # expired hours earlier. West of UTC it reported NO backoff for a
+    # partition the tick provably would not claim for another five
+    # minutes, and every EWMA as 0.00. A comment here once attributed the
+    # no-backoff symptom to the eastward skew, which sent the reader to
+    # reproduce it in the one direction where it cannot happen.
+    #
+    # It is the operator's only view of the numbers admission actually
+    # sorts by.
+    #
+    # `scheduled_eligible_at` is application-written, so it is the one the
+    # view may still compare in Ruby — and it is left there deliberately,
+    # as the reminder that which side a column belongs on is a property of
+    # who WRITES it, not of where it is read.
+    def partition_clock_facts(policy_name:, partition_key:)
+      row = connection.exec_query(
+        <<~SQL.squish,
+          SELECT
+            (next_eligible_at IS NOT NULL AND next_eligible_at > now())      AS in_backoff,
+            EXTRACT(EPOCH FROM (now() - last_checked_at))::float             AS age_seconds,
+            EXTRACT(EPOCH FROM (now() - decayed_admits_at))::float           AS decay_elapsed_seconds,
+            decayed_admits_at IS NOT NULL                                    AS has_decay_stamp
+          FROM #{PARTITIONS_TABLE}
+          WHERE policy_name = $1 AND partition_key = $2
+        SQL
+        "partition_clock_facts",
+        [policy_name, partition_key]
+      ).first || {}
+
+      {
+        in_backoff:            row["in_backoff"] == true || row["in_backoff"] == "t",
+        age_seconds:           row["age_seconds"]&.to_f,
+        decay_elapsed_seconds: row["decay_elapsed_seconds"]&.to_f,
+        has_decay_stamp:       row["has_decay_stamp"] == true || row["has_decay_stamp"] == "t"
       }
     end
 
@@ -1165,14 +1495,14 @@ module DispatchPolicy
           SELECT
             p.policy_name,
             COUNT(*) FILTER (WHERE p.next_eligible_at IS NOT NULL AND p.next_eligible_at > now())::int AS in_backoff,
-            EXTRACT(EPOCH FROM (now() - MIN(p.last_checked_at)))::float AS oldest_age_seconds,
-            EXTRACT(EPOCH FROM (now() - PERCENTILE_DISC(0.05) WITHIN GROUP (ORDER BY p.last_checked_at)))::float AS p95_age_seconds
+            EXTRACT(EPOCH FROM (now() - MIN(p.last_checked_at) FILTER (WHERE NOT #{PARKED_SQL})))::float AS oldest_age_seconds,
+            EXTRACT(EPOCH FROM (now() - PERCENTILE_DISC(0.05) WITHIN GROUP (ORDER BY p.last_checked_at) FILTER (WHERE NOT #{PARKED_SQL})))::float AS p95_age_seconds
           FROM #{PARTITIONS_TABLE} p
           WHERE p.status = 'active' AND p.pending_count > 0
           GROUP BY p.policy_name
         SQL
         "partition_round_trip_stats_by_policy",
-        []
+        [app_clock]
       )
       result.to_a.each_with_object({}) do |r, h|
         h[r["policy_name"]] = {
@@ -1293,11 +1623,12 @@ module DispatchPolicy
 
     # ----- tick samples sweep -------------------------------------------------
 
+    # On the application clock, because that is what writes `sampled_at`.
     def sweep_old_tick_samples!(cutoff_seconds:)
       connection.exec_query(
-        "DELETE FROM #{SAMPLES_TABLE} WHERE sampled_at < now() - ($1 || ' seconds')::interval",
+        "DELETE FROM #{SAMPLES_TABLE} WHERE sampled_at < $2::timestamp - ($1 || ' seconds')::interval",
         "sweep_old_tick_samples",
-        [cutoff_seconds.to_i]
+        [cutoff_seconds.to_i, app_clock]
       )
     end
 
@@ -1400,18 +1731,53 @@ module DispatchPolicy
         age_sql = "COALESCE(p.last_admit_at, p.created_at) < now() - ($1 || ' seconds')::interval"
       end
 
+      # Picks its victims in the same BYTE order every other multi-row
+      # writer of this table uses, and SKIPs any row somebody else already
+      # holds. A bare `DELETE … WHERE` locks in whatever order the plan
+      # produces — an index scan that tie-breaks equal keys by ctid, i.e.
+      # heap order — which is the A1 hazard exactly, and this was the last
+      # multi-row writer of the table still carrying it.
+      #
+      # Measured, after one retraction that was itself wrong: 8-10 deadlocks
+      # per 20s run against ONE process holding a byte-ordered transaction
+      # over 40 partitions, which is what `stage_many!` does; 0 with this
+      # CTE; three runs each, on a database with nobody else on it. An
+      # earlier harness reported 0 for BOTH and the retraction it produced
+      # went into three files — it recycled its partitions one key per
+      # autocommitted statement, so the writer it was racing never held two
+      # locks at once and never offered an inversion to invert. If you
+      # re-measure this, hold the locks in ONE transaction or you are
+      # measuring nothing.
+      #
+      # Postgres usually picks the sweep as the victim, and
+      # `TickLoop.sweep!`'s blanket rescue then silently skips the rest of
+      # that pass — partition GC, tick-sample GC and adaptive-stat GC.
+      #
+      # SKIP LOCKED as well as the order: the sweep is periodic and
+      # best-effort, so a partition somebody is writing right now is better
+      # left to the next pass than waited on. With nothing to wait for
+      # there is nothing to deadlock over, and the ordering keeps the
+      # guarantee if the SKIP is ever dropped.
       connection.exec_query(
         <<~SQL.squish,
-          DELETE FROM #{PARTITIONS_TABLE} p
-          WHERE p.pending_count = 0
-            #{filter}
-            AND #{age_sql}
-            #{refilled_bucket_sql}
-            AND NOT EXISTS (
-              SELECT 1 FROM #{STAGED_TABLE} s
-              WHERE s.policy_name = p.policy_name
-                AND s.partition_key = p.partition_key
-            )
+          WITH victims AS (
+            SELECT p.policy_name, p.partition_key
+            FROM #{PARTITIONS_TABLE} p
+            WHERE p.pending_count = 0
+              #{filter}
+              AND #{age_sql}
+              #{refilled_bucket_sql}
+              AND NOT EXISTS (
+                SELECT 1 FROM #{STAGED_TABLE} s
+                WHERE s.policy_name = p.policy_name
+                  AND s.partition_key = p.partition_key
+              )
+            ORDER BY p.policy_name COLLATE "C", p.partition_key COLLATE "C"
+            FOR UPDATE OF p SKIP LOCKED
+          )
+          DELETE FROM #{PARTITIONS_TABLE} d
+          USING victims v
+          WHERE d.policy_name = v.policy_name AND d.partition_key = v.partition_key
         SQL
         "sweep_inactive_partitions",
         params
@@ -1541,7 +1907,7 @@ module DispatchPolicy
       connection with_connection
       normalize_partition normalize_staged parse_jsonb
       sample_filter next_eligible_clause trend_direction clamp_backoff
-      base_class
+      base_class policy_lock_id app_clock
     ].freeze
 
     (singleton_methods(false) - ROLE_ROUTING_EXCLUDED).each do |method_name|

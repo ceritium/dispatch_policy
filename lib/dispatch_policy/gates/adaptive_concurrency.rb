@@ -7,7 +7,9 @@ module DispatchPolicy
     # queue is empty and shrinks when it builds up. AIMD loop persisted
     # in `dispatch_policy_adaptive_concurrency_stats`.
     #
-    # Feedback signal is `queue_lag_ms = perform_start - admitted_at`
+    # Feedback signal is `queue_lag_ms`: how long the job waited between
+    # admission and the start of its perform, measured end to end by the
+    # database (see InflightTracker.lookup_admission)
     # (time the job spent waiting in the adapter after admission).
     # Pure saturation signal — slow performs in the downstream service
     # don't punish admissions if workers still drain the queue quickly.

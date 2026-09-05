@@ -142,7 +142,7 @@ ActiveJob#perform_later
 (worker runs perform)
   → InflightTracker.track (around_perform)
     → INSERT inflight_jobs ON CONFLICT DO NOTHING
-    → spawn heartbeat thread
+    → register with the process's heartbeat thread
     → block.call
     → record_observation on adaptive gates (queue_lag → AIMD update)
     → DELETE inflight_jobs
@@ -657,8 +657,12 @@ DispatchPolicy.configure do |c|
                                           # know the policy and the row
                                           # still holds a token bucket
   c.inflight_stale_after      = 300      # GC inflight rows whose worker stopped heartbeating
+                                          # NOTE: the worker's connection pool needs at least
+                                          # one connection ABOVE its thread count, or the
+                                          # heartbeat cannot get one while every thread is
+                                          # performing and running jobs are swept as stale
   c.inflight_queued_stale_after = 3_600  # GC inflight rows admitted but never started (queued)
-  c.inflight_heartbeat_interval = 30     # how often the worker bumps heartbeat_at; 0 disables the thread
+  c.inflight_heartbeat_interval = 30     # how often heartbeat_at is bumped; 0 disables the thread
   c.sweep_every_ticks         = 50       # sweeper cadence (in tick iterations); <= 0 never sweeps
   c.metrics_retention         = 86_400   # tick_samples kept this long
   c.fairness_half_life_seconds = 60      # EWMA half-life for in-tick reorder; nil disables

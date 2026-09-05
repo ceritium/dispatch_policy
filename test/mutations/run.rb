@@ -64,10 +64,18 @@ module DispatchPolicy
           copy_tree(tree)
           ensure_database
 
+          busy = other_backends_on_database
+          if busy.positive?
+            abort "#{busy} other connection(s) are using #{DB}. Two suites on one " \
+                  "database TRUNCATE each other mid-test; the failures that produces " \
+                  "look like defects and are not. Set MUTATION_DB to a private name."
+          end
+
           say "control run (#{selected.size} mutation(s) selected)"
           control = suite(tree)
           unless control[:ran] && control[:green]
-            abort "the control run is not usable (#{control[:summary]}). " \
+            hint = other_backends_on_database.positive? ? " Another process is on #{DB}." : ""
+            abort "the control run is not usable (#{control[:summary]}).#{hint} " \
                   "Fix the suite before reading anything into a mutation."
           end
           say "control: #{control[:summary]}"
@@ -75,6 +83,45 @@ module DispatchPolicy
 
           report(selected.map { |m| [m, apply(tree, m)] })
         end
+      end
+
+      # SIGKILL the whole group, never a pattern. `pkill -9 -f <something>`
+      # matched a Postgres BACKEND once during this project's review and
+      # took the entire local cluster into crash recovery: killing a
+      # backend with SIGKILL makes the postmaster assume shared memory is
+      # corrupt and reset every connection. Address the group we spawned.
+      def kill_process_group(pid)
+        pgid = Process.getpgid(pid)
+        # ONLY when it is genuinely its own group. `pgroup: true` is what
+        # puts it there, and if that ever fails to apply — an older Ruby, a
+        # platform that ignores it — `getpgid` hands back OUR group and
+        # `kill(-pgid)` SIGKILLs the runner, the rake process and the
+        # shell that started them. Demonstrated: without `pgroup: true` the
+        # child's pgid IS the runner's, and the negative kill takes the
+        # whole run down mid-battery with no output.
+        if pgid != Process.getpgrp
+          Process.kill("KILL", -pgid)
+        else
+          Process.kill("KILL", pid)
+        end
+      rescue StandardError
+        begin
+          Process.kill("KILL", pid)
+        rescue StandardError
+          nil
+        end
+      end
+
+      # Terminate whatever is still connected to the mutation database.
+      # `pg_terminate_backend` asks the backend to exit cleanly, releasing
+      # its session locks — the opposite of SIGKILL, which is what makes it
+      # safe to use here.
+      def reap_database_backends!
+        system("psql", "-d", "postgres", "-tAc",
+               "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '#{DB}'",
+               out: File::NULL, err: File::NULL)
+      rescue StandardError
+        nil
       end
 
       def select(filter)
@@ -138,24 +185,60 @@ module DispatchPolicy
         out = +""
         timed_out = false
         Bundler.with_unbundled_env do
+          # Its own process GROUP, so the timeout below can kill the whole
+          # tree. `bundle exec rake test` is three processes deep — bundle,
+          # rake, and the rake_test_loader that actually runs minitest —
+          # and killing only the pid we hold leaves the grandchild running:
+          # measured at 36 orphaned rake_test_loader processes after a
+          # session with several timeouts, each still holding its database
+          # connections and competing for the machine with every later
+          # mutation.
           Open3.popen2e({ "DB_NAME" => DB, "DISPATCH_POLICY_REQUIRE_DB" => "1" },
-                        "bundle", "exec", "rake", "test", chdir: tree) do |stdin, oe, wait|
+                        "bundle", "exec", "rake", "test",
+                        chdir: tree, pgroup: true) do |stdin, oe, wait|
             stdin.close
             reader = Thread.new { out << oe.read }
-            if wait.join(TIMEOUT)
-              reader.join
-            else
-              timed_out = true
-              begin
-                Process.kill("KILL", wait.pid)
-              rescue StandardError
-                nil
+            # Its own group is what makes the timeout able to kill the whole
+            # tree, and it is also what stops Ctrl-C reaching it: the
+            # terminal sends SIGINT to the FOREGROUND group only, so an
+            # operator interrupting a hung mutation would kill the runner
+            # and leave the suite, its children and its backends running —
+            # the debris this whole method exists to prevent, arriving by
+            # the one route people actually use. Forward it by hand.
+            previous = {}
+            %w[INT TERM].each do |sig|
+              previous[sig] = trap(sig) do
+                kill_process_group(wait.pid)
+                reap_database_backends!
+                trap(sig, previous[sig] || "DEFAULT")
+                Process.kill(sig, Process.pid)
               end
-              reader.kill
+            end
+
+            begin
+              if wait.join(TIMEOUT)
+                reader.join
+              else
+                timed_out = true
+                kill_process_group(wait.pid)
+                reader.kill
+              end
+            ensure
+              previous.each { |sig, handler| trap(sig, handler || "DEFAULT") }
             end
           end
         end
-        return { ran: false, green: false, summary: "timed out after #{TIMEOUT}s" } if timed_out
+        if timed_out
+          # A timed-out suite is usually a test that HANGS under the
+          # mutation rather than failing, and a hanging test can be holding
+          # a SESSION-level advisory lock (the pause button takes one). The
+          # backend keeps that lock as long as it lives, so the next run
+          # against this database blocks on it and times out too — one
+          # NO RESULT turns into every subsequent mutation scoring
+          # NO RESULT, with nothing saying why. Clear the room.
+          reap_database_backends!
+          return { ran: false, green: false, summary: "timed out after #{TIMEOUT}s" }
+        end
 
         line = out[/^\d+ runs, \d+ assertions, \d+ failures, \d+ errors.*$/]
         unless line
@@ -182,6 +265,29 @@ module DispatchPolicy
 
       def ensure_database
         Open3.capture3("createdb", DB) # already there is fine
+      end
+
+      # Refuse to start if anything else is on this database.
+      #
+      # Every integration case TRUNCATEs all six tables in setup, so a
+      # second suite on the same database wipes this one's rows mid-test.
+      # The symptom does not look like concurrency: it looks like a dozen
+      # assertions about token buckets and fairness counters going wrong,
+      # and like mutations timing out — under contention the suite HANGS,
+      # because a TRUNCATE takes ACCESS EXCLUSIVE and queues behind another
+      # process's `SELECT … FOR UPDATE`, with a Ruby thread in the wait
+      # chain that Postgres's deadlock detector will not break. That cost
+      # an investigation, and the first explanation reached for was a
+      # corrupt database, which a clone disproved in thirteen seconds.
+      def other_backends_on_database
+        out, _err, status = Open3.capture3(
+          "psql", "-d", DB, "-tAc",
+          "SELECT count(*) FROM pg_stat_activity " \
+          "WHERE datname = current_database() AND pid <> pg_backend_pid()"
+        )
+        status.success? ? out.strip.to_i : 0
+      rescue StandardError
+        0 # no psql, or no permission: not a reason to refuse to run
       end
 
       def root

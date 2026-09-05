@@ -79,15 +79,26 @@ module DispatchPolicy
       # assuming the admission was lost. Raise it if your adapter backlog
       # can exceed an hour.
       @inflight_queued_stale_after = 60 * 60
-      # Seconds between heartbeat_at refreshes. Each beat checks out a
-      # connection from the role's pool for the duration of one UPDATE and
-      # returns it explicitly — the heartbeat thread runs outside the
+      # Seconds between heartbeat_at refreshes. ONE thread per process
+      # beats every running job in a single statement, checking out a
+      # connection from the role's pool for the duration of that UPDATE and
+      # returning it explicitly — the heartbeat thread runs outside the
       # Rails executor, where the pool treats a lease as permanent and
       # `with_connection` alone would NOT give it back (see
-      # InflightTracker.beat!). A little pool headroom above the worker
-      # concurrency is still worth having, since a beat and its job can
-      # want a connection at the same instant. Set to 0 to disable the
-      # heartbeat thread entirely.
+      # InflightTracker.beat!).
+      #
+      # **The pool needs at least one connection above the worker's thread
+      # count.** This is a requirement, not headroom. A performing job
+      # holds its connection for the whole perform, so with the Rails
+      # default sizing (pool and threads both from RAILS_MAX_THREADS) a
+      # saturated worker leaves nothing for the beat: measured with pool=3
+      # and 3 running jobs, every beat raised ConnectionTimeoutError, the
+      # rows went stale, and the gem's own sweeper deleted all three while
+      # the jobs were still running — after which the concurrency gate
+      # re-admits over occupied slots. With pool=4 the same run kept every
+      # row. `beat!` logs that timeout at error level naming this.
+      #
+      # Set to 0 to disable the heartbeat thread entirely.
       @inflight_heartbeat_interval = 30
       @real_adapter              = nil
       @logger                    = nil

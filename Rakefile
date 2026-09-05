@@ -54,6 +54,22 @@ namespace :mutations do
     DispatchPolicy::Mutations::Runner.run
   end
 
+  # A NO TARGET is reported only after the runner has copied the tree and
+  # run a control suite — fifteen minutes to learn that a `find` string
+  # moved. Every edit to a mutated line silently stales its entry, and a
+  # stale entry proves nothing while looking exactly like a passing one.
+  desc "Check every catalogue find-string still exists (seconds, no suite)"
+  task :check do
+    require_relative "test/mutations/catalogue"
+    stale = DispatchPolicy::Mutations::ALL.reject { |m| File.read(m[:file]).include?(m[:find]) }
+    if stale.empty?
+      puts "all #{DispatchPolicy::Mutations::ALL.size} find-strings present"
+    else
+      stale.each { |m| puts "  STALE  #{m[:id]}  #{m[:label]}  (#{m[:file]})" }
+      abort "#{stale.size} mutation(s) no longer match their source — they prove nothing until fixed."
+    end
+  end
+
   desc "List the catalogue without running anything"
   task :list do
     require_relative "test/mutations/catalogue"
