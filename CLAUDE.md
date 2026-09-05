@@ -19,7 +19,7 @@ See `README.md` for the API and examples.
 v0.1 (on master). The whole main flow is implemented and tested.
 What's pending lives in `IDEAS.md` with the rationale.
 
-352 runs / 911 assertions. `bundle exec rake test` from the root.
+358 runs / 917 assertions. `bundle exec rake test` from the root.
 A mutation battery guards the tests themselves: `bundle exec rake
 mutations:all` (see `test/mutations/README.md`, and "Fixing a defect"
 below).
@@ -153,9 +153,13 @@ dispatch_policy_policy_settings               one row per policy — pause flag
   shifted every column the gem owns by its offset. **Use
   `#{UTC_NOW}` in SQL, never a bare `now()`, and
   `clock_timestamp() AT TIME ZONE 'UTC'` where you need the wall clock
-  inside a transaction.** A test lints for it
-  (`utc_storage_test.rb`) because no behavioural test can cover a call site
-  that does not exist yet. Column DEFAULTS count: four of them write
+  inside a transaction.** A test lints for it (`utc_storage_test.rb`)
+  because no behavioural test can cover a call site that does not exist
+  yet — over EVERY file with raw SQL, not just `repository.rb`: the first
+  version read that one file, and the site it missed
+  (`InflightTracker.lookup_admission`) was left casting in the session's
+  zone against a column that had just moved to UTC, which is a ten-hour
+  error in the adaptive gate's only input. Column DEFAULTS count: four of them write
   timestamps, and `stage_many!` is the only path that reaches one.
   This replaced a rule that paired each column with the clock that wrote
   it. That rule was correct and nobody could hold it: it needed a list of
@@ -566,7 +570,7 @@ http://localhost:3000/                       # forms to enqueue
 http://localhost:3000/dispatch_policy        # dashboard
 
 # Tests
-bundle exec rake test                        # 352 runs / 911 assertions
+bundle exec rake test                        # 358 runs / 917 assertions
 # DB_NAME picks the database (default dispatch_policy_test). Use it whenever
 # anything else might be running the suite: every integration case TRUNCATEs
 # the gem's tables in setup, so two runs on one database produce failures
@@ -577,7 +581,7 @@ bundle exec rake test                        # 352 runs / 911 assertions
 # notices. Slow (one full suite per mutation). See test/mutations/README.md.
 bundle exec rake mutations:list              # the catalogue, no work done
 bundle exec rake mutations:check             # do the find-strings still match? (seconds)
-bundle exec rake mutations:all               # 68 mutations, 67 must be caught
+bundle exec rake mutations:all               # 70 mutations, 69 must be caught
 FILTER=19 bundle exec rake mutations:all     # one of them
 
 # When you add a column or table:

@@ -260,10 +260,14 @@ class ScheduledClockTest < DispatchPolicy::IntegrationTest
     end
   end
 
-  # `in_backoff` needs a backoff that has EXPIRED. A live one reads as live
-  # whichever clock computes it when the drift points forward, so asserting
-  # only that would pass against the bug — which is what the first version
-  # of this test did.
+  # `in_backoff` needs a backoff that has EXPIRED, and the drift has to
+  # point the other way than it does for a live one. The comparison is
+  # `next_eligible_at > clock`: a LIVE backoff is exposed by a clock that
+  # runs AHEAD (it jumps past the deadline and the backoff vanishes), an
+  # EXPIRED one by a clock that runs BEHIND (it falls back before the
+  # deadline and a dead backoff comes back to life). This case drifted
+  # forward at first, where the buggy and correct answers agree, and passed
+  # against its own mutation.
   def test_an_expired_backoff_does_not_read_as_active_under_clock_drift
     stage!(scheduled_at: nil)
     DispatchPolicy::Repository.connection.exec_query(
@@ -272,11 +276,13 @@ class ScheduledClockTest < DispatchPolicy::IntegrationTest
       "seed_expired", [POLICY, KEY]
     )
 
-    facts = travel_to(Time.now.utc + (10 * 3600)) do
+    facts = travel_to(Time.now.utc - (10 * 3600)) do
       DispatchPolicy::Repository.partition_clock_facts(policy_name: POLICY, partition_key: KEY)
     end
 
-    refute facts[:in_backoff], "the backoff expired five minutes ago; the tick can claim this now"
+    refute facts[:in_backoff],
+           "the backoff expired five minutes ago; computed on a clock ten hours behind the " \
+           "database's it reads as active again and the tick is told to wait"
   end
 
   # `defer_partition_to_next_scheduled!` reads the same column from both  # `defer_partition_to_next_scheduled!` reads the same column from both

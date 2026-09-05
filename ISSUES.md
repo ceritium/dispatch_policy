@@ -152,7 +152,9 @@ needs a host that sets `variables: { timezone: … }` in `database.yml` —
 a supported knob, commonly used to make raw psql output readable. Then
 `set(wait:)` runs off by the session's UTC offset — early by it east of
 UTC, late by it west — and nothing anywhere records the difference. Fixed by binding
-`config.now` on both sides. `next_eligible_at` deliberately stays on
+`config.now` on both sides. (Superseded by A13's fix, which moved every
+column to UTC and removed the pairing rule entirely.) `next_eligible_at`
+deliberately stayed on
 `now()`: Postgres writes it, so that is the clock it must be read on.
 
 ## A10 — The adaptive gate's feedback signal spanned two clocks

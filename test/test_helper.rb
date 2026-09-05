@@ -141,7 +141,12 @@ module DispatchPolicy
       TIMESTAMP_DEFAULTS.all? do |table, columns|
         columns.all? do |name|
           column = conn.columns(table).find { |c| c.name == name }
-          column && column.default_function.to_s.include?("AT TIME ZONE")
+          # Postgres normalises `AT TIME ZONE 'UTC'` to
+          # `timezone('UTC'::text, …)` in the catalog, so matching the text
+          # as WRITTEN never matches: the check reported drift forever and
+          # every integration case paid a DROP CASCADE and a re-migrate,
+          # silently. Match what the catalog actually stores.
+          column && column.default_function.to_s.include?("timezone('UTC'")
         end
       end
     end

@@ -93,22 +93,55 @@ class UtcStorageTest < DispatchPolicy::IntegrationTest
     end
   end
 
-  # The lint. Every one of the 40-odd SQL sites has to use the constant;
-  # a single bare `now()` reintroduces the whole class for whichever column
-  # it touches, and no behavioural test can cover a site that does not
-  # exist yet. This is a source assertion on purpose and it is the only
-  # kind that fits: it is guarding an ABSENCE across a whole file.
-  def test_no_sql_in_the_repository_uses_a_bare_now
-    offenders = File.readlines("lib/dispatch_policy/repository.rb").each_with_index.filter_map do |line, i|
-      next if line.lstrip.start_with?("#")        # prose may say now()
-      next unless line.include?("now()")
-      next if line.include?("AT TIME ZONE")       # the constant's own definition
+  # The lint. Every SQL site has to use the constant; a single bare `now()`
+  # reintroduces the whole class for whichever column it touches, and no
+  # behavioural test can cover a site that does not exist yet. This is a
+  # source assertion on purpose and it is the only kind that fits: it is
+  # guarding an ABSENCE across whole files.
+  #
+  # EVERY file with raw SQL, not just repository.rb. The first version read
+  # only that one, and the site it missed —
+  # `InflightTracker.lookup_admission` — was where this branch left a
+  # ten-hour error in the adaptive gate's only input.
+  SQL_FILES = %w[
+    lib/dispatch_policy/repository.rb
+    lib/dispatch_policy/inflight_tracker.rb
+    lib/dispatch_policy/tick.rb
+  ].freeze
 
-      "#{i + 1}: #{line.strip}"
+  # `now()`, `NOW()`, `current_timestamp`, `localtimestamp` — anything that
+  # yields the database's clock in the session's frame. `clock_timestamp`
+  # is here too: it is legitimate, but only wearing `AT TIME ZONE 'UTC'`.
+  CLOCK_SQL = /\b(now\s*\(\s*\)|current_timestamp|localtimestamp|clock_timestamp\s*\(\s*\))/i
+
+  def test_no_sql_anywhere_uses_the_session_clock
+    offenders = SQL_FILES.flat_map do |path|
+      File.readlines(path).each_with_index.filter_map do |line, i|
+        next if line.lstrip.start_with?("#")        # prose may say now()
+        next unless line.match?(CLOCK_SQL)
+        # A line may legitimately mention the clock while converting it.
+        next if line.include?("AT TIME ZONE 'UTC'")
+
+        "#{path}:#{i + 1}: #{line.strip}"
+      end
     end
 
     assert_empty offenders,
-                 "SQL must use Repository::UTC_NOW, not a bare now(): a timestamptz written " \
-                 "into a `timestamp WITHOUT time zone` column stores the SESSION's wall clock"
+                 "SQL must use Repository::UTC_NOW (or `clock_timestamp() AT TIME ZONE " \
+                 "'UTC'`): a timestamptz written into or compared against a `timestamp " \
+                 "WITHOUT time zone` column resolves in the SESSION's zone"
+  end
+
+  # The lint's own blind spot, made explicit: it is line-oriented, so a
+  # clock expression split across two lines of one SQL heredoc slips
+  # through. Nothing in the gem writes SQL that way today; if that changes,
+  # this test is the thing to fix rather than to delete.
+  def test_the_lint_reads_every_file_that_contains_raw_sql
+    with_sql = Dir["lib/dispatch_policy/**/*.rb"].select do |path|
+      File.read(path).match?(/exec_query|select_value|\bexecute\(/)
+    end
+
+    assert_equal with_sql.sort, SQL_FILES.sort,
+                 "a file gained or lost raw SQL; the lint above only reads the ones listed"
   end
 end

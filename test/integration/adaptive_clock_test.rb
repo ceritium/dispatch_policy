@@ -42,9 +42,37 @@ class AdaptiveClockTest < DispatchPolicy::IntegrationTest
     ActiveRecord::Base.connection.exec_query(
       "INSERT INTO dispatch_policy_inflight_jobs " \
       "(policy_name, partition_key, active_job_id, admitted_at, heartbeat_at) " \
-      "VALUES ('adaptive_clock', 'k', $1, now() - interval '5 seconds', now())",
+      "VALUES ('adaptive_clock', 'k', $1, #{DispatchPolicy::Repository::UTC_NOW} - " \
+      "interval '5 seconds', #{DispatchPolicy::Repository::UTC_NOW})",
       "seed_inflight", [active_job_id]
     )
+  end
+
+  # The write and the read are one subtraction, so a skewed session must not
+  # move either end. It moved one: `admitted_at` went to UTC while
+  # `lookup_admission` still cast `clock_timestamp()` in the session's zone,
+  # and the lag came back 36,000,000ms against a true 1ms. The fixture above
+  # is what hid it — it seeded with a bare `now()`, i.e. the store shape
+  # production had stopped writing.
+  { "east" => "Etc/GMT-10", "west" => "Etc/GMT+10", "half_hour" => "Asia/Kathmandu" }
+    .each do |direction, zone|
+    define_method("test_the_queue_lag_ignores_a_skewed_session_#{direction}") do
+      DispatchPolicy::Repository.connection.execute("SET TIME ZONE '#{zone}'")
+      job = AdaptiveJob.new
+      admit!(job.job_id)
+
+      observed = []
+      gate = AdaptiveJob::POLICY.gates.find { |g| g.name == :adaptive_concurrency }
+      gate.stub(:record_observation, ->(**kwargs) { observed << kwargs }) do
+        DispatchPolicy::InflightTracker.track(job) { nil }
+      end
+
+      assert_in_delta 5_000, observed.first[:queue_lag_ms], 2_000,
+                      "#{direction}: the job waited five seconds; the session's TimeZone " \
+                      "must not reach the AIMD controller's only input"
+    ensure
+      DispatchPolicy::Repository.connection.execute("SET TIME ZONE 'UTC'")
+    end
   end
 
   def test_the_queue_lag_comes_from_the_database_not_the_workers_clock

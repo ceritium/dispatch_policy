@@ -32,8 +32,13 @@
   the gem wrote was being stored in that zone and read back as UTC, which
   put scheduled work off by the offset and showed wrong times throughout
   the dashboard. Rows already written keep their offset — nothing rewrites
-  them — so expect a discontinuity at the upgrade in `enqueued_at`,
-  `heartbeat_at` and the metrics windows. Old rows age out on their own
+  them, so expect a discontinuity at the upgrade. It is not only cosmetic:
+  the same columns are what admission compares, so for one retention
+  window an old row and a new one are read on frames that differ by your
+  offset. In practice that means scheduled work staged before the upgrade
+  keeps its old due time, a pre-upgrade `heartbeat_at` can look stale (its
+  row gets swept and re-created, costing nothing), and the metrics windows
+  show a step. Deploy it when the backlog is small if you can. Old rows age out on their own
   retention; if you would rather not wait, shift them once with
   `UPDATE … SET col = col AT TIME ZONE '<your zone>' AT TIME ZONE 'UTC'`
   against a stopped tick loop.

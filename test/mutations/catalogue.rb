@@ -547,7 +547,7 @@ module DispatchPolicy
     file:  'lib/dispatch_policy/inflight_tracker.rb',
     find:  [
       '          "SELECT partition_key, EXTRACT(EPOCH FROM " \\',
-      '          "(clock_timestamp()::timestamp - admitted_at)) * 1000 AS raw_lag_ms " \\',
+      '          "((clock_timestamp() AT TIME ZONE \'UTC\') - admitted_at)) * 1000 AS raw_lag_ms " \\',
       '          "FROM dispatch_policy_inflight_jobs WHERE active_job_id = $1 LIMIT 1",',
       '          "lookup_admission",',
       '          [active_job_id]'
@@ -673,8 +673,8 @@ module DispatchPolicy
     # transaction opened" — the controller never sees a job as late.
     caught_by: 'adaptive_clock_test',
     file:  'lib/dispatch_policy/inflight_tracker.rb',
-    find:  '"(clock_timestamp()::timestamp - admitted_at)) * 1000 AS raw_lag_ms " \\',
-    replace: '"(now()::timestamp - admitted_at)) * 1000 AS raw_lag_ms " \\'
+    find:  '"((clock_timestamp() AT TIME ZONE \'UTC\') - admitted_at)) * 1000 AS raw_lag_ms " \\',
+    replace: '"(now() AT TIME ZONE \'UTC\' - admitted_at)) * 1000 AS raw_lag_ms " \\'
   },
   {
     id:    '51',
@@ -996,6 +996,30 @@ module DispatchPolicy
     file:  'db/migrate/20260501000001_create_dispatch_policy_tables.rb',
     find:  %q{t.datetime :enqueued_at,  null: false, default: -> { "(now() AT TIME ZONE 'UTC')" }},
     replace: %q{t.datetime :enqueued_at,  null: false, default: -> { "now()" }}
+  },
+  {
+    id:    '70',
+    label: 'adaptive lag: the read left on the session clock',
+    # The axis 42 and 50 do not cover. `admitted_at` is written in UTC and
+    # `clock_timestamp()::timestamp` casts in the SESSION's zone, so the two ends
+    # of one subtraction cross: measured at 36,000,000ms against a true 1ms on a
+    # UTC+10 session, which collapses the AIMD cap to `min` and keeps it there.
+    caught_by: 'adaptive_clock_test',
+    file:  'lib/dispatch_policy/inflight_tracker.rb',
+    find:  '"((clock_timestamp() AT TIME ZONE \'UTC\') - admitted_at)) * 1000 AS raw_lag_ms " \\',
+    replace: '"(clock_timestamp()::timestamp - admitted_at)) * 1000 AS raw_lag_ms " \\'
+  },
+  {
+    id:    '71',
+    label: 'schema drift: the defaults check matches text Postgres never stores',
+    # Postgres normalises `AT TIME ZONE 'UTC'` to `timezone('UTC'::text, …)`, so
+    # matching the text as WRITTEN never matches and the check reports drift
+    # forever — every integration case then pays a DROP CASCADE and re-migrate,
+    # silently, which is the opposite of what a drift check is for.
+    caught_by: 'postgres_bootstrap_test',
+    file:  'test/test_helper.rb',
+    find:  'column && column.default_function.to_s.include?("timezone(\'UTC\'")',
+    replace: 'column && column.default_function.to_s.include?("AT TIME ZONE")'
   },
     ].freeze
   end

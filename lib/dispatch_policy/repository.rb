@@ -326,8 +326,11 @@ module DispatchPolicy
     # Binding the clock puts both sides of the comparison through the same
     # `quoted_date` the write went through, so they agree under any
     # combination of session TimeZone and `ActiveRecord.default_timezone`.
-    # `next_eligible_at` stays on `now()` for exactly the same reason: it
-    # is written on that clock, so that is the clock it must be read on.
+    # `next_eligible_at` is compared against `UTC_NOW` because that is what
+    # WRITES it. The rule this file used to teach — pair each column with
+    # the clock that wrote it — is retired: every column the gem owns is
+    # UTC now, so there is one clock and no pairing to get wrong. See
+    # `UTC_NOW`.
     #
     # `decay_elapsed_seconds` is returned for the same rule, from the other
     # side. `decayed_admits_at` is Postgres-written (`record_partition_admit!`
