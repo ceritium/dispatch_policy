@@ -141,12 +141,23 @@ module DispatchPolicy
       TIMESTAMP_DEFAULTS.all? do |table, columns|
         columns.all? do |name|
           column = conn.columns(table).find { |c| c.name == name }
-          # Postgres normalises `AT TIME ZONE 'UTC'` to
-          # `timezone('UTC'::text, …)` in the catalog, so matching the text
-          # as WRITTEN never matches: the check reported drift forever and
-          # every integration case paid a DROP CASCADE and a re-migrate,
-          # silently. Match what the catalog actually stores.
-          column && column.default_function.to_s.include?("timezone('UTC'")
+          # Match on the ZONE, not on the syntax.
+          #
+          # Postgres deparses this default differently by major version:
+          # 13 stores `timezone('UTC'::text, now())`, 16 stores
+          # `now() AT TIME ZONE 'utc'::text` — different spelling AND
+          # different case. Matching either one exactly is a check that
+          # passes on one CI leg and fails on the other, which is precisely
+          # what happened twice: the first version matched
+          # "AT TIME ZONE" (green on PG16, silently always-rebuilding on
+          # PG13), the second matched "timezone('UTC'" (green on PG13, RED
+          # on PG16). Both spellings name the zone and a bare `now()` does
+          # not, so that is what to look for. The SEMANTIC property — that
+          # the default actually stores UTC — belongs to
+          # `utc_storage_test`, which exercises it through the real write
+          # path under skewed sessions; this only has to be fast and
+          # version-proof.
+          column && column.default_function.to_s.match?(/utc/i)
         end
       end
     end

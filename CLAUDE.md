@@ -155,11 +155,19 @@ dispatch_policy_policy_settings               one row per policy — pause flag
   `clock_timestamp() AT TIME ZONE 'UTC'` where you need the wall clock
   inside a transaction.** A test lints for it (`utc_storage_test.rb`)
   because no behavioural test can cover a call site that does not exist
-  yet — over EVERY file with raw SQL, not just `repository.rb`: the first
-  version read that one file, and the site it missed
-  (`InflightTracker.lookup_admission`) was left casting in the session's
-  zone against a column that had just moved to UTC, which is a ten-hour
-  error in the adaptive gate's only input. Column DEFAULTS count: four of them write
+  yet. Its file list is DERIVED, not written down — everything under
+  `lib/dispatch_policy` and `app` that carries SQL, plus the migration and
+  the generator template — because every hand-written version of that list
+  was short: the first read only `repository.rb` and missed
+  `InflightTracker.lookup_admission` (a ten-hour error in the adaptive
+  gate's only input), the second still missed `app/`, `db/migrate`, and
+  the generator template, which is the only copy an actual
+  `rails g dispatch_policy:install` runs.
+  One more constraint the store now carries: **the gem requires
+  `ActiveRecord.default_timezone = :utc`** (the Rails default). On
+  `:local`, Rails reads these columns back in the machine's zone while the
+  gem writes UTC, and every rendered timestamp is off by that offset.
+  Admission is unaffected — those comparisons are all database-side. Column DEFAULTS count: four of them write
   timestamps, and `stage_many!` is the only path that reaches one.
   This replaced a rule that paired each column with the clock that wrote
   it. That rule was correct and nobody could hold it: it needed a list of

@@ -235,7 +235,7 @@ Three things about the shape of this fix are worth keeping:
 Rows written by an older version under a skewed session keep their offset;
 nothing rewrites them. See the CHANGELOG's upgrade notes.
 
-## A9 — left open, deliberately## A9 — left open, deliberately
+## A9 — left open, deliberately
 
 The pending sparkline drops periods with no tick samples, so a tick loop
 that dies reads as a backlog that stopped growing. The query change is

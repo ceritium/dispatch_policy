@@ -1011,14 +1011,14 @@ module DispatchPolicy
   },
   {
     id:    '71',
-    label: 'schema drift: the defaults check matches text Postgres never stores',
-    # Postgres normalises `AT TIME ZONE 'UTC'` to `timezone('UTC'::text, …)`, so
-    # matching the text as WRITTEN never matches and the check reports drift
-    # forever — every integration case then pays a DROP CASCADE and re-migrate,
-    # silently, which is the opposite of what a drift check is for.
+    label: "schema drift: the defaults check pinned to one version's spelling",
+    # Postgres deparses this default differently per major version — PG13 stores
+    # `timezone('UTC'::text, now())`, PG16 stores `now() AT TIME ZONE 'utc'::text`
+    # — so matching either spelling exactly passes on one CI leg and fails on the
+    # other. Both name the zone; a bare `now()` does not.
     caught_by: 'postgres_bootstrap_test',
     file:  'test/test_helper.rb',
-    find:  'column && column.default_function.to_s.include?("timezone(\'UTC\'")',
+    find:  'column && column.default_function.to_s.match?(/utc/i)',
     replace: 'column && column.default_function.to_s.include?("AT TIME ZONE")'
   },
     ].freeze

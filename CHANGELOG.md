@@ -32,13 +32,42 @@
   the gem wrote was being stored in that zone and read back as UTC, which
   put scheduled work off by the offset and showed wrong times throughout
   the dashboard. Rows already written keep their offset — nothing rewrites
-  them, so expect a discontinuity at the upgrade. It is not only cosmetic:
-  the same columns are what admission compares, so for one retention
-  window an old row and a new one are read on frames that differ by your
-  offset. In practice that means scheduled work staged before the upgrade
-  keeps its old due time, a pre-upgrade `heartbeat_at` can look stale (its
-  row gets swept and re-created, costing nothing), and the metrics windows
-  show a step. Deploy it when the backlog is small if you can. Old rows age out on their own
+  them, so expect a discontinuity at the upgrade — and for two columns
+  that is not cosmetic and does not age out.
+
+  **`dispatch_policy_partitions.next_eligible_at` and `.decayed_admits_at`
+  need a one-off shift.** Staged, inflight and tick-sample rows leave on
+  their own retention, but a partition row lives forever, and
+  `next_eligible_at` is what `claim_partitions` filters on. A partition
+  backed off under a session EAST of UTC carries a value that now reads as
+  being in the future by your whole offset, so the tick will not claim it
+  until real time catches up — ten hours of a tenant admitting nothing,
+  with the dashboard showing it in backoff and nothing else wrong.
+  `decayed_admits_at` skews the fairness order the same way for the same
+  span. With the tick loop stopped:
+
+  ```sql
+  UPDATE dispatch_policy_partitions SET
+    next_eligible_at      = next_eligible_at      AT TIME ZONE '<your zone>' AT TIME ZONE 'UTC',
+    decayed_admits_at     = decayed_admits_at     AT TIME ZONE '<your zone>' AT TIME ZONE 'UTC',
+    last_checked_at       = last_checked_at       AT TIME ZONE '<your zone>' AT TIME ZONE 'UTC',
+    last_admit_at         = last_admit_at         AT TIME ZONE '<your zone>' AT TIME ZONE 'UTC',
+    last_enqueued_at      = last_enqueued_at      AT TIME ZONE '<your zone>' AT TIME ZONE 'UTC',
+    context_updated_at    = context_updated_at    AT TIME ZONE '<your zone>' AT TIME ZONE 'UTC';
+  ```
+
+  (`scheduled_eligible_at` is application-written and already UTC — leave
+  it alone.) The other tables can be shifted the same way or left to age
+  out; the visible cost of leaving them is scheduled work staged before
+  the upgrade keeping its old due time, a stale-looking `heartbeat_at`
+  whose row is swept and re-created, and a step in the metrics windows.
+
+  **This gem requires `ActiveRecord.default_timezone = :utc`,** which is
+  the Rails default. On `:local`, Rails reads these columns back in the
+  machine's zone while the gem now writes UTC, so every timestamp the
+  dashboard renders is off by that offset. Admission is unaffected — the
+  comparisons are all database-side — but the display is wrong in the way
+  A13 was. Old rows age out on their own
   retention; if you would rather not wait, shift them once with
   `UPDATE … SET col = col AT TIME ZONE '<your zone>' AT TIME ZONE 'UTC'`
   against a stopped tick loop.

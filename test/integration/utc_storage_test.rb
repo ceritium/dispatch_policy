@@ -103,24 +103,44 @@ class UtcStorageTest < DispatchPolicy::IntegrationTest
   # only that one, and the site it missed —
   # `InflightTracker.lookup_admission` — was where this branch left a
   # ten-hour error in the adaptive gate's only input.
-  SQL_FILES = %w[
-    lib/dispatch_policy/repository.rb
-    lib/dispatch_policy/inflight_tracker.rb
-    lib/dispatch_policy/tick.rb
+  # Where the gem ships SQL. All of it, not just where it is convenient:
+  # the first version of this lint read `repository.rb` alone and missed
+  # the site that carried a ten-hour error, and the second still missed
+  # `app/` (where a model scope already writes raw SQL on a timestamp
+  # column), `db/migrate` and the generator template — which is the one an
+  # actual `rails g dispatch_policy:install` runs, i.e. the only copy that
+  # reaches users at all.
+  SQL_DIRS = ["lib/dispatch_policy/**/*.rb", "app/**/*.rb"].freeze
+  EXTRA_SQL_FILES = %w[
+    db/migrate/20260501000001_create_dispatch_policy_tables.rb
+    lib/generators/dispatch_policy/install/templates/create_dispatch_policy_tables.rb.tt
   ].freeze
 
-  # `now()`, `NOW()`, `current_timestamp`, `localtimestamp` — anything that
-  # yields the database's clock in the session's frame. `clock_timestamp`
-  # is here too: it is legitimate, but only wearing `AT TIME ZONE 'UTC'`.
-  CLOCK_SQL = /\b(now\s*\(\s*\)|current_timestamp|localtimestamp|clock_timestamp\s*\(\s*\))/i
+  SQL_FILES = (Dir[*SQL_DIRS].select { |f| File.read(f).match?(/exec_query|select_value|\bexecute\(|where\(/) } +
+               EXTRA_SQL_FILES).sort.freeze
+
+  # Everything Postgres offers that yields a clock in the SESSION's frame.
+  # `clock_timestamp` and `now` are legitimate, but only wearing
+  # `AT TIME ZONE 'UTC'`; the rest have no correct use here at all.
+  CLOCK_SQL = /\b(
+    now\s*\(\s*\) | current_timestamp | localtimestamp | current_time |
+    clock_timestamp\s*\(\s*\) | transaction_timestamp\s*\(\s*\) |
+    statement_timestamp\s*\(\s*\) | timeofday\s*\(\s*\)
+  )/xi
 
   def test_no_sql_anywhere_uses_the_session_clock
     offenders = SQL_FILES.flat_map do |path|
       File.readlines(path).each_with_index.filter_map do |line, i|
         next if line.lstrip.start_with?("#")        # prose may say now()
-        next unless line.match?(CLOCK_SQL)
-        # A line may legitimately mention the clock while converting it.
-        next if line.include?("AT TIME ZONE 'UTC'")
+
+        # Strip the CONVERTED expressions first, then look at what is left.
+        # Skipping the whole line when it says `AT TIME ZONE 'UTC'`
+        # anywhere hides a bare `now()` sitting next to a correct
+        # conversion on the same line — and this file's SQL is `.squish`ed
+        # one-liners, so two expressions per line is the normal shape, not
+        # a contrivance.
+        rest = line.gsub(/\(?\s*(now|clock_timestamp)\s*\(\s*\)\s*AT TIME ZONE\s*'UTC'\s*\)?/i, "")
+        next unless rest.match?(CLOCK_SQL)
 
         "#{path}:#{i + 1}: #{line.strip}"
       end
@@ -132,16 +152,25 @@ class UtcStorageTest < DispatchPolicy::IntegrationTest
                  "WITHOUT time zone` column resolves in the SESSION's zone"
   end
 
+  # The list is DERIVED, not written down, so it cannot go stale — this
+  # only asserts the derivation still finds the files we know carry SQL,
+  # so that a change to the sniff cannot silently empty it.
+  def test_the_lint_reads_the_files_that_carry_sql
+    %w[
+      lib/dispatch_policy/repository.rb
+      lib/dispatch_policy/inflight_tracker.rb
+      app/models/dispatch_policy/staged_job.rb
+      db/migrate/20260501000001_create_dispatch_policy_tables.rb
+      lib/generators/dispatch_policy/install/templates/create_dispatch_policy_tables.rb.tt
+    ].each do |path|
+      assert_includes SQL_FILES, path, "the lint stopped reading a file that carries SQL"
+    end
+    assert_operator SQL_FILES.size, :>=, 5
+  end
+
   # The lint's own blind spot, made explicit: it is line-oriented, so a
   # clock expression split across two lines of one SQL heredoc slips
   # through. Nothing in the gem writes SQL that way today; if that changes,
   # this test is the thing to fix rather than to delete.
-  def test_the_lint_reads_every_file_that_contains_raw_sql
-    with_sql = Dir["lib/dispatch_policy/**/*.rb"].select do |path|
-      File.read(path).match?(/exec_query|select_value|\bexecute\(/)
-    end
 
-    assert_equal with_sql.sort, SQL_FILES.sort,
-                 "a file gained or lost raw SQL; the lint above only reads the ones listed"
-  end
 end
