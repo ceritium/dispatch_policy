@@ -30,7 +30,7 @@ module DispatchPolicy
               "written here (that the quarantine zeroes pending_count: it " \
               "subtracts with a GREATEST floor, so a partition with other " \
               "pending rows is still claimed). The real property is that the " \
-              "MIN only counts rows with `scheduled_at > now()`, and the claim " \
+              "MIN only counts rows scheduled in the FUTURE, and the claim " \
               "only ever returns rows that are already due — so a row cannot be " \
               "both held and still scheduled in the future. If any new path can " \
               "hold a future-scheduled row, delete this entry and write the test."

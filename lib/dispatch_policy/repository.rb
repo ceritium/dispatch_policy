@@ -733,7 +733,7 @@ module DispatchPolicy
     # unreachable: quarantine happens in the Forwarder, which only ever
     # sees rows the claim handed it, and the claim only takes rows that
     # are already due — so a quarantined row can never satisfy
-    # `scheduled_at > now()`. It is kept because the day something else
+    # a `scheduled_at` in the future. It is kept because the day something else
     # can quarantine a future row, a horizon pointing at one would wake
     # the partition for work nothing will claim. No test pins it; nothing
     # can, by construction.
