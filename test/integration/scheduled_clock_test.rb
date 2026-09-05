@@ -30,6 +30,10 @@ class ScheduledClockTest < DispatchPolicy::IntegrationTest
   EAST   = "Etc/GMT-10" # UTC+10 — makes now() look 10h LATER than it is
   WEST   = "Etc/GMT+10" # UTC-10 — makes now() look 10h EARLIER
 
+  # Seeded with the same expression the gem writes with, so the only
+  # thing a skewed session can change is whether the READ is right.
+  UTC = DispatchPolicy::Repository::UTC_NOW
+
   def teardown
     session_timezone("UTC")
     super
@@ -203,7 +207,7 @@ class ScheduledClockTest < DispatchPolicy::IntegrationTest
     )
     DispatchPolicy::Repository.connection.exec_query(
       "UPDATE dispatch_policy_partitions SET decayed_admits = $3, " \
-      "decayed_admits_at = now() - ($4 || ' seconds')::interval " \
+      "decayed_admits_at = #{UTC} - ($4 || ' seconds')::interval " \
       "WHERE policy_name = $1 AND partition_key = $2",
       "seed_decay", [POLICY, key, admits, ago.to_i]
     )
@@ -230,9 +234,9 @@ class ScheduledClockTest < DispatchPolicy::IntegrationTest
       stage!(scheduled_at: nil)
       DispatchPolicy::Repository.connection.exec_query(
         "UPDATE dispatch_policy_partitions SET decayed_admits = 10.0, " \
-        "decayed_admits_at = now() - interval '600 seconds', " \
-        "last_checked_at   = now() - interval '30 seconds', " \
-        "next_eligible_at  = now() + interval '300 seconds' " \
+        "decayed_admits_at = #{UTC} - interval '600 seconds', " \
+        "last_checked_at   = #{UTC} - interval '30 seconds', " \
+        "next_eligible_at  = #{UTC} + interval '300 seconds' " \
         "WHERE policy_name = $1 AND partition_key = $2",
         "seed_facts", [POLICY, KEY]
       )
@@ -261,7 +265,7 @@ class ScheduledClockTest < DispatchPolicy::IntegrationTest
     session_timezone(EAST)
     stage!(scheduled_at: nil)
     DispatchPolicy::Repository.connection.exec_query(
-      "UPDATE dispatch_policy_partitions SET next_eligible_at = now() - interval '300 seconds' " \
+      "UPDATE dispatch_policy_partitions SET next_eligible_at = #{UTC} - interval '300 seconds' " \
       "WHERE policy_name = $1 AND partition_key = $2",
       "seed_expired", [POLICY, KEY]
     )

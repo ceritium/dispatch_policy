@@ -26,6 +26,10 @@ class PartitionViewTest < DispatchPolicy::IntegrationTest
 
   VIEW = File.expand_path("../../app/views/dispatch_policy/partitions/show.html.erb", __dir__)
 
+  # Seeded with the same expression the gem writes with, so the only
+  # thing a skewed session can change is whether the READ is right.
+  UTC = DispatchPolicy::Repository::UTC_NOW
+
   def setup
     super
     DispatchPolicy.registry.register(
@@ -110,7 +114,7 @@ class PartitionViewTest < DispatchPolicy::IntegrationTest
   # SET TIME ZONE is a SESSION setting and these cases share a connection,
   # so without this the skewed case contaminates whatever runs next — which
   # it did: the expired-horizon test passed alone and failed in the full
-  # suite, because its `now() - interval '2 hours'` was being written and
+  # suite, because its `#{UTC} - interval '2 hours'` was being written and
   # read ten hours apart.
   def teardown
     session_timezone("UTC")
@@ -125,7 +129,7 @@ class PartitionViewTest < DispatchPolicy::IntegrationTest
   # pending count, which is the stall-looking reading that stat exists to
   # prevent, with no exception and nothing in the logs.
   def test_a_parked_partition_reads_as_parked_under_an_epoch_float_clock
-    set_horizon!("now() + interval '2 hours'")
+    set_horizon!("#{UTC} + interval '2 hours'")
     partition = partition_row
 
     [-> { Time.now.utc }, -> { Time.now.utc.to_f }].each do |clock|
@@ -150,7 +154,7 @@ class PartitionViewTest < DispatchPolicy::IntegrationTest
   # writes a future horizon and nothing rewrites it as it expires, so every
   # parked partition sits here between its horizon and the next tick.
   def test_a_partition_whose_horizon_has_passed_does_not_read_as_parked
-    set_horizon!("now() - interval '2 hours'")
+    set_horizon!("#{UTC} - interval '2 hours'")
     refute parked_for(partition_row),
            "the horizon passed two hours ago; this partition is due, not parked"
   end
@@ -167,9 +171,9 @@ class PartitionViewTest < DispatchPolicy::IntegrationTest
     session_timezone("Etc/GMT-10")
     DispatchPolicy::Repository.connection.exec_query(
       "UPDATE dispatch_policy_partitions SET decayed_admits = 10.0, " \
-      "decayed_admits_at = now() - interval '600 seconds', " \
-      "last_checked_at   = now() - interval '30 seconds', " \
-      "next_eligible_at  = now() + interval '300 seconds' " \
+      "decayed_admits_at = #{UTC} - interval '600 seconds', " \
+      "last_checked_at   = #{UTC} - interval '30 seconds', " \
+      "next_eligible_at  = #{UTC} + interval '300 seconds' " \
       "WHERE policy_name = $1 AND partition_key = $2",
       "seed", [POLICY, KEY]
     )
@@ -197,7 +201,7 @@ class PartitionViewTest < DispatchPolicy::IntegrationTest
   def test_an_expired_backoff_does_not_render_as_active
     session_timezone("Etc/GMT-10")
     DispatchPolicy::Repository.connection.exec_query(
-      "UPDATE dispatch_policy_partitions SET next_eligible_at = now() - interval '300 seconds' " \
+      "UPDATE dispatch_policy_partitions SET next_eligible_at = #{UTC} - interval '300 seconds' " \
       "WHERE policy_name = $1 AND partition_key = $2",
       "expired", [POLICY, KEY]
     )

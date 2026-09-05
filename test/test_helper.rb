@@ -57,6 +57,13 @@ module DispatchPolicy
       "dispatch_policy_staged_jobs" => %w[failed_at failure_reason]
     }.freeze
 
+    # Every column whose DEFAULT is a clock expression. See defaults_current?.
+    TIMESTAMP_DEFAULTS = {
+      "dispatch_policy_staged_jobs"   => %w[enqueued_at],
+      "dispatch_policy_inflight_jobs" => %w[admitted_at heartbeat_at],
+      "dispatch_policy_tick_samples"  => %w[sampled_at]
+    }.freeze
+
     module_function
 
     # Memoized across the whole run rather than per class: ten classes
@@ -114,9 +121,28 @@ module DispatchPolicy
       # Detect schema drift (e.g. new column added in a migration update),
       # per table — a column checked against the wrong table can never be
       # satisfied, which rebuilds the whole schema before every case.
-      SCHEMA_COLUMNS.all? do |table, required|
+      return false unless SCHEMA_COLUMNS.all? { |table, required|
         cols = conn.columns(table).map(&:name)
         required.all? { |c| cols.include?(c) }
+      }
+
+      defaults_current?(conn)
+    end
+
+    # Column DEFAULTS drift too, and the column-presence check above cannot
+    # see it: a database created before the defaults changed keeps writing
+    # the old expression, and the only symptom is a handful of unrelated
+    # assertions failing on that database and nowhere else. That cost an
+    # investigation the first time (`now()` -> `(now() AT TIME ZONE 'UTC')`,
+    # A13), so the drift check now covers the four timestamp defaults —
+    # which are the only defaults in the schema whose VALUE depends on
+    # anything.
+    def defaults_current?(conn)
+      TIMESTAMP_DEFAULTS.all? do |table, columns|
+        columns.all? do |name|
+          column = conn.columns(table).find { |c| c.name == name }
+          column && column.default_function.to_s.include?("AT TIME ZONE")
+        end
       end
     end
 
