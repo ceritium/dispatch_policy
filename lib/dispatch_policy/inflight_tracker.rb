@@ -247,8 +247,14 @@ module DispatchPolicy
     # back, so the cap collapses to `min` and stays there with nothing
     # anywhere reporting a clock problem. A skew ALSO comes from the two
     # ends disagreeing about the session TimeZone, since these columns are
-    # `timestamp WITHOUT time zone` — hence `clock_timestamp()::timestamp`,
-    # which lands in the same frame `now()` stored.
+    # `timestamp WITHOUT time zone` — hence
+    # `clock_timestamp() AT TIME ZONE 'UTC'`, which lands in the same frame
+    # `Repository::UTC_NOW` stored. `::timestamp` is NOT the same thing and
+    # was what stood here: it casts in the SESSION's zone, so once the
+    # write moved to UTC the two ends crossed and every lag was off by the
+    # session's offset — measured at 36,000,000ms on a UTC+10 session,
+    # against a true 1ms. The write and the read are one subtraction; a
+    # change to either is a change to both.
     #
     # `clock_timestamp()`, not `now()`: `now()` is the TRANSACTION
     # timestamp, so inside a host that wraps the perform in a transaction
@@ -279,7 +285,7 @@ module DispatchPolicy
       result = Repository.with_connection do
         Repository.connection.exec_query(
           "SELECT partition_key, EXTRACT(EPOCH FROM " \
-          "(clock_timestamp()::timestamp - admitted_at)) * 1000 AS raw_lag_ms " \
+          "((clock_timestamp() AT TIME ZONE 'UTC') - admitted_at)) * 1000 AS raw_lag_ms " \
           "FROM dispatch_policy_inflight_jobs WHERE active_job_id = $1 LIMIT 1",
           "lookup_admission",
           [active_job_id]

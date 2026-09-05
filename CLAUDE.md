@@ -19,7 +19,7 @@ See `README.md` for the API and examples.
 v0.1 (on master). The whole main flow is implemented and tested.
 What's pending lives in `IDEAS.md` with the rationale.
 
-349 runs / 869 assertions. `bundle exec rake test` from the root.
+358 runs / 917 assertions. `bundle exec rake test` from the root.
 A mutation battery guards the tests themselves: `bundle exec rake
 mutations:all` (see `test/mutations/README.md`, and "Fixing a defect"
 below).
@@ -143,72 +143,47 @@ dispatch_policy_policy_settings               one row per policy — pause flag
   as `GREATEST(now, stored)`: two admission transactions can execute in
   the opposite order to the one they started in, and a stamp that moves
   backwards makes that interval refill twice.
-- **A comparison whose two sides come from different clocks is a bug, and
-  these columns make it invisible.** Every datetime column the gem owns is
-  `timestamp WITHOUT time zone`, so comparing one against `now()` (a
-  timestamptz) reinterprets the stored value in the SESSION TimeZone. That
-  is correct only while the session agrees with whatever wrote the value.
-  Postgres-written columns (`next_eligible_at`, `last_checked_at`,
-  `failed_at`, `heartbeat_at`, `decayed_admits_at`) are written by `now()`
-  on the same footing, so they are read with `now()` — which for
-  `decayed_admits_at` means the DATABASE computes the elapsed time the
-  Tick's fairness reorder decays by (`claim_partitions` returns it as
-  `decay_elapsed_seconds`). Subtracting it from `Time.current` inverted the
-  fairness order under a skewed session. The list above is only worth
-  having if every entry on it has been checked — this column was missing
-  from it entirely, and the fix for it was then found HALF-APPLIED: the
-  same three columns were still being subtracted from `Time.current` in
-  `partitions/show.html.erb`. Every COMPARISON a view makes on these
-  columns is computed in `Repository#partition_clock_facts` for that
-  reason, and `test/integration/partition_view_test.rb` renders the
-  template's own logic — "a Rails view is unreachable from this suite"
-  stood here for one commit and is wrong: Rails does not boot, but ERB is
-  just a template, and binding the controller's locals and rendering it
-  takes twenty lines.
-  What is NOT fixed, and is recorded in ISSUES.md rather than
-  papered over: DISPLAY. `format_time` renders a naive timestamp with
-  `.utc.strftime`, so on a skewed session Postgres-written timestamps are
-  shown off by the session's offset while application-written ones are
-  right — adjacently, on the same page. That is the whole dashboard, not
-  this page, and it is a different change. "We fixed the
-  crossing" is a claim about the files somebody looked at, never about the
-  codebase — this bullet has now been wrong twice, in the same direction. Application-written ones —
-  `staged_jobs.scheduled_at`, the `scheduled_eligible_at` horizon derived
-  from it, and `tick_samples.sampled_at` — are bound from Ruby and
-  serialized by `quoted_date`,
-  so they are compared against a BOUND `Repository.app_clock` (which is
-  `config.now`, coerced — `config.clock` is public API and may hand back an
-  epoch Float, which every other reader accepts via `.to_f` and Postgres
-  rejects as a timestamp), never `now()`. That holds OUTSIDE Repository
-  too: `StagedJob.due` is the scope the drain button counts what is left
-  with, and read on the wrong clock it flashes "N still pending — click
-  drain again" about rows the claim will not take. Mixing them needs no misconfiguration to be wrong, just a host
-  that sets `variables: { timezone: … }` in database.yml, and then
-  `set(wait:)` is off by the session's UTC offset in whichever direction it
-  points — early by it east of UTC, LATE by it west — with no trace in any
-  metric (A11). It always fires; "never" stood here for three commits and
-  is wrong, and an operator whose jobs are consistently four hours late
-  will not match that symptom to a doc that says they never run. `sampled_at` is on this list
-  because it was MOVED here: it used to be written by `now()` and read by
-  five different Ruby-bounded windows, so on a session west of UTC every
-  sample landed ten hours in the past and the dashboard showed an idle
-  tick loop. An earlier version of this very paragraph listed it as
-  Postgres-written and safe, which is how a reviewer found it — the list
-  is only worth having if each entry has actually been checked. The same
-  rule applies outside
-  SQL: the adaptive gate's `queue_lag` is computed BY THE DATABASE
-  (`clock_timestamp()::timestamp - admitted_at`) rather than subtracted
-  from the worker's `Time.current`, because those are two machines' clocks
-  and the difference is the AIMD controller's entire input (A10). Use
-  `clock_timestamp()` and not `now()` there: `now()` is the transaction
-  timestamp, so inside a host that wraps the perform in a transaction it
-  stops advancing. What this rule does NOT fix, and cannot: two Postgres
-  sessions that disagree about their TimeZone. `admitted_at` is stored in
-  the writing session's frame, so a tick and a worker configured
-  differently still read each other wrong — and the lag's
-  `GREATEST(…, 0)` silently absorbs one direction of that. Consistent
-  session configuration across the fleet is an assumption of the whole
-  schema, not just of this column.
+- **Every datetime the gem writes is UTC, and `Repository::UTC_NOW` is how.**
+  These columns are `timestamp WITHOUT time zone` — a wall clock, no zone —
+  and ActiveRecord reads them back as UTC because `default_timezone` is
+  `:utc`. A bare `now()` is a timestamptz, so writing it stores the
+  SESSION's wall clock instead. Rails sets that session to UTC, so the
+  default install was fine; a host that sets `variables: { timezone: … }`
+  in database.yml — a supported knob, common for readable psql output —
+  shifted every column the gem owns by its offset. **Use
+  `#{UTC_NOW}` in SQL, never a bare `now()`, and
+  `clock_timestamp() AT TIME ZONE 'UTC'` where you need the wall clock
+  inside a transaction.** A test lints for it (`utc_storage_test.rb`)
+  because no behavioural test can cover a call site that does not exist
+  yet. Its file list is DERIVED, not written down — everything under
+  `lib/dispatch_policy` and `app` that carries SQL, plus the migration and
+  the generator template — because every hand-written version of that list
+  was short: the first read only `repository.rb` and missed
+  `InflightTracker.lookup_admission` (a ten-hour error in the adaptive
+  gate's only input), the second still missed `app/`, `db/migrate`, and
+  the generator template, which is the only copy an actual
+  `rails g dispatch_policy:install` runs.
+  One more constraint the store now carries: **the gem requires
+  `ActiveRecord.default_timezone = :utc`** (the Rails default). On
+  `:local`, Rails reads these columns back in the machine's zone while the
+  gem writes UTC, and every rendered timestamp is off by that offset.
+  Admission is unaffected — those comparisons are all database-side. Column DEFAULTS count: four of them write
+  timestamps, and `stage_many!` is the only path that reaches one.
+  This replaced a rule that paired each column with the clock that wrote
+  it. That rule was correct and nobody could hold it: it needed a list of
+  which columns were Postgres-written, and **the list was wrong three
+  times** — `sampled_at` classified backwards, `decayed_admits_at` missing
+  entirely, and the whole thing asserted as complete while
+  `partitions/show.html.erb` still recomputed three of them in Ruby. One
+  convention has no list to get wrong. It cost two audit findings to
+  learn: A10/A11 (comparisons deciding wrongly — scheduled work early or
+  late, a fairness order inverted, an adaptive cap collapsed) and A13
+  (values displayed wrongly — a backoff "until" a time in the past, a
+  round-trip age of minus ten hours).
+  Application-bound comparisons still exist and are still right:
+  `Repository.app_clock` binds a Ruby `Time` (coerced, since `config.clock`
+  may return an epoch Float) and both sides are UTC, so it agrees with
+  `UTC_NOW` by construction rather than by care.
 - **The partition sweeper holds a throttled partition until its bucket
   has REFILLED, not until its window is out.** `sweep_inactive_partitions!`
   refills the stored value to now with the same expression the admission
@@ -603,7 +578,7 @@ http://localhost:3000/                       # forms to enqueue
 http://localhost:3000/dispatch_policy        # dashboard
 
 # Tests
-bundle exec rake test                        # 349 runs / 869 assertions
+bundle exec rake test                        # 358 runs / 917 assertions
 # DB_NAME picks the database (default dispatch_policy_test). Use it whenever
 # anything else might be running the suite: every integration case TRUNCATEs
 # the gem's tables in setup, so two runs on one database produce failures
@@ -614,7 +589,7 @@ bundle exec rake test                        # 349 runs / 869 assertions
 # notices. Slow (one full suite per mutation). See test/mutations/README.md.
 bundle exec rake mutations:list              # the catalogue, no work done
 bundle exec rake mutations:check             # do the find-strings still match? (seconds)
-bundle exec rake mutations:all               # 66 mutations, 65 must be caught
+bundle exec rake mutations:all               # 70 mutations, 69 must be caught
 FILTER=19 bundle exec rake mutations:all     # one of them
 
 # When you add a column or table:

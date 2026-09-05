@@ -51,4 +51,35 @@ class PostgresBootstrapTest < Minitest::Test
            "the next test class must retry — caching the failure would skip " \
            "every remaining integration case and still report a green run"
   end
+
+  # A drift check that never says "current" is not a safe default: it is a
+  # silent DROP CASCADE and full re-migrate before EVERY integration case,
+  # which is most of the suite's wall time and looks like nothing at all.
+  # That is what happened when `defaults_current?` matched the default
+  # expression as WRITTEN (`AT TIME ZONE 'UTC'`) rather than as Postgres
+  # stores it (`timezone('UTC'::text, …)`).
+  #
+  # A mutation cannot catch this on its own — always-rebuild is slow, not
+  # wrong, so the suite stays green. The property has to be asserted.
+  def test_a_freshly_built_schema_reports_as_current
+    skip "no Postgres available" unless PG.connect!
+    PG.ensure_schema!
+
+    assert PG.schema_present?,
+           "the schema was just built, so the drift check must say it is current — " \
+           "otherwise every integration case silently rebuilds it"
+  end
+
+  # And it must still notice a default that is genuinely wrong, or it is
+  # only fast.
+  def test_a_stale_timestamp_default_reports_as_drifted
+    skip "no Postgres available" unless PG.connect!
+    PG.ensure_schema!
+    conn = ActiveRecord::Base.connection
+    conn.execute("ALTER TABLE dispatch_policy_tick_samples ALTER COLUMN sampled_at SET DEFAULT now()")
+
+    refute PG.schema_present?, "a default reverted to the session clock is drift"
+  ensure
+    PG.ensure_schema! if PG.connect!
+  end
 end

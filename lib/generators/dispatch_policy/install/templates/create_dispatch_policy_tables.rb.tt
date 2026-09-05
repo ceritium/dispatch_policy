@@ -8,7 +8,7 @@ class CreateDispatchPolicyTables < ActiveRecord::Migration[<%= Rails::VERSION::S
       t.jsonb   :job_data,      null: false
       t.datetime :scheduled_at
       t.integer :priority,      default: 0, null: false
-      t.datetime :enqueued_at,  null: false, default: -> { "now()" }
+      t.datetime :enqueued_at,  null: false, default: -> { "(now() AT TIME ZONE 'UTC')" }
       t.jsonb   :context,       null: false, default: {}
       # Quarantine. A row the Forwarder can never deliver — a job_class
       # the process cannot resolve, because a deploy renamed or dropped it
@@ -76,8 +76,8 @@ class CreateDispatchPolicyTables < ActiveRecord::Migration[<%= Rails::VERSION::S
       t.string   :policy_name,    null: false
       t.string   :partition_key,  null: false
       t.string   :active_job_id,  null: false
-      t.datetime :admitted_at,    null: false, default: -> { "now()" }
-      t.datetime :heartbeat_at,   null: false, default: -> { "now()" }
+      t.datetime :admitted_at,    null: false, default: -> { "(now() AT TIME ZONE 'UTC')" }
+      t.datetime :heartbeat_at,   null: false, default: -> { "(now() AT TIME ZONE 'UTC')" }
     end
     add_index :dispatch_policy_inflight_jobs, :active_job_id, unique: true,
               name: "idx_dp_inflight_active_job_id"
@@ -88,7 +88,7 @@ class CreateDispatchPolicyTables < ActiveRecord::Migration[<%= Rails::VERSION::S
 
     create_table :dispatch_policy_tick_samples do |t|
       t.string   :policy_name,        null: false
-      t.datetime :sampled_at,         null: false, default: -> { "now()" }
+      t.datetime :sampled_at,         null: false, default: -> { "(now() AT TIME ZONE 'UTC')" }
       t.integer  :duration_ms,        null: false, default: 0
       t.integer  :partitions_seen,    null: false, default: 0
       t.integer  :partitions_admitted, null: false, default: 0

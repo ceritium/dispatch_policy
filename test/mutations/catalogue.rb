@@ -30,7 +30,7 @@ module DispatchPolicy
               "written here (that the quarantine zeroes pending_count: it " \
               "subtracts with a GREATEST floor, so a partition with other " \
               "pending rows is still claimed). The real property is that the " \
-              "MIN only counts rows with `scheduled_at > now()`, and the claim " \
+              "MIN only counts rows scheduled in the FUTURE, and the claim " \
               "only ever returns rows that are already due — so a row cannot be " \
               "both held and still scheduled in the future. If any new path can " \
               "hold a future-scheduled row, delete this entry and write the test."
@@ -220,8 +220,8 @@ module DispatchPolicy
     # Build the interval by multiplication, not by text parsing.
     caught_by: 'interval_overflow_test',
     file:  'lib/dispatch_policy/repository.rb',
-    find:  'now() + ($5 * interval \'1 second\')',
-    replace: 'now() + ($5 || \' seconds\')::interval'
+    find:  '#{UTC_NOW} + ($5 * interval \'1 second\')',
+    replace: '#{UTC_NOW} + ($5 || \' seconds\')::interval'
   },
   {
     id:    '17',
@@ -419,7 +419,7 @@ module DispatchPolicy
     # behind it starves — the same outcome as 31, reached from the other side.
     caught_by: 'claim_rotation_test',
     file:  'lib/dispatch_policy/repository.rb',
-    find:  'SET last_checked_at = now()' + "\n",
+    find:  'SET last_checked_at = #{UTC_NOW}' + "\n",
     replace: 'SET last_checked_at = p.last_checked_at' + "\n"
   },
   {
@@ -547,7 +547,7 @@ module DispatchPolicy
     file:  'lib/dispatch_policy/inflight_tracker.rb',
     find:  [
       '          "SELECT partition_key, EXTRACT(EPOCH FROM " \\',
-      '          "(clock_timestamp()::timestamp - admitted_at)) * 1000 AS raw_lag_ms " \\',
+      '          "((clock_timestamp() AT TIME ZONE \'UTC\') - admitted_at)) * 1000 AS raw_lag_ms " \\',
       '          "FROM dispatch_policy_inflight_jobs WHERE active_job_id = $1 LIMIT 1",',
       '          "lookup_admission",',
       '          [active_job_id]'
@@ -673,8 +673,8 @@ module DispatchPolicy
     # transaction opened" — the controller never sees a job as late.
     caught_by: 'adaptive_clock_test',
     file:  'lib/dispatch_policy/inflight_tracker.rb',
-    find:  '"(clock_timestamp()::timestamp - admitted_at)) * 1000 AS raw_lag_ms " \\',
-    replace: '"(now()::timestamp - admitted_at)) * 1000 AS raw_lag_ms " \\'
+    find:  '"((clock_timestamp() AT TIME ZONE \'UTC\') - admitted_at)) * 1000 AS raw_lag_ms " \\',
+    replace: '"(now() AT TIME ZONE \'UTC\' - admitted_at)) * 1000 AS raw_lag_ms " \\'
   },
   {
     id:    '51',
@@ -866,12 +866,12 @@ module DispatchPolicy
     # the dashboard index read different methods; only one was covered.
     caught_by: 'round_trip_stats_test',
     file:  'lib/dispatch_policy/repository.rb',
-    find:  '            EXTRACT(EPOCH FROM (now() - MIN(p.last_checked_at) FILTER (WHERE NOT #{PARKED_SQL})))::float AS oldest_age_seconds,' + "\n" +
-           '            EXTRACT(EPOCH FROM (now() - PERCENTILE_DISC(0.05) WITHIN GROUP (ORDER BY p.last_checked_at) FILTER (WHERE NOT #{PARKED_SQL})))::float AS p95_age_seconds' + "\n" +
+    find:  '            EXTRACT(EPOCH FROM (#{UTC_NOW} - MIN(p.last_checked_at) FILTER (WHERE NOT #{PARKED_SQL})))::float AS oldest_age_seconds,' + "\n" +
+           '            EXTRACT(EPOCH FROM (#{UTC_NOW} - PERCENTILE_DISC(0.05) WITHIN GROUP (ORDER BY p.last_checked_at) FILTER (WHERE NOT #{PARKED_SQL})))::float AS p95_age_seconds' + "\n" +
            '          FROM #{PARTITIONS_TABLE} p' + "\n" +
            "          WHERE p.status = 'active' AND p.pending_count > 0",
-    replace: '            EXTRACT(EPOCH FROM (now() - MIN(p.last_checked_at) FILTER (WHERE $1::timestamp IS NOT NULL)))::float AS oldest_age_seconds,' + "\n" +
-             '            EXTRACT(EPOCH FROM (now() - PERCENTILE_DISC(0.05) WITHIN GROUP (ORDER BY p.last_checked_at) FILTER (WHERE $1::timestamp IS NOT NULL)))::float AS p95_age_seconds' + "\n" +
+    replace: '            EXTRACT(EPOCH FROM (#{UTC_NOW} - MIN(p.last_checked_at) FILTER (WHERE $1::timestamp IS NOT NULL)))::float AS oldest_age_seconds,' + "\n" +
+             '            EXTRACT(EPOCH FROM (#{UTC_NOW} - PERCENTILE_DISC(0.05) WITHIN GROUP (ORDER BY p.last_checked_at) FILTER (WHERE $1::timestamp IS NOT NULL)))::float AS p95_age_seconds' + "\n" +
              '          FROM #{PARTITIONS_TABLE} p' + "\n" +
              "          WHERE p.status = 'active' AND p.pending_count > 0"
   },
@@ -885,8 +885,8 @@ module DispatchPolicy
     caught_by: 'scheduled_clock_test',
     file:  'lib/dispatch_policy/repository.rb',
     find:  [
-      '            EXTRACT(EPOCH FROM (now() - last_checked_at))::float             AS age_seconds,',
-      '            EXTRACT(EPOCH FROM (now() - decayed_admits_at))::float           AS decay_elapsed_seconds,',
+      '            EXTRACT(EPOCH FROM (#{UTC_NOW} - last_checked_at))::float             AS age_seconds,',
+      '            EXTRACT(EPOCH FROM (#{UTC_NOW} - decayed_admits_at))::float           AS decay_elapsed_seconds,',
       '            decayed_admits_at IS NOT NULL                                    AS has_decay_stamp',
       '          FROM #{PARTITIONS_TABLE}',
       '          WHERE policy_name = $1 AND partition_key = $2',
@@ -927,9 +927,9 @@ module DispatchPolicy
     caught_by: 'scheduled_clock_test',
     file:  'lib/dispatch_policy/repository.rb',
     find:  [
-      '            (next_eligible_at IS NOT NULL AND next_eligible_at > now())      AS in_backoff,',
-      '            EXTRACT(EPOCH FROM (now() - last_checked_at))::float             AS age_seconds,',
-      '            EXTRACT(EPOCH FROM (now() - decayed_admits_at))::float           AS decay_elapsed_seconds,',
+      '            (next_eligible_at IS NOT NULL AND next_eligible_at > #{UTC_NOW})      AS in_backoff,',
+      '            EXTRACT(EPOCH FROM (#{UTC_NOW} - last_checked_at))::float             AS age_seconds,',
+      '            EXTRACT(EPOCH FROM (#{UTC_NOW} - decayed_admits_at))::float           AS decay_elapsed_seconds,',
       '            decayed_admits_at IS NOT NULL                                    AS has_decay_stamp',
       '          FROM #{PARTITIONS_TABLE}',
       '          WHERE policy_name = $1 AND partition_key = $2',
@@ -939,8 +939,8 @@ module DispatchPolicy
     ].join("\n"),
     replace: [
       '            (next_eligible_at IS NOT NULL AND next_eligible_at > $3::timestamp) AS in_backoff,',
-      '            EXTRACT(EPOCH FROM (now() - last_checked_at))::float             AS age_seconds,',
-      '            EXTRACT(EPOCH FROM (now() - decayed_admits_at))::float           AS decay_elapsed_seconds,',
+      '            EXTRACT(EPOCH FROM (#{UTC_NOW} - last_checked_at))::float             AS age_seconds,',
+      '            EXTRACT(EPOCH FROM (#{UTC_NOW} - decayed_admits_at))::float           AS decay_elapsed_seconds,',
       '            decayed_admits_at IS NOT NULL                                    AS has_decay_stamp',
       '          FROM #{PARTITIONS_TABLE}',
       '          WHERE policy_name = $1 AND partition_key = $2',
@@ -972,6 +972,54 @@ module DispatchPolicy
     file:  'app/views/dispatch_policy/partitions/show.html.erb',
     find:  '<% in_backoff  = @clock_facts[:in_backoff] %>',
     replace: '<% in_backoff  = @partition.next_eligible_at && @partition.next_eligible_at > Time.current %>'
+  },
+  {
+    id:    '68',
+    label: 'UTC_NOW: back to a bare now()',
+    # A13's root fix. `now()` is a timestamptz; written into a `timestamp WITHOUT
+    # time zone` column it stores the SESSION's wall clock, so a host that sets
+    # `variables: { timezone: … }` shifts every datetime the gem owns by its
+    # offset — wrong comparisons AND wrong displayed values.
+    caught_by: 'utc_storage_test',
+    file:  'lib/dispatch_policy/repository.rb',
+    find:  %q{UTC_NOW = "(now() AT TIME ZONE 'UTC')"},
+    replace: %q{UTC_NOW = "now()"}
+  },
+  {
+    id:    '69',
+    label: 'UTC_NOW: a column DEFAULT left on a bare now()',
+    # The four column defaults are a separate write path from the SQL, and only
+    # ONE is reachable — `stage_many!` lets the default fill `enqueued_at` where
+    # `stage!` supplies it. A test that only calls `stage!` leaves all four
+    # unexercised, which is how this survived its first version.
+    caught_by: 'utc_storage_test',
+    file:  'db/migrate/20260501000001_create_dispatch_policy_tables.rb',
+    find:  %q{t.datetime :enqueued_at,  null: false, default: -> { "(now() AT TIME ZONE 'UTC')" }},
+    replace: %q{t.datetime :enqueued_at,  null: false, default: -> { "now()" }}
+  },
+  {
+    id:    '70',
+    label: 'adaptive lag: the read left on the session clock',
+    # The axis 42 and 50 do not cover. `admitted_at` is written in UTC and
+    # `clock_timestamp()::timestamp` casts in the SESSION's zone, so the two ends
+    # of one subtraction cross: measured at 36,000,000ms against a true 1ms on a
+    # UTC+10 session, which collapses the AIMD cap to `min` and keeps it there.
+    caught_by: 'adaptive_clock_test',
+    file:  'lib/dispatch_policy/inflight_tracker.rb',
+    find:  '"((clock_timestamp() AT TIME ZONE \'UTC\') - admitted_at)) * 1000 AS raw_lag_ms " \\',
+    replace: '"(clock_timestamp()::timestamp - admitted_at)) * 1000 AS raw_lag_ms " \\'
+  },
+  {
+    id:    '71',
+    label: "schema drift: the defaults check pinned to one version's spelling",
+    # Postgres deparses this default differently per major version — PG13 stores
+    # `timezone('UTC'::text, now())`, PG16 stores `now() AT TIME ZONE 'utc'::text`
+    # — so matching either spelling exactly passes on one CI leg and fails on the
+    # other. Both name the zone; a bare `now()` does not.
+    caught_by: 'postgres_bootstrap_test',
+    file:  'test/test_helper.rb',
+    find:  'column && column.default_function.to_s.match?(/utc/i)',
+    replace: 'column && column.default_function.to_s.include?("AT TIME ZONE")'
   },
     ].freeze
   end

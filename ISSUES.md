@@ -152,7 +152,9 @@ needs a host that sets `variables: { timezone: … }` in `database.yml` —
 a supported knob, commonly used to make raw psql output readable. Then
 `set(wait:)` runs off by the session's UTC offset — early by it east of
 UTC, late by it west — and nothing anywhere records the difference. Fixed by binding
-`config.now` on both sides. `next_eligible_at` deliberately stays on
+`config.now` on both sides. (Superseded by A13's fix, which moved every
+column to UTC and removed the pairing rule entirely.) `next_eligible_at`
+deliberately stayed on
 `now()`: Postgres writes it, so that is the clock it must be read on.
 
 ## A10 — The adaptive gate's feedback signal spanned two clocks
@@ -196,43 +198,42 @@ that cannot help — and their frozen `last_checked_at` dragged the
 round-trip percentiles toward infinity. They are excluded from both and
 reported on their own as `schedule_parked`.
 
-## A13 — the dashboard renders naive timestamps as if they were UTC
+## A13 — the dashboard rendered naive timestamps as if they were UTC *(fixed)*
 
-Open. `format_time` is `time.utc.strftime`, and every datetime column the
-gem owns is `timestamp WITHOUT time zone`. On a session whose TimeZone is
-not UTC — the `variables: { timezone: … }` install this whole branch
-exists for — Postgres writes local wall clock into those columns and
-ActiveRecord reads them back as UTC.
+`format_time` is `time.utc.strftime`, and every datetime column the gem
+owns is `timestamp WITHOUT time zone`. On a session whose TimeZone is not
+UTC — the `variables: { timezone: … }` install — Postgres wrote local wall
+clock into those columns and ActiveRecord read them back as UTC.
 
-**It is exactly half the columns, and which half matters.**
-Postgres-written ones (`next_eligible_at`, `last_checked_at`,
-`last_admit_at`, `last_enqueued_at`, `context_updated_at`,
-`staged_jobs.enqueued_at`, `failed_at`) render offset by the session's
-UTC offset. Application-written ones (`staged_jobs.scheduled_at` and the
-`scheduled_eligible_at` horizon derived from it) render CORRECTLY — they
-were bound from Ruby as UTC and come back as the UTC they were written in.
-An earlier version of this entry said "every rendered timestamp on every
-page", which would send whoever fixes it to apply a blanket offset and
-break the half that is right.
+It was exactly half the columns, and which half mattered: Postgres-written
+ones rendered offset, application-written ones rendered correctly, on
+adjacent lines of the same page. "Next eligible" and "Scheduled horizon"
+sat next to each other, one wrong and one right.
 
-So the dashboard is ALREADY internally inconsistent, and adjacently:
-`partitions/show.html.erb` puts "Next eligible" (offset) and "Scheduled
-horizon" (correct) on neighbouring `<li>`s; `staged_jobs/show.html.erb`
-does the same with `enqueued_at` and `scheduled_at`. "A per-call fix would
-make it inconsistent, which is worse than uniformly offset" was the
-deferral reason written here, and it is false in both halves — it is not
-uniform, and it is already inconsistent.
+**Fixed at the write, not at the read.** Every SQL site now uses
+`Repository::UTC_NOW` (`(now() AT TIME ZONE 'UTC')`) and the four column
+DEFAULTS do the same, so the store is uniformly UTC and ActiveRecord's
+reading is right by construction. `format_time` needed no change.
 
-The real reason to defer is smaller and honest: fixing it means deciding
-once, for the whole engine, whether it renders in UTC, in the session's
-zone or in the operator's, and then knowing at every call site which kind
-of column it holds. That is a UI change with its own design, and this
-branch is about admission. Found by a reviewer after the partition page's
-COMPARISONS were moved onto the writing clock: the page now decides
-correctly and prints the decision beside a timestamp that disagrees with
-it — "Backoff until 17:00:39" over a footer reading "now: 21:00:38".
+Three things about the shape of this fix are worth keeping:
 
-The comparisons are what admission depends on, and those are correct.
+- **It removed a category instead of compensating for one.** The previous
+  rule — pair each column with the clock that wrote it — was correct and
+  unusable: it required a list of which columns were Postgres-written, and
+  that list was wrong three times (`sampled_at` classified backwards,
+  `decayed_admits_at` missing, and the whole thing asserted complete while
+  a view still recomputed three of them). One convention has no list.
+- **Under the default session it is a no-op.** Rails sets the session to
+  UTC, so `now() AT TIME ZONE 'UTC'` stores the same bytes `now()` did.
+  Nobody who was not already broken sees a change.
+- **The column defaults nearly slipped through.** Only one of the four is
+  reachable — `stage_many!` lets the default fill `enqueued_at`, while
+  `stage!` supplies it — so the first version of the test called `stage!`
+  and left all four unexercised. The mutation that reverts a default
+  SURVIVED until the bulk path was added to the test.
+
+Rows written by an older version under a skewed session keep their offset;
+nothing rewrites them. See the CHANGELOG's upgrade notes.
 
 ## A9 — left open, deliberately
 
@@ -267,8 +268,8 @@ documented multi-database install), interaction (two ordinary
 participants deadlocking), and failure (one bad row wedging a partition
 forever).
 
-> **Status:** A1-A7 fixed. A8, A10, A11 and A12 fixed in the follow-up
-> pass below; A9 still open, with its reasoning there.
+> **Status:** A1-A7 fixed. A8, A10, A11, A12 and A13 fixed in the
+> follow-up passes below; A9 still open, with its reasoning there.
 
 ## Five review rounds on the fix branch
 

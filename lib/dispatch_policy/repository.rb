@@ -43,6 +43,37 @@ module DispatchPolicy
     # `claim_partitions`.
     PARKED_SQL = "(p.scheduled_eligible_at IS NOT NULL AND p.scheduled_eligible_at > $1)"
 
+    # The database clock, in UTC, always — regardless of the session's
+    # TimeZone.
+    #
+    # Every datetime column the gem owns is `timestamp WITHOUT time zone`,
+    # which stores a wall clock and no zone. A bare `now()` is a
+    # timestamptz, so writing it into such a column stores the wall clock
+    # of the SESSION, and reading it back compares it against the session
+    # too. Rails sets that session to UTC, so the default install was
+    # consistent — but a host that sets `variables: { timezone: … }` in
+    # database.yml (a supported knob, commonly used to make raw psql output
+    # readable) shifted every one of these columns by its offset, and
+    # ActiveRecord read them all back as UTC anyway.
+    #
+    # That produced two classes of bug this gem has now had both of:
+    # comparisons that decided wrongly (A10/A11 — scheduled work early or
+    # late, a fairness order inverted, an adaptive cap collapsed), and
+    # values displayed wrongly (A13 — a backoff "until" a time in the past,
+    # a round-trip age of minus ten hours). The comparisons were fixed
+    # one at a time by pairing each column with the clock that wrote it,
+    # which worked and was a rule nobody could hold in their head: the
+    # invariant needed a five-line paragraph and a list of columns, and
+    # that list was WRONG three times.
+    #
+    # `AT TIME ZONE 'UTC'` removes the category. Every column the gem
+    # writes is UTC, every comparison is UTC against UTC, and
+    # ActiveRecord's `default_timezone = :utc` reading is right by
+    # construction. Under the default session (UTC) the stored value is
+    # byte-identical to what `now()` produced before, so upgrading changes
+    # nothing for anyone who was not already broken.
+    UTC_NOW = "(now() AT TIME ZONE 'UTC')"
+
     module_function
 
     # The application clock, as a Time, for binding into SQL.
@@ -122,7 +153,7 @@ module DispatchPolicy
           <<~SQL.squish,
             INSERT INTO #{STAGED_TABLE}
               (policy_name, partition_key, queue_name, job_class, job_data, context, scheduled_at, priority, enqueued_at)
-            VALUES ($1, $2, $3, $4, $5::jsonb, $6::jsonb, $7, $8, now())
+            VALUES ($1, $2, $3, $4, $5::jsonb, $6::jsonb, $7, $8, #{UTC_NOW})
           SQL
           "stage_job",
           [policy_name, partition_key, queue_name, job_class, JSON.dump(job_data), JSON.dump(context), scheduled_at, priority]
@@ -242,8 +273,8 @@ module DispatchPolicy
             (policy_name, partition_key, queue_name, shard, context, context_updated_at,
              pending_count, last_enqueued_at, status, gate_state, scheduled_eligible_at,
              created_at, updated_at)
-          VALUES ($1, $2, $3, $4, $5::jsonb, now(), $6, now(), 'active', '{}'::jsonb, $7,
-                  now(), now())
+          VALUES ($1, $2, $3, $4, $5::jsonb, #{UTC_NOW}, $6, #{UTC_NOW}, 'active', '{}'::jsonb, $7,
+                  #{UTC_NOW}, #{UTC_NOW})
           ON CONFLICT (policy_name, partition_key) DO UPDATE SET
             context             = EXCLUDED.context,
             context_updated_at  = EXCLUDED.context_updated_at,
@@ -260,7 +291,7 @@ module DispatchPolicy
               ELSE LEAST(#{PARTITIONS_TABLE}.scheduled_eligible_at,
                          EXCLUDED.scheduled_eligible_at)
             END,
-            updated_at          = now()
+            updated_at          = #{UTC_NOW}
         SQL
         "upsert_partition",
         [policy_name, partition_key, queue_name, shard, JSON.dump(context), delta_pending,
@@ -295,8 +326,11 @@ module DispatchPolicy
     # Binding the clock puts both sides of the comparison through the same
     # `quoted_date` the write went through, so they agree under any
     # combination of session TimeZone and `ActiveRecord.default_timezone`.
-    # `next_eligible_at` stays on `now()` for exactly the same reason: it
-    # is written on that clock, so that is the clock it must be read on.
+    # `next_eligible_at` is compared against `UTC_NOW` because that is what
+    # WRITES it. The rule this file used to teach — pair each column with
+    # the clock that wrote it — is retired: every column the gem owns is
+    # UTC now, so there is one clock and no pairing to get wrong. See
+    # `UTC_NOW`.
     #
     # `decay_elapsed_seconds` is returned for the same rule, from the other
     # side. `decayed_admits_at` is Postgres-written (`record_partition_admit!`
@@ -320,7 +354,7 @@ module DispatchPolicy
           WHERE policy_name = $1
             AND status = 'active'
             AND pending_count > 0
-            AND (next_eligible_at IS NULL OR next_eligible_at <= now())
+            AND (next_eligible_at IS NULL OR next_eligible_at <= #{UTC_NOW})
             AND (scheduled_eligible_at IS NULL OR scheduled_eligible_at <= $2)
             AND NOT EXISTS (
               SELECT 1 FROM #{POLICY_SETTINGS_TABLE} ps
@@ -332,11 +366,11 @@ module DispatchPolicy
           FOR UPDATE SKIP LOCKED
         )
         UPDATE #{PARTITIONS_TABLE} p
-        SET last_checked_at = now()
+        SET last_checked_at = #{UTC_NOW}
         FROM candidates
         WHERE p.id = candidates.id
         RETURNING p.*,
-          EXTRACT(EPOCH FROM (now() - p.decayed_admits_at)) AS decay_elapsed_seconds
+          EXTRACT(EPOCH FROM (#{UTC_NOW} - p.decayed_admits_at)) AS decay_elapsed_seconds
       SQL
       result = connection.exec_query(sql, "claim_partitions", params)
       result.to_a.map { |row| normalize_partition(row) }
@@ -425,7 +459,7 @@ module DispatchPolicy
       marked = connection.exec_query(
         <<~SQL.squish,
           UPDATE #{STAGED_TABLE}
-          SET failed_at = now(), failure_reason = $3
+          SET failed_at = #{UTC_NOW}, failure_reason = $3
           WHERE policy_name = $1 AND partition_key = $2
             AND id = ANY($4::bigint[]) AND failed_at IS NULL
           RETURNING id
@@ -438,7 +472,7 @@ module DispatchPolicy
         connection.exec_query(
           <<~SQL.squish,
             UPDATE #{PARTITIONS_TABLE}
-            SET pending_count = GREATEST(pending_count - $3, 0), updated_at = now()
+            SET pending_count = GREATEST(pending_count - $3, 0), updated_at = #{UTC_NOW}
             WHERE policy_name = $1 AND partition_key = $2
           SQL
           "decrement_pending_for_quarantine",
@@ -475,7 +509,7 @@ module DispatchPolicy
         <<~SQL.squish,
           SELECT DISTINCT partition_key FROM #{STAGED_TABLE}
           WHERE policy_name = $1 AND failed_at IS NOT NULL
-            AND failed_at < now() - ($2 || ' seconds')::interval
+            AND failed_at < #{UTC_NOW} - ($2 || ' seconds')::interval
         SQL
         "aged_quarantine_partitions",
         [policy_name, older_than.to_i]
@@ -521,13 +555,13 @@ module DispatchPolicy
           WITH requeued AS (
             UPDATE #{STAGED_TABLE} SET failed_at = NULL, failure_reason = NULL
             WHERE policy_name = $1 AND partition_key = $2 AND failed_at IS NOT NULL
-              AND ($3::bigint IS NULL OR failed_at < now() - ($3 || ' seconds')::interval)
+              AND ($3::bigint IS NULL OR failed_at < #{UTC_NOW} - ($3 || ' seconds')::interval)
             RETURNING id
           ), bumped AS (
             UPDATE #{PARTITIONS_TABLE}
             SET pending_count = pending_count + (SELECT count(*) FROM requeued),
                 scheduled_eligible_at = NULL,
-                updated_at = now()
+                updated_at = #{UTC_NOW}
             WHERE policy_name = $1 AND partition_key = $2
           )
           SELECT count(*) AS requeued FROM requeued
@@ -611,12 +645,12 @@ module DispatchPolicy
         decay_sql = <<~SQL.squish
           decayed_admits     = decayed_admits *
                                 exp(GREATEST(
-                                  - COALESCE(EXTRACT(EPOCH FROM (now() - decayed_admits_at)), 0)
+                                  - COALESCE(EXTRACT(EPOCH FROM (#{UTC_NOW} - decayed_admits_at)), 0)
                                     / NULLIF($#{decay_idx}::double precision, 0),
                                   -700
                                 ))
                               + $#{admitted_idx_for_ewma},
-          decayed_admits_at  = now(),
+          decayed_admits_at  = #{UTC_NOW},
         SQL
       else
         decay_sql = ""
@@ -670,11 +704,11 @@ module DispatchPolicy
           UPDATE #{PARTITIONS_TABLE}
           SET pending_count    = GREATEST(pending_count - $3, 0),
               total_admitted   = total_admitted + $3,
-              last_admit_at    = CASE WHEN $3 > 0 THEN now() ELSE last_admit_at END,
+              last_admit_at    = CASE WHEN $3 > 0 THEN #{UTC_NOW} ELSE last_admit_at END,
               gate_state       = #{gate_state_sql},
               next_eligible_at = #{next_eligible_sql},
               #{decay_sql}
-              updated_at       = now()
+              updated_at       = #{UTC_NOW}
           WHERE policy_name = $1 AND partition_key = $2
         SQL
         "record_partition_admit",
@@ -702,7 +736,7 @@ module DispatchPolicy
     # unreachable: quarantine happens in the Forwarder, which only ever
     # sees rows the claim handed it, and the claim only takes rows that
     # are already due — so a quarantined row can never satisfy
-    # `scheduled_at > now()`. It is kept because the day something else
+    # a `scheduled_at` in the future. It is kept because the day something else
     # can quarantine a future row, a horizon pointing at one would wake
     # the partition for work nothing will claim. No test pins it; nothing
     # can, by construction.
@@ -731,7 +765,7 @@ module DispatchPolicy
                   AND s.failed_at IS NULL
                   AND s.scheduled_at > $3
               ),
-              updated_at = now()
+              updated_at = #{UTC_NOW}
           WHERE p.policy_name = $1 AND p.partition_key = $2
             AND NOT EXISTS (
               SELECT 1 FROM #{STAGED_TABLE} d
@@ -827,9 +861,9 @@ module DispatchPolicy
             SET gate_state       = p.gate_state || v.gate_state_patch,
                 next_eligible_at = CASE
                   WHEN v.retry_after_secs IS NULL THEN p.next_eligible_at
-                  ELSE now() + (v.retry_after_secs * interval '1 second')
+                  ELSE #{UTC_NOW} + (v.retry_after_secs * interval '1 second')
                 END,
-                updated_at       = now()
+                updated_at       = #{UTC_NOW}
             FROM (VALUES #{values_sql.join(", ")})
               AS v(policy_name, partition_key, gate_state_patch, retry_after_secs)
             WHERE p.policy_name = v.policy_name AND p.partition_key = v.partition_key
@@ -849,9 +883,9 @@ module DispatchPolicy
       connection.exec_query(
         <<~SQL.squish,
           INSERT INTO #{POLICY_SETTINGS_TABLE} (policy_name, paused, created_at, updated_at)
-          VALUES ($1, $2, now(), now())
+          VALUES ($1, $2, #{UTC_NOW}, #{UTC_NOW})
           ON CONFLICT (policy_name)
-          DO UPDATE SET paused = EXCLUDED.paused, updated_at = now()
+          DO UPDATE SET paused = EXCLUDED.paused, updated_at = #{UTC_NOW}
         SQL
         "set_policy_paused",
         [policy_name, paused ? true : false]
@@ -996,7 +1030,7 @@ module DispatchPolicy
           updated += connection.exec_query(
             <<~SQL.squish,
               UPDATE #{PARTITIONS_TABLE}
-              SET status = $2, updated_at = now()
+              SET status = $2, updated_at = #{UTC_NOW}
               WHERE policy_name = $1 AND partition_key IN (#{update_keys})
               RETURNING 1
             SQL
@@ -1017,7 +1051,7 @@ module DispatchPolicy
       params     = []
       rows.each_with_index do |row, idx|
         base = idx * 3
-        values_sql << "($#{base + 1}, $#{base + 2}, $#{base + 3}, now(), now())"
+        values_sql << "($#{base + 1}, $#{base + 2}, $#{base + 3}, #{UTC_NOW}, #{UTC_NOW})"
         params.push(row[:policy_name], row[:partition_key], row[:active_job_id])
       end
       # ON CONFLICT (active_job_id) DO NOTHING covers two paths that
@@ -1070,7 +1104,7 @@ module DispatchPolicy
 
       placeholders = ids.each_index.map { |i| "$#{i + 1}" }.join(", ")
       connection.exec_query(
-        "UPDATE #{INFLIGHT_TABLE} SET heartbeat_at = now() " \
+        "UPDATE #{INFLIGHT_TABLE} SET heartbeat_at = #{UTC_NOW} " \
         "WHERE active_job_id IN (#{placeholders}) RETURNING active_job_id",
         "heartbeat_inflight",
         ids
@@ -1111,9 +1145,9 @@ module DispatchPolicy
         <<~SQL.squish,
           DELETE FROM #{INFLIGHT_TABLE}
           WHERE (heartbeat_at > admitted_at
-                 AND heartbeat_at < now() - ($1 || ' seconds')::interval)
+                 AND heartbeat_at < #{UTC_NOW} - ($1 || ' seconds')::interval)
              OR (heartbeat_at <= admitted_at
-                 AND admitted_at < now() - ($2 || ' seconds')::interval)
+                 AND admitted_at < #{UTC_NOW} - ($2 || ' seconds')::interval)
         SQL
         "sweep_stale_inflight",
         [cutoff_seconds.to_i, queued_cutoff_seconds.to_i]
@@ -1380,10 +1414,10 @@ module DispatchPolicy
             COUNT(*)::int AS active_partitions,
             COUNT(*) FILTER (WHERE p.last_checked_at IS NULL AND NOT #{PARKED_SQL})::int AS never_checked,
             COUNT(*) FILTER (WHERE #{PARKED_SQL})::int AS schedule_parked,
-            COUNT(*) FILTER (WHERE p.next_eligible_at IS NOT NULL AND p.next_eligible_at > now())::int AS in_backoff,
-            EXTRACT(EPOCH FROM (now() - MIN(p.last_checked_at) FILTER (WHERE NOT #{PARKED_SQL})))::float AS oldest_age_seconds,
-            EXTRACT(EPOCH FROM (now() - PERCENTILE_DISC(0.5)  WITHIN GROUP (ORDER BY p.last_checked_at) FILTER (WHERE NOT #{PARKED_SQL})))::float AS p50_age_seconds,
-            EXTRACT(EPOCH FROM (now() - PERCENTILE_DISC(0.05) WITHIN GROUP (ORDER BY p.last_checked_at) FILTER (WHERE NOT #{PARKED_SQL})))::float AS p95_age_seconds
+            COUNT(*) FILTER (WHERE p.next_eligible_at IS NOT NULL AND p.next_eligible_at > #{UTC_NOW})::int AS in_backoff,
+            EXTRACT(EPOCH FROM (#{UTC_NOW} - MIN(p.last_checked_at) FILTER (WHERE NOT #{PARKED_SQL})))::float AS oldest_age_seconds,
+            EXTRACT(EPOCH FROM (#{UTC_NOW} - PERCENTILE_DISC(0.5)  WITHIN GROUP (ORDER BY p.last_checked_at) FILTER (WHERE NOT #{PARKED_SQL})))::float AS p50_age_seconds,
+            EXTRACT(EPOCH FROM (#{UTC_NOW} - PERCENTILE_DISC(0.05) WITHIN GROUP (ORDER BY p.last_checked_at) FILTER (WHERE NOT #{PARKED_SQL})))::float AS p95_age_seconds
           FROM #{PARTITIONS_TABLE} p
           #{filter_sql}
         SQL
@@ -1438,9 +1472,9 @@ module DispatchPolicy
       row = connection.exec_query(
         <<~SQL.squish,
           SELECT
-            (next_eligible_at IS NOT NULL AND next_eligible_at > now())      AS in_backoff,
-            EXTRACT(EPOCH FROM (now() - last_checked_at))::float             AS age_seconds,
-            EXTRACT(EPOCH FROM (now() - decayed_admits_at))::float           AS decay_elapsed_seconds,
+            (next_eligible_at IS NOT NULL AND next_eligible_at > #{UTC_NOW})      AS in_backoff,
+            EXTRACT(EPOCH FROM (#{UTC_NOW} - last_checked_at))::float             AS age_seconds,
+            EXTRACT(EPOCH FROM (#{UTC_NOW} - decayed_admits_at))::float           AS decay_elapsed_seconds,
             decayed_admits_at IS NOT NULL                                    AS has_decay_stamp
           FROM #{PARTITIONS_TABLE}
           WHERE policy_name = $1 AND partition_key = $2
@@ -1494,9 +1528,9 @@ module DispatchPolicy
         <<~SQL.squish,
           SELECT
             p.policy_name,
-            COUNT(*) FILTER (WHERE p.next_eligible_at IS NOT NULL AND p.next_eligible_at > now())::int AS in_backoff,
-            EXTRACT(EPOCH FROM (now() - MIN(p.last_checked_at) FILTER (WHERE NOT #{PARKED_SQL})))::float AS oldest_age_seconds,
-            EXTRACT(EPOCH FROM (now() - PERCENTILE_DISC(0.05) WITHIN GROUP (ORDER BY p.last_checked_at) FILTER (WHERE NOT #{PARKED_SQL})))::float AS p95_age_seconds
+            COUNT(*) FILTER (WHERE p.next_eligible_at IS NOT NULL AND p.next_eligible_at > #{UTC_NOW})::int AS in_backoff,
+            EXTRACT(EPOCH FROM (#{UTC_NOW} - MIN(p.last_checked_at) FILTER (WHERE NOT #{PARKED_SQL})))::float AS oldest_age_seconds,
+            EXTRACT(EPOCH FROM (#{UTC_NOW} - PERCENTILE_DISC(0.05) WITHIN GROUP (ORDER BY p.last_checked_at) FILTER (WHERE NOT #{PARKED_SQL})))::float AS p95_age_seconds
           FROM #{PARTITIONS_TABLE} p
           WHERE p.status = 'active' AND p.pending_count > 0
           GROUP BY p.policy_name
@@ -1525,7 +1559,7 @@ module DispatchPolicy
           INSERT INTO #{ADAPTIVE_TABLE}
             (policy_name, partition_key, current_max, ewma_latency_ms,
              sample_count, created_at, updated_at)
-          VALUES ($1, $2, $3, 0, 0, now(), now())
+          VALUES ($1, $2, $3, 0, 0, #{UTC_NOW}, #{UTC_NOW})
           ON CONFLICT (policy_name, partition_key) DO NOTHING
         SQL
         "adaptive_seed",
@@ -1577,8 +1611,8 @@ module DispatchPolicy
                 THEN FLOOR(current_max * $9::double precision)::int
               ELSE current_max + 1
             END)),
-            last_observed_at = now(),
-            updated_at       = now()
+            last_observed_at = #{UTC_NOW},
+            updated_at       = #{UTC_NOW}
           WHERE policy_name = $1 AND partition_key = $2
         SQL
         "adaptive_record",
@@ -1609,7 +1643,7 @@ module DispatchPolicy
       connection.exec_query(
         <<~SQL.squish,
           DELETE FROM #{ADAPTIVE_TABLE} a
-          WHERE a.updated_at < now() - ($1 || ' seconds')::interval
+          WHERE a.updated_at < #{UTC_NOW} - ($1 || ' seconds')::interval
             AND NOT EXISTS (
               SELECT 1 FROM #{PARTITIONS_TABLE} p
               WHERE p.policy_name = a.policy_name
@@ -1723,12 +1757,12 @@ module DispatchPolicy
       if throttled_cutoff_seconds
         params << throttled_cutoff_seconds.to_i
         age_sql = <<~SQL.squish
-          COALESCE(p.last_admit_at, p.created_at) < now() - (
+          COALESCE(p.last_admit_at, p.created_at) < #{UTC_NOW} - (
             CASE WHEN p.gate_state ? 'throttle' THEN $#{params.size} ELSE $1 END || ' seconds'
           )::interval
         SQL
       else
-        age_sql = "COALESCE(p.last_admit_at, p.created_at) < now() - ($1 || ' seconds')::interval"
+        age_sql = "COALESCE(p.last_admit_at, p.created_at) < #{UTC_NOW} - ($1 || ' seconds')::interval"
       end
 
       # Picks its victims in the same BYTE order every other multi-row
@@ -1874,7 +1908,7 @@ module DispatchPolicy
         ["NULL", []]
       else
         # 5th param ($5) — caller appends params to those of the parent UPDATE
-        ["now() + ($5 * interval '1 second')", [clamp_backoff(retry_after)]]
+        ["#{UTC_NOW} + ($5 * interval '1 second')", [clamp_backoff(retry_after)]]
       end
     end
 

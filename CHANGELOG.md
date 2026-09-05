@@ -4,6 +4,81 @@
 
 ### Upgrade notes
 
+- **Timestamp defaults now store UTC explicitly.** Four columns default to
+  the database clock — `dispatch_policy_staged_jobs.enqueued_at`,
+  `dispatch_policy_inflight_jobs.admitted_at` and `.heartbeat_at`, and
+  `dispatch_policy_tick_samples.sampled_at` — and their default changed
+  from `now()` to `(now() AT TIME ZONE 'UTC')`. The gem ships a single
+  migration, so run it yourself:
+
+  ```sql
+  ALTER TABLE dispatch_policy_staged_jobs
+    ALTER COLUMN enqueued_at  SET DEFAULT (now() AT TIME ZONE 'UTC');
+  ALTER TABLE dispatch_policy_inflight_jobs
+    ALTER COLUMN admitted_at  SET DEFAULT (now() AT TIME ZONE 'UTC'),
+    ALTER COLUMN heartbeat_at SET DEFAULT (now() AT TIME ZONE 'UTC');
+  ALTER TABLE dispatch_policy_tick_samples
+    ALTER COLUMN sampled_at   SET DEFAULT (now() AT TIME ZONE 'UTC');
+  ```
+
+  These are metadata-only changes: they take an ACCESS EXCLUSIVE lock for
+  the instant it takes to update the catalog, rewrite nothing, and are safe
+  on a live table.
+
+  **If your `database.yml` does NOT set a session TimeZone, this changes
+  nothing at all** — Rails already runs its sessions in UTC, so the stored
+  bytes are identical, and you can apply it at your leisure. If it DOES
+  (`variables: { timezone: … }`), it is a correctness fix: every datetime
+  the gem wrote was being stored in that zone and read back as UTC, which
+  put scheduled work off by the offset and showed wrong times throughout
+  the dashboard. Rows already written keep their offset — nothing rewrites
+  them, so expect a discontinuity at the upgrade — and for two columns
+  that is not cosmetic and does not age out.
+
+  **`dispatch_policy_partitions.next_eligible_at` and `.decayed_admits_at`
+  need a one-off shift.** Staged, inflight and tick-sample rows leave on
+  their own retention, but a partition row lives forever, and
+  `next_eligible_at` is what `claim_partitions` filters on. A partition
+  backed off under a session EAST of UTC carries a value that now reads as
+  being in the future by your whole offset, so the tick will not claim it
+  until real time catches up — ten hours of a tenant admitting nothing,
+  with the dashboard showing it in backoff and nothing else wrong.
+  `decayed_admits_at` skews the fairness order the same way for the same
+  span. With the tick loop stopped:
+
+  ```sql
+  UPDATE dispatch_policy_partitions SET
+    next_eligible_at      = next_eligible_at      AT TIME ZONE '<your zone>' AT TIME ZONE 'UTC',
+    decayed_admits_at     = decayed_admits_at     AT TIME ZONE '<your zone>' AT TIME ZONE 'UTC',
+    last_checked_at       = last_checked_at       AT TIME ZONE '<your zone>' AT TIME ZONE 'UTC',
+    last_admit_at         = last_admit_at         AT TIME ZONE '<your zone>' AT TIME ZONE 'UTC',
+    last_enqueued_at      = last_enqueued_at      AT TIME ZONE '<your zone>' AT TIME ZONE 'UTC',
+    context_updated_at    = context_updated_at    AT TIME ZONE '<your zone>' AT TIME ZONE 'UTC',
+    created_at            = created_at            AT TIME ZONE '<your zone>' AT TIME ZONE 'UTC',
+    updated_at            = updated_at            AT TIME ZONE '<your zone>' AT TIME ZONE 'UTC';
+  ```
+
+  `created_at` is in that list for the same reason as `next_eligible_at`
+  and not for tidiness: the partition sweeper ages rows on
+  `COALESCE(last_admit_at, created_at)`, so east of UTC a pre-upgrade
+  partition looks newer than it is by your offset and is not collected
+  until real time catches up. (`scheduled_eligible_at` is
+  application-written and already UTC — leave it alone; it is the one
+  timestamp on this table that must NOT be shifted.) The other tables can be shifted the same way or left to age
+  out; the visible cost of leaving them is scheduled work staged before
+  the upgrade keeping its old due time, a stale-looking `heartbeat_at`
+  whose row is swept and re-created, and a step in the metrics windows.
+
+  **This gem requires `ActiveRecord.default_timezone = :utc`,** which is
+  the Rails default. On `:local`, Rails reads these columns back in the
+  machine's zone while the gem now writes UTC, so every timestamp the
+  dashboard renders is off by that offset. Admission is unaffected — the
+  comparisons are all database-side — but the display is wrong in the way
+  A13 was. Old rows age out on their own
+  retention; if you would rather not wait, shift them once with
+  `UPDATE … SET col = col AT TIME ZONE '<your zone>' AT TIME ZONE 'UTC'`
+  against a stopped tick loop.
+
 - **New columns**: `dispatch_policy_partitions.scheduled_eligible_at`,
   and `failed_at` / `failure_reason` on `dispatch_policy_staged_jobs`
   (all nullable). The gem ships a single migration, so an existing
@@ -54,6 +129,19 @@
   `next_eligible_at` and simply becomes claimable one tick earlier,
   after which the tick re-parks it in the new column.
 ### Fixed
+
+- **Every datetime the gem writes is stored in UTC (A13).** These columns
+  are `timestamp WITHOUT time zone`, and a bare `now()` is a timestamptz —
+  so writing it stored the SESSION's wall clock while ActiveRecord read it
+  back as UTC. On an install that sets `variables: { timezone: … }` in
+  database.yml that shifted everything the gem owns by the session's
+  offset: half the dashboard's timestamps rendered wrong (the other half,
+  the application-written ones, rendered right — on adjacent lines of the
+  same page), and it was the root of the comparison bugs fixed one at a
+  time below. Every SQL site now uses `Repository::UTC_NOW` and the column
+  defaults match, so the store is uniform and ActiveRecord's reading is
+  correct by construction. Under a default Rails session the stored bytes
+  are unchanged.
 
 - **Pausing a policy no longer deadlocks against ordinary enqueues, and
   two overlapping clicks can no longer wedge it.**

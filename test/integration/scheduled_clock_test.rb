@@ -30,6 +30,10 @@ class ScheduledClockTest < DispatchPolicy::IntegrationTest
   EAST   = "Etc/GMT-10" # UTC+10 — makes now() look 10h LATER than it is
   WEST   = "Etc/GMT+10" # UTC-10 — makes now() look 10h EARLIER
 
+  # Seeded with the same expression the gem writes with, so the only
+  # thing a skewed session can change is whether the READ is right.
+  UTC = DispatchPolicy::Repository::UTC_NOW
+
   def teardown
     session_timezone("UTC")
     super
@@ -159,22 +163,28 @@ class ScheduledClockTest < DispatchPolicy::IntegrationTest
     assert_equal 3, summary[:jobs_admitted]
   end
 
-  # The in-tick fairness reorder subtracts `decayed_admits_at`, which
-  # `record_partition_admit!` writes with Postgres `now()`. Computed against
-  # `Time.current` it is the A10 crossing in the one place the audit's sweep
-  # did not reach: east of UTC the stored value reads as being in the FUTURE,
-  # the elapsed time clamps to 0, no decay is applied, and the order INVERTS
-  # — the partition that just admitted a burst is served before one idle for
-  # ten minutes. And since the in-memory decay is the only thing that lowers
-  # `decayed_admits` between admissions, that partition then stays last.
-  def test_the_fairness_order_survives_a_skewed_session_timezone
-    # The session is skewed BEFORE the column is written, which is the only
-    # shape that reproduces: in production one session config applies to
-    # everything, so `record_partition_admit!`'s `now()` stores a local wall
-    # clock and Ruby then reads it back as UTC. Seeding under UTC and only
-    # reading under the skew tests nothing — that version stayed green with
-    # the crossing put back.
-    session_timezone(EAST)
+  # The in-tick fairness reorder decays by the time since
+  # `decayed_admits_at`, a column the DATABASE writes. Computing that
+  # elapsed time from `Time.current` puts the two ends of one subtraction
+  # on two MACHINES' clocks — the worker's and the database's — and the
+  # order it produces is only as good as their agreement.
+  #
+  # `travel_to` is the discriminator, not a skewed session TimeZone. Since
+  # every column is stored in UTC (see `Repository::UTC_NOW`), a skewed
+  # session no longer makes Ruby and Postgres disagree about a stored
+  # value, so that version of this test stopped discriminating the moment
+  # A13 was fixed — it SURVIVED its own mutation.
+  #
+  # BEHIND, specifically, and the direction is the whole test. A worker
+  # ahead of the database is harmless here: it adds the same constant to
+  # every elapsed time, `exp(-(e+d)/tau)` factors into
+  # `exp(-e/tau) * exp(-d/tau)`, and multiplying every sort key by one
+  # positive constant cannot reorder them. A worker BEHIND drives elapsed
+  # negative, where `[…, 0.0].max` clamps it — and a clamp is not uniform:
+  # every partition collapses to its RAW admit count, so the one that just
+  # bursted sorts last instead of first. Getting this backwards is how the
+  # first version of this test passed against its own mutation.
+  def test_the_fairness_order_survives_a_worker_clock_that_has_drifted
     seed_decayed!("busy",  admits: 10.0, ago: 600) # bursted, then idle 10 min
     seed_decayed!("quiet", admits: 1.0,  ago: 0)   # just admitted a little
 
@@ -188,12 +198,16 @@ class ScheduledClockTest < DispatchPolicy::IntegrationTest
     )
 
     claimed = DispatchPolicy::Repository.claim_partitions(policy_name: POLICY, limit: 10)
-    tick    = DispatchPolicy::Tick.new(POLICY)
-    tick.send(:sort_partitions_for_fairness!, claimed)
+
+    # This process's clock is ten hours BEHIND the database's.
+    travel_to(Time.now.utc - (10 * 3600)) do
+      DispatchPolicy::Tick.new(POLICY).send(:sort_partitions_for_fairness!, claimed)
+    end
 
     assert_equal %w[busy quiet], claimed.map { |p| p["partition_key"] },
                  "after 10 idle minutes `busy` has decayed below `quiet` and must go first; " \
-                 "read on the session clock the decay is skipped and the order inverts"
+                 "computed on this process's clock the elapsed time goes negative, clamps " \
+                 "to zero, and every partition sorts on its raw admit count instead"
   end
 
   def seed_decayed!(key, admits:, ago:)
@@ -203,75 +217,75 @@ class ScheduledClockTest < DispatchPolicy::IntegrationTest
     )
     DispatchPolicy::Repository.connection.exec_query(
       "UPDATE dispatch_policy_partitions SET decayed_admits = $3, " \
-      "decayed_admits_at = now() - ($4 || ' seconds')::interval " \
+      "decayed_admits_at = #{UTC} - ($4 || ' seconds')::interval " \
       "WHERE policy_name = $1 AND partition_key = $2",
       "seed_decay", [POLICY, key, admits, ago.to_i]
     )
   end
 
-  # The same three columns the partition page renders. A Rails view is not
-  # unreachable from this suite — a reviewer drove one in twenty lines with
-  # rails runner and Rack::Test — but the computation still belongs in the
-  # Repository, where a mutation can reach it and where the page and the
-  # Tick are guaranteed to agree by construction.
+  # The four facts the partition page renders come from columns the
+  # DATABASE writes, so the database computes them. Recomputing in Ruby
+  # subtracts the worker's clock from the database's, and the page then
+  # disagrees with the admission it is describing.
   #
-  # BOTH directions, because the columns fail in opposite ones and a test
-  # pointed at only one is decorative for the others. East of UTC the
-  # stored value reads as being in the FUTURE: the age goes negative, the
-  # decay is skipped, and a backoff that expired hours ago still reports as
-  # active — so `in_backoff` is TRUE there whether or not the bug is
-  # present, and asserting it east proves nothing. West of UTC is where a
-  # live backoff reads as none. The first version of this test asserted all
-  # three facts under EAST and stayed green with the backoff comparison put
-  # back on the app clock.
-  { "east" => EAST, "west" => WEST }.each do |direction, zone|
-    define_method("test_the_partition_page_facts_are_computed_on_the_writing_clock_#{direction}") do
-      session_timezone(zone)
+  # The discriminator is host clock drift, not a skewed session: every
+  # column is stored in UTC now (`Repository::UTC_NOW`), so a skewed
+  # session no longer makes Ruby and Postgres disagree about a stored
+  # value — the session-TimeZone version of these tests SURVIVED its own
+  # mutations once A13 was fixed. Both directions, because they fail
+  # differently: ahead, the age inflates and a live backoff still reads
+  # live; behind, the age goes negative and a live backoff reads as none.
+  { "ahead" => 10 * 3600, "behind" => -10 * 3600 }.each do |direction, drift|
+    define_method("test_the_partition_page_facts_ignore_a_worker_clock_#{direction}") do
       stage!(scheduled_at: nil)
       DispatchPolicy::Repository.connection.exec_query(
         "UPDATE dispatch_policy_partitions SET decayed_admits = 10.0, " \
-        "decayed_admits_at = now() - interval '600 seconds', " \
-        "last_checked_at   = now() - interval '30 seconds', " \
-        "next_eligible_at  = now() + interval '300 seconds' " \
+        "decayed_admits_at = #{UTC} - interval '600 seconds', " \
+        "last_checked_at   = #{UTC} - interval '30 seconds', " \
+        "next_eligible_at  = #{UTC} + interval '300 seconds' " \
         "WHERE policy_name = $1 AND partition_key = $2",
         "seed_facts", [POLICY, KEY]
       )
 
-      facts = DispatchPolicy::Repository.partition_clock_facts(
-        policy_name: POLICY, partition_key: KEY
-      )
+      facts = travel_to(Time.now.utc + drift) do
+        DispatchPolicy::Repository.partition_clock_facts(policy_name: POLICY, partition_key: KEY)
+      end
 
       assert facts[:in_backoff],
-             "#{direction.upcase}: the tick will not claim this partition for another five " \
-             "minutes. Read on the app clock, WEST reports no backoff at all"
+             "#{direction}: the tick will not claim this partition for another five minutes"
       assert_in_delta 30, facts[:age_seconds], 5,
-                      "#{direction.upcase}: read on the worker's clock this is off by the offset " \
-                      "in whichever direction the session points"
+                      "#{direction}: computed on this process's clock the age is off by the drift"
       assert_in_delta 600, facts[:decay_elapsed_seconds], 5,
-                      "#{direction.upcase}: the page's EWMA is the Tick's own sort key; skewed it " \
-                      "renders 10.00 east and 0.00 west, against a true 0.0098"
+                      "#{direction}: the page's EWMA is the Tick's own sort key"
     end
   end
 
-  # An expired backoff must read as expired. This is the assertion the
-  # `in_backoff` fact needs and the one above cannot make: east of UTC a
-  # live backoff reads as live even with the bug, so only a backoff in the
-  # PAST discriminates there.
-  def test_an_expired_backoff_does_not_read_as_active_under_skew
-    session_timezone(EAST)
+  # `in_backoff` needs a backoff that has EXPIRED, and the drift has to
+  # point the other way than it does for a live one. The comparison is
+  # `next_eligible_at > clock`: a LIVE backoff is exposed by a clock that
+  # runs AHEAD (it jumps past the deadline and the backoff vanishes), an
+  # EXPIRED one by a clock that runs BEHIND (it falls back before the
+  # deadline and a dead backoff comes back to life). This case drifted
+  # forward at first, where the buggy and correct answers agree, and passed
+  # against its own mutation.
+  def test_an_expired_backoff_does_not_read_as_active_under_clock_drift
     stage!(scheduled_at: nil)
     DispatchPolicy::Repository.connection.exec_query(
-      "UPDATE dispatch_policy_partitions SET next_eligible_at = now() - interval '300 seconds' " \
+      "UPDATE dispatch_policy_partitions SET next_eligible_at = #{UTC} - interval '300 seconds' " \
       "WHERE policy_name = $1 AND partition_key = $2",
       "seed_expired", [POLICY, KEY]
     )
 
-    refute DispatchPolicy::Repository.partition_clock_facts(
-      policy_name: POLICY, partition_key: KEY
-    )[:in_backoff], "the backoff expired five minutes ago; the tick can claim this now"
+    facts = travel_to(Time.now.utc - (10 * 3600)) do
+      DispatchPolicy::Repository.partition_clock_facts(policy_name: POLICY, partition_key: KEY)
+    end
+
+    refute facts[:in_backoff],
+           "the backoff expired five minutes ago; computed on a clock ten hours behind the " \
+           "database's it reads as active again and the tick is told to wait"
   end
 
-  # `defer_partition_to_next_scheduled!` reads the same column from both
+  # `defer_partition_to_next_scheduled!` reads the same column from both  # `defer_partition_to_next_scheduled!` reads the same column from both
   # ends: MIN over rows still in the future, and a NOT EXISTS guard over
   # rows already due. On a skewed session both answers move together — the
   # future row reads as due, so the guard suppresses the park entirely and
